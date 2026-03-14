@@ -177,12 +177,21 @@ const main = async () => {
     const isLive = !config.dryRun && pendingTrade.orderIds.length > 0;
     if (isLive) {
       const fills = await clob.getOrderFills(pendingTrade.orderIds);
+
+      // Build tokenId -> side mapping from the original orders
+      const tokenSideMap = new Map<string, "Up" | "Down">();
+      for (const order of pendingTrade.orders) {
+        tokenSideMap.set(order.tokenId, order.side as "Up" | "Down");
+      }
+
       logger.info("Order fills queried", {
         fills: fills.map((f) => ({
           orderID: f.orderID.slice(0, 12) + "...",
           sizeMatched: f.sizeMatched,
           price: f.price,
           costFilled: `$${f.costFilled.toFixed(2)}`,
+          tokenId: f.tokenId?.slice(0, 12) + "...",
+          side: tokenSideMap.get(f.tokenId) ?? "unknown",
         })),
       });
 
@@ -194,10 +203,8 @@ const main = async () => {
         totalFilledCost += fill.costFilled;
         totalFilledShares += fill.sizeMatched;
 
-        // Determine side from the order's tokenId — we need to match back
-        // Since fills don't carry side info, use the primary side for now
-        // (all orders in a batch are same side)
-        const side = pendingTrade.primarySide;
+        // Determine side from the order's tokenId
+        const side = tokenSideMap.get(fill.tokenId) ?? pendingTrade.primarySide;
         const won = side === winner;
         const pnl = won
           ? fill.sizeMatched * (1 - fill.price) // win: shares * ($1 - price)

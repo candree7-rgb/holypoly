@@ -292,8 +292,9 @@ export class ClobService {
     sizeMatched: number;
     price: number;
     costFilled: number;
+    tokenId: string;
   }>> {
-    const fills: Array<{ orderID: string; sizeMatched: number; price: number; costFilled: number }> = [];
+    const fills: Array<{ orderID: string; sizeMatched: number; price: number; costFilled: number; tokenId: string }> = [];
     for (const id of orderIds) {
       try {
         const order = await this.client.getOrder(id);
@@ -304,6 +305,7 @@ export class ClobService {
           sizeMatched,
           price,
           costFilled: sizeMatched * price, // shares * price-per-share = USD cost
+          tokenId: order.asset_id,
         });
       } catch (err) {
         this.logger.warn("Failed to query order fill", {
