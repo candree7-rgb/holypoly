@@ -377,6 +377,12 @@ const main = async () => {
 
           const result = await clob.placeBatchOrders(clobOrders);
           logger.info("Batch result", { placed: result.placed, failed: result.failed });
+
+          // Only track trade if orders were actually placed
+          if (result.placed === 0) {
+            logger.warn("No orders placed (all below minimum or failed), skipping trade tracking");
+            continue;
+          }
         }
 
         tradedThisWindow = true;
