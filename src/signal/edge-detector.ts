@@ -140,7 +140,7 @@ export class EdgeDetector {
       primarySide: edge.bestSide,
       fairUp: edge.fairUp,
       bestEdge: edge.bestEdge,
-      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, ${numPrimary}P${shouldHedge ? "+H" : ""})`,
+      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, ${numPrimary}P${shouldHedge ? "+½H" : ""})`,
     };
   }
 
@@ -171,13 +171,12 @@ export class EdgeDetector {
 
   /**
    * Dynamic hedge decision based on edge strength.
-   * purpledeer hedges only 31% of windows — high conviction = NO hedge.
+   * Only hedge at medium conviction (8-12¢). No hedge for weak or strong edges.
+   * Weak (5-8¢): too little edge to waste on both sides.
+   * Strong (12+¢): high conviction, no hedge needed.
    */
   private shouldHedge(edgeCents: number): boolean {
-    // Edge > hedgeEdgeThreshold (12¢): no hedge (high conviction)
-    // Edge 8-12¢: optional hedge
-    // Edge 5-8¢: hedge recommended
-    return edgeCents < this.config.hedgeEdgeThresholdCents;
+    return edgeCents >= this.config.edgeTier2Cents && edgeCents < this.config.hedgeEdgeThresholdCents;
   }
 
   /**
@@ -238,12 +237,13 @@ export class EdgeDetector {
         .filter((a) => a.price <= hedgeMaxPrice)
         .slice(0, 1); // max 1 hedge order (purpledeer avg)
 
+      const hedgeAmount = buyAmountUsd * 0.5; // half-size hedge
       for (const level of hedgeLevels) {
         orders.push({
           side: hedgeSide,
           tokenId: hedgeTokenId,
           price: level.price * 100,
-          amount: buyAmountUsd,
+          amount: hedgeAmount,
         });
       }
     }
