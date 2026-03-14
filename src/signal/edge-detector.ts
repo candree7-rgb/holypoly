@@ -184,19 +184,21 @@ export class EdgeDetector {
       }
     }
 
-    // Hedge side: 1-2 orders at cheap levels only
-    const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100;
-    const hedgeLevels = hedgeBook.asks
-      .filter((a) => a.price <= hedgeMaxPrice)
-      .slice(0, 2);
+    // Hedge side: only if we have primary orders (never hedge without a primary bet)
+    if (orders.length > 0) {
+      const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100;
+      const hedgeLevels = hedgeBook.asks
+        .filter((a) => a.price <= hedgeMaxPrice)
+        .slice(0, 2);
 
-    for (const level of hedgeLevels) {
-      orders.push({
-        side: hedgeSide,
-        tokenId: hedgeTokenId,
-        price: level.price * 100,
-        amount: buyAmountUsd,
-      });
+      for (const level of hedgeLevels) {
+        orders.push({
+          side: hedgeSide,
+          tokenId: hedgeTokenId,
+          price: level.price * 100,
+          amount: buyAmountUsd,
+        });
+      }
     }
 
     // Cap total orders
