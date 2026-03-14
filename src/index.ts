@@ -259,12 +259,27 @@ const main = async () => {
     });
 
     // Update risk manager P&L tracking (works for both dry run and live)
-    await riskManager.recordResult(totalPnl);
+    // For live trades, verify P&L against actual balance change
+    let verifiedPnl = totalPnl;
+    if (isLive) {
+      const balanceAfter = await clob.getBalance();
+      const actualPnl = balanceAfter - pendingTrade.balanceBefore;
+      if (Math.abs(actualPnl - totalPnl) > 0.50) {
+        logger.warn("P&L mismatch: calculated vs actual balance change", {
+          calculatedPnl: `$${totalPnl.toFixed(2)}`,
+          actualPnl: `$${actualPnl.toFixed(2)}`,
+          balanceBefore: `$${pendingTrade.balanceBefore.toFixed(2)}`,
+          balanceAfter: `$${balanceAfter.toFixed(2)}`,
+        });
+        verifiedPnl = actualPnl;
+      }
+    }
+    await riskManager.recordResult(verifiedPnl);
 
     // Update DB record with settlement data
     await db.updateWindowSettlement(
       pendingTrade.conditionId,
-      totalPnl,
+      verifiedPnl,
       winner,
     );
 
@@ -273,7 +288,7 @@ const main = async () => {
     const dailyStats = await riskManager.getDailyStats();
     telegram.alertSettlement(
       winner,
-      totalPnl,
+      verifiedPnl,
       ordersWon,
       orderResults.length,
       dailyStats.totalPnl,
