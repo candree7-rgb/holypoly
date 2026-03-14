@@ -28,11 +28,13 @@ export class EdgeDetector {
 
   /**
    * Evaluate the current window and decide whether/what to trade.
+   * @param buyAmountUsd - Dynamic buy amount (calculated from balance %)
    */
   async evaluate(
     window: WindowInfo,
     currentBtcPrice: number,
-    timeRemainingSeconds: number
+    timeRemainingSeconds: number,
+    buyAmountUsd: number = this.config.buyAmountPct
   ): Promise<TradeDecision> {
     const noTrade = (reason: string): TradeDecision => ({
       shouldTrade: false,
@@ -107,7 +109,8 @@ export class EdgeDetector {
       edge.bestSide,
       edge.fairUp,
       upBook,
-      downBook
+      downBook,
+      buyAmountUsd
     );
 
     if (orders.length === 0) {
@@ -134,7 +137,8 @@ export class EdgeDetector {
     primarySide: TradeSide,
     fairUp: number,
     upBook: OrderbookSnapshot,
-    downBook: OrderbookSnapshot
+    downBook: OrderbookSnapshot,
+    buyAmountUsd: number
   ): GridOrder[] {
     const orders: GridOrder[] = [];
     const hedgeSide: TradeSide = primarySide === "Up" ? "Down" : "Up";
@@ -153,12 +157,12 @@ export class EdgeDetector {
       .slice(0, this.config.maxBuysPerSide);
 
     for (const level of primaryLevels) {
-      const size = this.config.buyAmountUsd / level.price; // shares = USD / price
+      const size = buyAmountUsd / level.price; // shares = USD / price
       orders.push({
         side: primarySide,
         tokenId: primaryTokenId,
         price: level.price * 100, // store as cents for logging
-        amount: this.config.buyAmountUsd,
+        amount: buyAmountUsd,
       });
     }
 
@@ -169,7 +173,7 @@ export class EdgeDetector {
           side: primarySide,
           tokenId: primaryTokenId,
           price: primaryBook.bestAsk * 100,
-          amount: this.config.buyAmountUsd,
+          amount: buyAmountUsd,
         });
       }
     }
@@ -185,7 +189,7 @@ export class EdgeDetector {
         side: hedgeSide,
         tokenId: hedgeTokenId,
         price: level.price * 100,
-        amount: this.config.buyAmountUsd,
+        amount: buyAmountUsd,
       });
     }
 

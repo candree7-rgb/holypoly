@@ -3,6 +3,7 @@ import { webcrypto } from "crypto";
 import { Side } from "@polymarket/clob-client";
 import { loadConfig, ConfigError, type Config } from "./config.js";
 import { createLogger } from "./logger.js";
+import { Database } from "./db.js";
 import { BinanceWsClient } from "./data/binance-ws.js";
 import { GammaClient } from "./data/gamma.js";
 import { ClobService } from "./data/clob.js";
@@ -13,16 +14,10 @@ import { FairValueEngine } from "./signal/fair-value.js";
 import { EdgeDetector } from "./signal/edge-detector.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { RiskManager } from "./risk/limits.js";
-import {
-  loadState,
-  saveState,
-  recordWindowResult,
-  markRedeemAttempt,
-} from "./state.js";
 import { sleep, nowSec } from "./utils.js";
-import type { GridOrder, TradeSide, WindowResult } from "./types.js";
+import type { GridOrder } from "./types.js";
 
-const MAIN_LOOP_INTERVAL_MS = 1000; // Check every second
+const MAIN_LOOP_INTERVAL_MS = 1000;
 const REDEEM_COOLDOWN_SEC = 600;
 const REDEEM_POLL_INTERVAL_MS = 30000;
 
@@ -32,7 +27,6 @@ const main = async () => {
       webcrypto as Crypto;
   }
 
-  // Load config
   let config: Config;
   try {
     config = loadConfig();
@@ -46,15 +40,20 @@ const main = async () => {
   }
 
   const logger = createLogger(config.debug);
-  const state = await loadState(config.stateFile);
+
+  // Initialize PostgreSQL
+  const db = new Database(config.databaseUrl, logger);
+  await db.init();
 
   logger.info("=== HolyPoly Bot Starting ===");
   logger.info("Mode", { dryRun: config.dryRun });
   logger.info("Parameters", {
-    buyAmount: config.buyAmountUsd,
-    edgeThreshold: config.edgeThresholdCents,
+    buyAmountPct: `${config.buyAmountPct}%`,
+    edgeThreshold: `${config.edgeThresholdCents}¢`,
     maxBuysPerWindow: config.maxBuysPerWindow,
-    entryDelay: config.entryDelaySeconds,
+    entryDelay: `${config.entryDelaySeconds}s`,
+    dailyLossLimit: `${config.dailyLossLimitPct}%`,
+    weeklyLossLimit: `${config.weeklyLossLimitPct}%`,
   });
 
   // Initialize services
@@ -79,8 +78,13 @@ const main = async () => {
   const fairValueEngine = new FairValueEngine(volatilityCalc);
   const edgeDetector = new EdgeDetector(fairValueEngine, clob, config, logger);
 
-  // Risk manager
-  const riskManager = new RiskManager(config, state, logger);
+  // Risk manager (%-based, backed by PostgreSQL)
+  const riskManager = new RiskManager(
+    config,
+    db,
+    logger,
+    () => dataApi.getBalance(config.profileAddress)
+  );
 
   // Binance WebSocket (realtime BTC price)
   const binance = new BinanceWsClient(logger);
@@ -106,7 +110,7 @@ const main = async () => {
       )
     : null;
 
-  // Track state per window
+  // Per-window state
   let tradedThisWindow = false;
   let currentWindowId: string | null = null;
   let windowOrders: GridOrder[] = [];
@@ -121,7 +125,7 @@ const main = async () => {
 
         // Log status every 5 minutes
         if (now - lastStatusLog >= 300000) {
-          riskManager.logStatus();
+          await riskManager.logStatus();
           logger.info("Binance WS", { connected: binance.connected, price: binance.price });
           lastStatusLog = now;
         }
@@ -139,62 +143,64 @@ const main = async () => {
           continue;
         }
 
-        // New window detected — reset per-window state
+        // New window — reset
         if (window.conditionId !== currentWindowId) {
           currentWindowId = window.conditionId;
           tradedThisWindow = false;
           windowOrders = [];
 
-          // Set opening price from current Binance price at window start
           if (window.openingPrice === 0) {
             windowManager.setOpeningPrice(binance.price);
           }
         }
 
-        // Already traded this window — wait for it to end
         if (tradedThisWindow) {
           await sleep(MAIN_LOOP_INTERVAL_MS);
           continue;
         }
 
-        // Not in entry phase yet — wait
+        // Wait for entry phase
         if (!windowManager.isEntryPhase(config.entryDelaySeconds)) {
           await sleep(MAIN_LOOP_INTERVAL_MS);
           continue;
         }
 
-        // Risk check
-        const riskCheck = riskManager.check();
+        // Risk check (returns dynamic buy amount from balance %)
+        const riskCheck = await riskManager.check();
         if (!riskCheck.allowed) {
           logger.warn("Risk check blocked", { reason: riskCheck.reason });
-          tradedThisWindow = true; // Skip this window
+          tradedThisWindow = true;
           await sleep(MAIN_LOOP_INTERVAL_MS);
           continue;
         }
 
-        // Evaluate edge and decide
+        const buyAmountUsd = riskCheck.buyAmountUsd;
+
+        // Evaluate edge
         const timeRemaining = windowManager.timeRemaining();
         const decision = await edgeDetector.evaluate(
           window,
           binance.price,
-          timeRemaining
+          timeRemaining,
+          buyAmountUsd
         );
 
         if (!decision.shouldTrade) {
           logger.debug("Skip window", { reason: decision.reason });
-          tradedThisWindow = true; // Don't re-evaluate
+          tradedThisWindow = true;
           await sleep(MAIN_LOOP_INTERVAL_MS);
           continue;
         }
 
         // === PLACE ORDERS ===
+        const balance = await riskManager.getBalance();
         logger.info("Trading window!", {
           side: decision.primarySide,
           edge: decision.bestEdge.toFixed(1) + "¢",
           fairUp: decision.fairUp + "¢",
           orders: decision.orders.length,
+          buyAmount: `$${buyAmountUsd.toFixed(2)} (${config.buyAmountPct}% of $${balance.toFixed(2)})`,
           btcPrice: binance.price.toFixed(2),
-          openingPrice: window.openingPrice.toFixed(2),
           delta: (binance.price - window.openingPrice).toFixed(2),
         });
 
@@ -207,30 +213,33 @@ const main = async () => {
             })),
           });
         } else {
-          // Convert GridOrders to CLOB orders
           const clobOrders = decision.orders.map((o) => ({
             tokenId: o.tokenId,
-            side: Side.BUY, // We only buy, never sell
-            price: o.price / 100, // cents back to decimal
-            size: o.amount / (o.price / 100), // shares = USD / price
+            side: Side.BUY,
+            price: o.price / 100,
+            size: o.amount / (o.price / 100),
           }));
 
           const result = await clob.placeBatchOrders(clobOrders);
-          logger.info("Batch result", {
-            placed: result.placed,
-            failed: result.failed,
-          });
+          logger.info("Batch result", { placed: result.placed, failed: result.failed });
         }
 
         tradedThisWindow = true;
         windowOrders = decision.orders;
 
-        // Save state
-        state.currentWindow = {
-          startTime: window.startTime,
-          ordersPlaced: decision.orders.length,
-        };
-        await saveState(config.stateFile, state);
+        // Record to database
+        await db.recordWindow({
+          windowStart: window.startTime,
+          conditionId: window.conditionId,
+          traded: true,
+          primarySide: decision.primarySide,
+          orders: decision.orders,
+          fillCount: decision.orders.length,
+          pnl: null, // set after settlement
+          winner: null,
+          balanceBefore: balance,
+          balanceAfter: null,
+        });
 
       } catch (err) {
         logger.error("Trading loop error", { error: (err as Error).message });
@@ -246,24 +255,23 @@ const main = async () => {
 
     while (true) {
       try {
-        const positions = await dataApi.getPositions(
-          config.profileAddress,
-          true, // redeemable only
-        );
+        const positions = await dataApi.getPositions(config.profileAddress, true);
         const now = nowSec();
-        const eligible = positions.filter((pos) => {
-          const last = state.redeemAttempts[pos.conditionId] ?? 0;
-          return now - last > REDEEM_COOLDOWN_SEC;
-        });
+        const eligible: typeof positions = [];
+
+        for (const pos of positions) {
+          const last = await db.getRedeemAttempt(pos.conditionId);
+          if (now - last > REDEEM_COOLDOWN_SEC) {
+            eligible.push(pos);
+          }
+        }
 
         if (eligible.length) {
           logger.info("Redeeming positions", { count: eligible.length });
           await redeemService.redeemPositions(eligible);
-          const attemptedConditions = new Set(eligible.map((p) => p.conditionId));
-          for (const conditionId of attemptedConditions) {
-            markRedeemAttempt(state, conditionId);
+          for (const pos of eligible) {
+            await db.markRedeemAttempt(pos.conditionId);
           }
-          await saveState(config.stateFile, state);
         }
       } catch (err) {
         logger.error("Redeem loop error", { error: (err as Error).message });
@@ -273,7 +281,17 @@ const main = async () => {
     }
   };
 
-  // Run both loops concurrently
+  // Graceful shutdown
+  const shutdown = async () => {
+    logger.info("Shutting down...");
+    binance.stop();
+    await db.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  // Run both loops
   await Promise.all([tradingLoop(), redeemLoop()]);
 };
 

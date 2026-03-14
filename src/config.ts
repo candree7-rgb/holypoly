@@ -20,8 +20,9 @@ export interface Config {
   profileAddress: string;
   apiCreds?: ApiCreds;
 
-  // Trading parameters
-  buyAmountUsd: number;
+  // Trading parameters (percentage-based for compounding)
+  /** % of wallet balance per individual order (e.g. 2 = 2%) */
+  buyAmountPct: number;
   edgeThresholdCents: number;
   maxBuysPerWindow: number;
   maxBuysPerSide: number;
@@ -31,11 +32,17 @@ export interface Config {
   minDeltaThresholdUsd: number;
   volatilityLookbackSeconds: number;
 
-  // Risk management
-  dailyLossLimitUsd: number;
-  weeklyLossLimitUsd: number;
+  // Risk management (percentage-based)
+  /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
+  dailyLossLimitPct: number;
+  /** Max weekly loss as % of starting weekly balance */
+  weeklyLossLimitPct: number;
   losingStreakPause: number;
-  minWalletBalanceUsd: number;
+  /** Absolute minimum USDC balance — stop trading below this */
+  minBalanceFloorUsd: number;
+
+  // Database
+  databaseUrl: string;
 
   // Auto-redeem
   autoRedeem: boolean;
@@ -121,8 +128,8 @@ export const loadConfig = (): Config => {
     ? { key: apiKey, secret: apiSecret, passphrase: apiPassphrase }
     : undefined;
 
-  // Trading parameters
-  const buyAmountUsd = parseNumber("BUY_AMOUNT_USD", 39.60);
+  // Trading parameters (percentage-based)
+  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 2); // 2% of balance per order
   const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
   const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7);
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 5);
@@ -132,11 +139,14 @@ export const loadConfig = (): Config => {
   const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
   const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 300);
 
-  // Risk management
-  const dailyLossLimitUsd = parseNumber("DAILY_LOSS_LIMIT_USD", 500);
-  const weeklyLossLimitUsd = parseNumber("WEEKLY_LOSS_LIMIT_USD", 2000);
+  // Risk management (percentage-based)
+  const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10); // 10% of daily starting balance
+  const weeklyLossLimitPct = parseNumber("WEEKLY_LOSS_LIMIT_PCT", 20); // 20% of weekly starting balance
   const losingStreakPause = parseNumber("LOSING_STREAK_PAUSE", 5);
-  const minWalletBalanceUsd = parseNumber("MIN_WALLET_BALANCE_USD", 500);
+  const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50); // absolute floor
+
+  // Database
+  const databaseUrl = requireEnv("DATABASE_URL");
 
   // Auto-redeem
   const autoRedeem = parseBoolean("AUTO_REDEEM", true);
@@ -167,7 +177,7 @@ export const loadConfig = (): Config => {
 
   const dryRun = parseBoolean("DRY_RUN", true);
   const debug = parseBoolean("DEBUG", false);
-  const stateFile = getEnv("STATE_FILE") ?? "./data/state.json";
+  const stateFile = getEnv("STATE_FILE") ?? "./data/state.json"; // legacy fallback
 
   return {
     clobHost,
@@ -179,7 +189,7 @@ export const loadConfig = (): Config => {
     funderAddress: funderAddress?.toLowerCase(),
     profileAddress,
     apiCreds,
-    buyAmountUsd,
+    buyAmountPct,
     edgeThresholdCents,
     maxBuysPerWindow,
     maxBuysPerSide,
@@ -188,10 +198,11 @@ export const loadConfig = (): Config => {
     redeemDelaySeconds,
     minDeltaThresholdUsd,
     volatilityLookbackSeconds,
-    dailyLossLimitUsd,
-    weeklyLossLimitUsd,
+    dailyLossLimitPct,
+    weeklyLossLimitPct,
     losingStreakPause,
-    minWalletBalanceUsd,
+    minBalanceFloorUsd,
+    databaseUrl,
     autoRedeem,
     relayerUrl,
     relayerTxType,
