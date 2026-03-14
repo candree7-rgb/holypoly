@@ -103,8 +103,11 @@ export class EdgeDetector {
       return noTrade(`BTC flat (delta=$${absDelta.toFixed(2)}) and market near 50/50`);
     }
 
-    // Skip when primary side is too expensive (purpledeer sweet spot: 50-65¢)
+    // Skip when primary side outside sweet spot (purpledeer: 50-65¢)
     const primaryAskCents = edge.bestSide === "Up" ? marketUpCents : marketDownCents;
+    if (primaryAskCents < this.config.minEntryPriceCents) {
+      return noTrade(`Primary ${edge.bestSide} too cheap (${primaryAskCents}¢ < ${this.config.minEntryPriceCents}¢ — contrarian bet)`);
+    }
     if (primaryAskCents > this.config.maxEntryPriceCents) {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
     }

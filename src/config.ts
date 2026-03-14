@@ -28,6 +28,7 @@ export interface Config {
   maxBuysPerSide: number;
   hedgeMaxPriceCents: number;
   maxEntryPriceCents: number;
+  minEntryPriceCents: number;
   entryDelaySeconds: number;
   redeemDelaySeconds: number;
   minDeltaThresholdUsd: number;
@@ -136,6 +137,7 @@ export const loadConfig = (): Config => {
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 40);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 65);
+  const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 50);
   const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 30);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
   const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
@@ -197,6 +199,7 @@ export const loadConfig = (): Config => {
     maxBuysPerSide,
     hedgeMaxPriceCents,
     maxEntryPriceCents,
+    minEntryPriceCents,
     entryDelaySeconds,
     redeemDelaySeconds,
     minDeltaThresholdUsd,
