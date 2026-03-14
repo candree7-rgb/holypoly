@@ -147,6 +147,16 @@ export class RiskManager {
   }
 
   /**
+   * Get today's stats for notifications.
+   */
+  async getDailyStats(): Promise<{ totalPnl: number; wins: number; losses: number }> {
+    const balance = await this.getBalance();
+    const today = dayKeyUtc();
+    const daily = await this.db.ensureDailySnapshot(today, balance);
+    return { totalPnl: daily.totalPnl, wins: daily.wins, losses: daily.losses };
+  }
+
+  /**
    * Log current risk status.
    */
   async logStatus(): Promise<void> {

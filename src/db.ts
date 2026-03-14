@@ -59,6 +59,15 @@ export class Database {
       CREATE INDEX IF NOT EXISTS idx_window_trades_start ON window_trades(window_start);
       CREATE INDEX IF NOT EXISTS idx_window_trades_condition ON window_trades(condition_id);
     `);
+
+    // One-time cleanup: remove all dry-run data for clean live start
+    // TODO: Remove this block after first live deployment
+    await this.pool.query("DELETE FROM window_trades");
+    await this.pool.query("DELETE FROM daily_snapshots");
+    await this.pool.query("DELETE FROM weekly_snapshots");
+    await this.pool.query("DELETE FROM bot_state WHERE key LIKE 'redeem:%'");
+    this.logger.info("Database cleaned (dry-run data removed)");
+
     this.logger.info("Database initialized");
   }
 

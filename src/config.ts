@@ -64,6 +64,10 @@ export interface Config {
   builderSigningToken?: string;
   rpcUrl?: string;
 
+  // Telegram
+  telegramBotToken?: string;
+  telegramChatId?: string;
+
   // Operation
   dryRun: boolean;
   debug: boolean;
@@ -196,6 +200,10 @@ export const loadConfig = (): Config => {
     }
   }
 
+  // Telegram (optional)
+  const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
+  const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
+
   const dryRun = parseBoolean("DRY_RUN", true);
   const debug = parseBoolean("DEBUG", false);
   const stateFile = getEnv("STATE_FILE") ?? "./data/state.json"; // legacy fallback
@@ -237,6 +245,8 @@ export const loadConfig = (): Config => {
     builderSigningUrl,
     builderSigningToken,
     rpcUrl,
+    telegramBotToken,
+    telegramChatId,
     dryRun,
     debug,
     stateFile,

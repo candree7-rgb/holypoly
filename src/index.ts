@@ -16,6 +16,7 @@ import { FairValueEngine } from "./signal/fair-value.js";
 import { EdgeDetector } from "./signal/edge-detector.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { RiskManager } from "./risk/limits.js";
+import { TelegramNotifier } from "./telegram.js";
 import { sleep, nowSec } from "./utils.js";
 import type { GridOrder } from "./types.js";
 
@@ -46,6 +47,13 @@ const main = async () => {
   // PostgreSQL
   const db = new Database(config.databaseUrl, logger);
   await db.init();
+
+  // Telegram notifications
+  const telegram = new TelegramNotifier(
+    config.telegramBotToken,
+    config.telegramChatId,
+    logger,
+  );
 
   logger.info("=== HolyPoly Bot Starting ===");
   logger.info("Mode", { dryRun: config.dryRun });
@@ -128,6 +136,10 @@ const main = async () => {
       )
     : null;
 
+  // Send startup alert
+  const startupBalance = await clob.getBalance();
+  telegram.alertStartup(config.dryRun, startupBalance, config.buyAmountPct);
+
   // Per-window state
   let tradedThisWindow = false;
   let currentWindowId: string | null = null;
@@ -199,6 +211,19 @@ const main = async () => {
       pendingTrade.conditionId,
       totalPnl,
       winner,
+    );
+
+    // Telegram settlement alert
+    const ordersWon = orderResults.filter((o) => o.won).length;
+    const dailyStats = await riskManager.getDailyStats();
+    telegram.alertSettlement(
+      winner,
+      totalPnl,
+      ordersWon,
+      orderResults.length,
+      dailyStats.totalPnl,
+      dailyStats.wins,
+      dailyStats.losses,
     );
 
     pendingTrade = null;
@@ -285,6 +310,7 @@ const main = async () => {
         const riskCheck = await riskManager.check();
         if (!riskCheck.allowed) {
           logger.warn("Risk check blocked", { reason: riskCheck.reason });
+          telegram.alertCircuitBreaker(riskCheck.reason ?? "Unknown");
           tradedThisWindow = true;
           await sleep(MAIN_LOOP_INTERVAL_MS);
           continue;
@@ -321,6 +347,17 @@ const main = async () => {
           delta: `$${(binance.price - window.openingPrice).toFixed(2)}`,
           timeLeft: `${timeRemaining.toFixed(0)}s`,
         });
+
+        // Telegram trade alert
+        telegram.alertTrade(
+          decision.primarySide,
+          decision.bestEdge,
+          decision.orders.length,
+          buyAmountUsd,
+          balance,
+          binance.price,
+          timeRemaining,
+        );
 
         if (config.dryRun) {
           logger.info("DRY_RUN — would place:", {
@@ -369,6 +406,7 @@ const main = async () => {
 
       } catch (err) {
         logger.error("Trading loop error", { error: (err as Error).message });
+        telegram.alertError((err as Error).message);
       }
 
       await sleep(MAIN_LOOP_INTERVAL_MS);
