@@ -104,7 +104,9 @@ export class ClobService {
       const result = await this.client.getBalanceAllowance({
         asset_type: AssetType.COLLATERAL,
       });
-      return parseFloat(result.balance) || 0;
+      // Balance is returned in micro-USDC (6 decimals), convert to USD
+      const raw = parseFloat(result.balance) || 0;
+      return raw / 1e6;
     } catch (err) {
       this.logger.warn("Failed to get balance", { error: (err as Error).message });
       return 0;
