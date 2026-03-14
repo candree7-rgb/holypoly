@@ -259,19 +259,21 @@ const main = async () => {
     });
 
     // Update risk manager P&L tracking (works for both dry run and live)
-    // For live trades, verify P&L against actual balance change
-    let verifiedPnl = totalPnl;
+    // For live trades, log balance change for monitoring (but trust fill-based P&L)
+    // Note: balance-based P&L is unreliable because:
+    //   1. balanceBefore may include recently settled funds from previous trades
+    //   2. balanceAfter may not yet include the current settlement payout
+    const verifiedPnl = totalPnl;
     if (isLive) {
       const balanceAfter = await clob.getBalance();
       const actualPnl = balanceAfter - pendingTrade.balanceBefore;
       if (Math.abs(actualPnl - totalPnl) > 0.50) {
-        logger.warn("P&L mismatch: calculated vs actual balance change", {
-          calculatedPnl: `$${totalPnl.toFixed(2)}`,
-          actualPnl: `$${actualPnl.toFixed(2)}`,
+        logger.warn("P&L note: balance change differs from fill-based calc (expected due to settlement timing)", {
+          fillBasedPnl: `$${totalPnl.toFixed(2)}`,
+          balanceChangePnl: `$${actualPnl.toFixed(2)}`,
           balanceBefore: `$${pendingTrade.balanceBefore.toFixed(2)}`,
           balanceAfter: `$${balanceAfter.toFixed(2)}`,
         });
-        verifiedPnl = actualPnl;
       }
     }
     await riskManager.recordResult(verifiedPnl);
