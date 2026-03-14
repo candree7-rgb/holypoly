@@ -16,6 +16,8 @@ interface ClobMarket {
   question: string;
   market_slug: string;
   end_date_iso: string;
+  start_time_ms?: number;
+  end_time_ms?: number;
   active: boolean;
   closed: boolean;
   accepting_orders: boolean;
@@ -68,7 +70,7 @@ export class MarketDiscovery {
       }
 
       try {
-        const market = await this.fetchMarketBySlug(slug);
+        const market = await this.fetchMarketBySlug(slug, windowStart, windowSize);
         if (!market) continue;
 
         // Must be active and accepting orders
@@ -82,7 +84,9 @@ export class MarketDiscovery {
           continue;
         }
 
-        const windowEnd = windowStart + windowSize;
+        // Use precise timestamps from Gamma API if available, else calculate from slug
+        const startMs = market.start_time_ms ?? windowStart * 1000;
+        const endMs = market.end_time_ms ?? (windowStart + windowSize) * 1000;
 
         this.currentSlug = slug;
         this.currentMarket = {
@@ -90,15 +94,15 @@ export class MarketDiscovery {
           upTokenId: upToken.token_id,
           downTokenId: downToken.token_id,
           openingPrice: 0, // Set from Chainlink at window start
-          startTime: windowStart * 1000,
-          endTime: windowEnd * 1000,
+          startTime: startMs,
+          endTime: endMs,
           negRisk: market.neg_risk,
         };
 
         this.logger.info("Found 5-min BTC market", {
           slug,
           conditionId: market.condition_id.slice(0, 16) + "...",
-          window: `${new Date(windowStart * 1000).toISOString()} - ${new Date(windowEnd * 1000).toISOString()}`,
+          window: `${new Date(startMs).toISOString()} - ${new Date(endMs).toISOString()}`,
           upPrice: upToken.price,
           downPrice: downToken.price,
         });
@@ -117,7 +121,7 @@ export class MarketDiscovery {
    * Since CLOB doesn't support slug search directly, we construct
    * condition_id from the known slug pattern.
    */
-  private async fetchMarketBySlug(slug: string): Promise<ClobMarket | null> {
+  private async fetchMarketBySlug(slug: string, windowStartSec: number, windowSizeSec: number): Promise<ClobMarket | null> {
     // The CLOB has a /markets endpoint but doesn't filter by slug well.
     // Instead, try the Gamma API which indexes these markets:
     try {
@@ -130,7 +134,10 @@ export class MarketDiscovery {
           conditionId: string;
           clobTokenIds: string;
           outcomes: string;
+          outcomePrices: string;
           endDateIso: string;
+          endDate: string;
+          eventStartTime: string;
           active: boolean;
           closed: boolean;
           negRisk: boolean;
@@ -139,11 +146,23 @@ export class MarketDiscovery {
           const m = data[0];
           const tokenIds = JSON.parse(m.clobTokenIds || "[]") as string[];
           const outcomes = JSON.parse(m.outcomes || "[]") as string[];
+          const prices = JSON.parse(m.outcomePrices || "[]") as string[];
+
+          // Use precise timestamps from Gamma API
+          const startMs = m.eventStartTime
+            ? new Date(m.eventStartTime).getTime()
+            : windowStartSec * 1000;
+          const endMs = m.endDate
+            ? new Date(m.endDate).getTime()
+            : startMs + windowSizeSec * 1000;
+
           return {
             condition_id: m.conditionId,
             question: "",
             market_slug: slug,
-            end_date_iso: m.endDateIso,
+            end_date_iso: m.endDate || m.endDateIso,
+            start_time_ms: startMs,
+            end_time_ms: endMs,
             active: m.active,
             closed: m.closed,
             accepting_orders: m.active && !m.closed,
@@ -153,7 +172,7 @@ export class MarketDiscovery {
             tokens: tokenIds.map((id, i) => ({
               token_id: id,
               outcome: outcomes[i] || (i === 0 ? "Up" : "Down"),
-              price: 0.5,
+              price: prices[i] ? parseFloat(prices[i]) : 0.5,
               winner: false,
             })),
             tags: ["5M"],
