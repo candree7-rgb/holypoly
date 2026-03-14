@@ -211,8 +211,8 @@ export class ClobService {
   }
 
   /**
-   * Place multiple limit orders as a batch.
-   * Each order is placed individually but in rapid succession.
+   * Place multiple limit orders in a single API call via POST /orders.
+   * Signs all orders first, then posts them as one batch.
    */
   async placeBatchOrders(orders: Array<{
     tokenId: string;
@@ -220,28 +220,59 @@ export class ClobService {
     price: number;
     size: number;
   }>): Promise<{ placed: number; failed: number }> {
-    let placed = 0;
-    let failed = 0;
+    if (orders.length === 0) return { placed: 0, failed: 0 };
+
+    // Get meta for tick size rounding (cache hit after first call)
+    const firstMeta = await this.getMarketMeta(orders[0].tokenId);
+
+    // Sign all orders
+    const signedArgs: Array<{ order: import("@polymarket/clob-client").SignedOrder; orderType: OrderType }> = [];
+    let skipped = 0;
 
     for (const order of orders) {
-      try {
-        await this.placeLimitOrder(order);
-        placed++;
-        this.logger.info("Order placed", {
+      const meta = await this.getMarketMeta(order.tokenId);
+      const price = this.roundToTick(order.price, meta.tickSize, order.side);
+
+      if (order.size < meta.minOrderSize) {
+        this.logger.warn("Order size below minimum", {
           tokenId: order.tokenId,
-          side: order.side === Side.BUY ? "BUY" : "SELL",
-          price: order.price,
           size: order.size,
+          min: meta.minOrderSize,
         });
+        skipped++;
+        continue;
+      }
+
+      try {
+        const signed = await this.client.createOrder(
+          { tokenID: order.tokenId, price, side: order.side, size: order.size },
+          { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        );
+        signedArgs.push({ order: signed, orderType: OrderType.GTC });
       } catch (err) {
-        failed++;
-        this.logger.warn("Order failed", {
+        this.logger.warn("Order signing failed", {
           tokenId: order.tokenId,
           error: (err as Error).message,
         });
+        skipped++;
       }
     }
 
-    return { placed, failed };
+    if (signedArgs.length === 0) {
+      return { placed: 0, failed: skipped };
+    }
+
+    // Post all signed orders in one API call
+    try {
+      const resp = await this.client.postOrders(signedArgs);
+      this.logger.info("Batch posted", {
+        submitted: signedArgs.length,
+        response: resp,
+      });
+      return { placed: signedArgs.length, failed: skipped };
+    } catch (err) {
+      this.logger.error("Batch post failed", { error: (err as Error).message });
+      return { placed: 0, failed: orders.length };
+    }
   }
 }
