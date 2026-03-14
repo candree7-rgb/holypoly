@@ -151,6 +151,7 @@ const main = async () => {
     orders: GridOrder[];
     primarySide: "Up" | "Down";
     balanceBefore: number;
+    orderIds: string[]; // live order IDs for fill tracking
   } | null = null;
 
   /**
@@ -172,23 +173,70 @@ const main = async () => {
     let totalPnl = 0;
     const orderResults: Array<{ side: string; price: string; amount: string; pnl: string; won: boolean }> = [];
 
-    for (const order of pendingTrade.orders) {
-      const won = order.side === winner;
-      // Binary outcome: win pays $1/share, lose pays $0/share
-      // shares = amount / (price/100), cost = amount
-      // win pnl = shares * 1 - cost = amount * (100/price - 1)
-      // lose pnl = -cost = -amount
-      const pnl = won
-        ? order.amount * (100 / order.price - 1)
-        : -order.amount;
-      totalPnl += pnl;
-      orderResults.push({
-        side: order.side,
-        price: `${order.price.toFixed(1)}¢`,
-        amount: `$${order.amount.toFixed(2)}`,
-        pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-        won,
+    // For live trades, query actual fills from Polymarket
+    const isLive = !config.dryRun && pendingTrade.orderIds.length > 0;
+    if (isLive) {
+      const fills = await clob.getOrderFills(pendingTrade.orderIds);
+      logger.info("Order fills queried", {
+        fills: fills.map((f) => ({
+          orderID: f.orderID.slice(0, 12) + "...",
+          sizeMatched: f.sizeMatched,
+          price: f.price,
+          costFilled: `$${f.costFilled.toFixed(2)}`,
+        })),
       });
+
+      // Build a list of orders with actual fill data
+      let totalFilledCost = 0;
+      let totalFilledShares = 0;
+      for (const fill of fills) {
+        if (fill.sizeMatched <= 0) continue;
+        totalFilledCost += fill.costFilled;
+        totalFilledShares += fill.sizeMatched;
+
+        // Determine side from the order's tokenId — we need to match back
+        // Since fills don't carry side info, use the primary side for now
+        // (all orders in a batch are same side)
+        const side = pendingTrade.primarySide;
+        const won = side === winner;
+        const pnl = won
+          ? fill.sizeMatched * (1 - fill.price) // win: shares * ($1 - price)
+          : -fill.costFilled;                     // lose: -cost
+        totalPnl += pnl;
+        orderResults.push({
+          side,
+          price: `${(fill.price * 100).toFixed(1)}¢`,
+          amount: `$${fill.costFilled.toFixed(2)}`,
+          pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+          won,
+        });
+      }
+
+      if (totalFilledCost === 0) {
+        logger.info("No orders were filled, skipping settlement");
+        pendingTrade = null;
+        return;
+      }
+    } else {
+      // Dry run: use planned order amounts (simulated)
+      for (const order of pendingTrade.orders) {
+        const won = order.side === winner;
+        // Binary outcome: win pays $1/share, lose pays $0/share
+        // shares = amount / (price/100), cost = amount
+        // win pnl = shares * 1 - cost = amount * (100/price - 1)
+        // lose pnl = -cost = -amount
+        const pnl = won
+          ? order.amount * (100 / order.price - 1)
+          : -order.amount;
+        totalPnl += pnl;
+        orderResults.push({
+          side: order.side,
+          price: `${order.price.toFixed(1)}¢`,
+          amount: `$${order.amount.toFixed(2)}`,
+          pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+          won,
+        });
+      }
     }
 
     const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
@@ -359,6 +407,7 @@ const main = async () => {
           timeRemaining,
         );
 
+        let liveOrderIds: string[] = [];
         if (config.dryRun) {
           logger.info("DRY_RUN — would place:", {
             orders: decision.orders.map((o) => ({
@@ -376,13 +425,15 @@ const main = async () => {
           }));
 
           const result = await clob.placeBatchOrders(clobOrders);
-          logger.info("Batch result", { placed: result.placed, failed: result.failed });
+          logger.info("Batch result", { placed: result.placed, failed: result.failed, orderIds: result.orderIds });
 
           // Only track trade if orders were actually placed
           if (result.placed === 0) {
             logger.warn("No orders placed (all below minimum or failed), skipping trade tracking");
             continue;
           }
+
+          liveOrderIds = result.orderIds;
         }
 
         tradedThisWindow = true;
@@ -394,6 +445,7 @@ const main = async () => {
           orders: decision.orders,
           primarySide: decision.primarySide,
           balanceBefore: balance,
+          orderIds: liveOrderIds,
         };
 
         // Record to database

@@ -219,8 +219,8 @@ export class ClobService {
     side: Side;
     price: number;
     size: number;
-  }>): Promise<{ placed: number; failed: number }> {
-    if (orders.length === 0) return { placed: 0, failed: 0 };
+  }>): Promise<{ placed: number; failed: number; orderIds: string[] }> {
+    if (orders.length === 0) return { placed: 0, failed: 0, orderIds: [] };
 
     // Get meta for tick size rounding (cache hit after first call)
     const firstMeta = await this.getMarketMeta(orders[0].tokenId);
@@ -259,7 +259,7 @@ export class ClobService {
     }
 
     if (signedArgs.length === 0) {
-      return { placed: 0, failed: skipped };
+      return { placed: 0, failed: skipped, orderIds: [] };
     }
 
     // Post all signed orders in one API call
@@ -269,10 +269,49 @@ export class ClobService {
         submitted: signedArgs.length,
         response: resp,
       });
-      return { placed: signedArgs.length, failed: skipped };
+      // Extract order IDs from response (array of OrderResponse or similar)
+      const orderIds: string[] = [];
+      if (Array.isArray(resp)) {
+        for (const r of resp) {
+          if (r?.orderID) orderIds.push(r.orderID);
+        }
+      }
+      return { placed: signedArgs.length, failed: skipped, orderIds };
     } catch (err) {
       this.logger.error("Batch post failed", { error: (err as Error).message });
-      return { placed: 0, failed: orders.length };
+      return { placed: 0, failed: orders.length, orderIds: [] };
     }
+  }
+
+  /**
+   * Query actual fill amounts for placed orders.
+   * Returns the USD cost actually filled per order.
+   */
+  async getOrderFills(orderIds: string[]): Promise<Array<{
+    orderID: string;
+    sizeMatched: number;
+    price: number;
+    costFilled: number;
+  }>> {
+    const fills: Array<{ orderID: string; sizeMatched: number; price: number; costFilled: number }> = [];
+    for (const id of orderIds) {
+      try {
+        const order = await this.client.getOrder(id);
+        const sizeMatched = parseFloat(order.size_matched) || 0;
+        const price = parseFloat(order.price) || 0;
+        fills.push({
+          orderID: id,
+          sizeMatched,
+          price,
+          costFilled: sizeMatched * price, // shares * price-per-share = USD cost
+        });
+      } catch (err) {
+        this.logger.warn("Failed to query order fill", {
+          orderID: id,
+          error: (err as Error).message,
+        });
+      }
+    }
+    return fills;
   }
 }
