@@ -131,8 +131,8 @@ export const loadConfig = (): Config => {
   // Trading parameters (percentage-based)
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 2); // 2% of balance per order
   const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
-  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7);
-  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 5);
+  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
+  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 40);
   const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 30);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);

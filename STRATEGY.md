@@ -65,7 +65,7 @@ P(Up gewinnt) = Φ(z)    ← Normal-Verteilung CDF
 ## Order-Strategie: Grid Orders
 
 ### Primäre Seite (die Seite mit Edge):
-- Kauft bis zu **5 Orders** (MAX_BUYS_PER_SIDE) an verschiedenen Ask-Levels
+- Kauft bis zu **3 Orders** (MAX_BUYS_PER_SIDE) an verschiedenen Ask-Levels
 - Nur Orders wo Preis ≤ Fair Value + 5¢
 - Jede Order: $5.00 (BUY_AMOUNT_PCT=5% von Balance)
 
@@ -74,8 +74,8 @@ P(Up gewinnt) = Φ(z)    ← Normal-Verteilung CDF
 - Zweck: Wenn BTC sich umkehrt, verlieren wir weniger
 
 ### Maximal pro Window:
-- **3 Orders total** (MAX_BUYS_PER_WINDOW=3)
-- Das heisst z.B.: 2 Primary + 1 Hedge, oder 3 Primary + 0 Hedge
+- **5 Orders total** (MAX_BUYS_PER_WINDOW=5)
+- Das heisst z.B.: 3 Primary + 2 Hedge, oder 3 Primary + 0 Hedge
 
 ### Wichtig zum Hedge:
 Der Bot kauft NICHT 50/50 auf beide Seiten! Das Hedge ist optional und nur bei billigen Preisen:
@@ -142,8 +142,8 @@ Wenn Fair Value = 65¢ und wir kaufen bei 55¢:
 |-----------|------|-------------|
 | BUY_AMOUNT_PCT | 5% | Pro Order als % der Balance |
 | EDGE_THRESHOLD_CENTS | 5 | Mindest-Edge in Cents |
-| MAX_BUYS_PER_WINDOW | 3 | Max Orders pro 5-Min Window |
-| MAX_BUYS_PER_SIDE | 5 | Max Orders pro Seite (vor Window-Cap) |
+| MAX_BUYS_PER_WINDOW | 5 | Max Orders pro 5-Min Window |
+| MAX_BUYS_PER_SIDE | 3 | Max Primary-Orders pro Seite (+ bis zu 2 Hedge) |
 | ENTRY_DELAY_SECONDS | 30 | Warten nach Window-Start |
 | HEDGE_MAX_PRICE_CENTS | 40 | Hedge nur kaufen wenn < 40¢ |
 | MIN_DELTA_THRESHOLD_USD | 10 | Min BTC-Bewegung bei 50/50 Markt |
