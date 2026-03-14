@@ -25,31 +25,37 @@ const TIME_BUCKETS = [240, 200, 150, 100, 60, 30, 10];
  * Each row is a delta bucket, each column is a time bucket.
  *
  * Key differences from normal CDF:
- * 1. More extreme at moderate deltas (momentum effect)
- * 2. Faster convergence as time decreases (less mean-reversion than theory)
- * 3. Slightly asymmetric (BTC has mild upward drift in short intervals)
+ * 1. Mean-reversion bias at early timepoints (240s, 200s) — BTC dips/spikes
+ *    frequently revert within 5 minutes, so P(continuation) is LOWER than
+ *    normal CDF suggests when lots of time remains.
+ * 2. Directional confidence only with less time (≤60s) — less time to revert.
+ * 3. Conservative at moderate deltas — only give strong edge signal when
+ *    the move is large or time is short.
  *
- * Values calibrated so that entries at 50-65¢ with 5¢+ edge yield ~58-62% observed win rate.
+ * Calibrated to avoid the observed failure mode: Bot sees -$20 dip at 60s,
+ * bets Down at 67%, but BTC reverts and Up wins. With mean-reversion table,
+ * the same dip at 240s remaining gives only ~55% Down, requiring a bigger
+ * move or less time before triggering a trade.
  */
 const LOOKUP: number[][] = [
-  // delta:  -3.0   240s   200s   150s   100s    60s    30s    10s
-  /* -3.0 */ [  3,     2,     2,     1,     1,     1,     1 ],
-  /* -2.0 */ [  8,     6,     5,     4,     3,     2,     1 ],
-  /* -1.5 */ [ 14,    11,     9,     7,     5,     3,     2 ],
-  /* -1.0 */ [ 22,    19,    16,    13,    10,     7,     3 ],
-  /* -0.7 */ [ 28,    25,    22,    18,    14,    10,     5 ],
-  /* -0.5 */ [ 33,    30,    27,    23,    19,    14,     7 ],
-  /* -0.3 */ [ 39,    37,    34,    30,    26,    20,    12 ],
-  /* -0.1 */ [ 46,    45,    43,    41,    38,    33,    25 ],
+  // delta:        240s   200s   150s   100s    60s    30s    10s
+  /* -3.0 */ [ 12,     8,     5,     3,     2,     1,     1 ],
+  /* -2.0 */ [ 20,    16,    12,     8,     5,     3,     1 ],
+  /* -1.5 */ [ 27,    23,    18,    13,     9,     5,     2 ],
+  /* -1.0 */ [ 34,    30,    25,    20,    14,     8,     3 ],
+  /* -0.7 */ [ 38,    35,    30,    25,    19,    12,     5 ],
+  /* -0.5 */ [ 42,    39,    35,    30,    24,    16,     7 ],
+  /* -0.3 */ [ 45,    43,    40,    36,    31,    23,    12 ],
+  /* -0.1 */ [ 48,    47,    46,    44,    41,    36,    25 ],
   /*  0.0 */ [ 50,    50,    50,    50,    50,    50,    50 ],
-  /*  0.1 */ [ 54,    55,    57,    59,    62,    67,    75 ],
-  /*  0.3 */ [ 61,    63,    66,    70,    74,    80,    88 ],
-  /*  0.5 */ [ 67,    70,    73,    77,    81,    86,    93 ],
-  /*  0.7 */ [ 72,    75,    78,    82,    86,    90,    95 ],
-  /*  1.0 */ [ 78,    81,    84,    87,    90,    93,    97 ],
-  /*  1.5 */ [ 86,    89,    91,    93,    95,    97,    98 ],
-  /*  2.0 */ [ 92,    94,    95,    96,    97,    98,    99 ],
-  /*  3.0 */ [ 97,    98,    98,    99,    99,    99,    99 ],
+  /*  0.1 */ [ 52,    53,    54,    56,    59,    64,    75 ],
+  /*  0.3 */ [ 55,    57,    60,    64,    69,    77,    88 ],
+  /*  0.5 */ [ 58,    61,    65,    70,    76,    84,    93 ],
+  /*  0.7 */ [ 62,    65,    70,    75,    81,    88,    95 ],
+  /*  1.0 */ [ 66,    70,    75,    80,    86,    92,    97 ],
+  /*  1.5 */ [ 73,    77,    82,    87,    91,    95,    98 ],
+  /*  2.0 */ [ 80,    84,    88,    92,    95,    97,    99 ],
+  /*  3.0 */ [ 88,    92,    95,    97,    98,    99,    99 ],
 ];
 
 /**
