@@ -284,10 +284,11 @@ export class ClobService {
   }
 
   /**
-   * Query actual fill amounts for placed orders.
-   * Returns the USD cost actually filled per order.
+   * Query actual fill data for placed orders using the trades endpoint.
+   * Uses getTrades() for actual execution prices (not limit prices).
+   * Falls back to getOrder() if trades lookup fails.
    */
-  async getOrderFills(orderIds: string[]): Promise<Array<{
+  async getOrderFills(orderIds: string[], conditionId?: string): Promise<Array<{
     orderID: string;
     sizeMatched: number;
     price: number;
@@ -295,6 +296,61 @@ export class ClobService {
     tokenId: string;
   }>> {
     const fills: Array<{ orderID: string; sizeMatched: number; price: number; costFilled: number; tokenId: string }> = [];
+    const orderIdSet = new Set(orderIds);
+
+    // Try trades endpoint first for actual execution prices
+    if (conditionId) {
+      try {
+        const trades = await this.client.getTrades({ market: conditionId });
+        for (const trade of trades) {
+          // Check if we're the taker on this trade
+          if (orderIdSet.has(trade.taker_order_id)) {
+            const size = parseFloat(trade.size) || 0;
+            const price = parseFloat(trade.price) || 0;
+            if (size > 0) {
+              fills.push({
+                orderID: trade.taker_order_id,
+                sizeMatched: size,
+                price,
+                costFilled: size * price,
+                tokenId: trade.asset_id,
+              });
+            }
+            continue;
+          }
+
+          // Check if we're the maker on this trade
+          for (const makerOrder of trade.maker_orders) {
+            if (orderIdSet.has(makerOrder.order_id)) {
+              const size = parseFloat(makerOrder.matched_amount) || 0;
+              const price = parseFloat(makerOrder.price) || 0;
+              if (size > 0) {
+                fills.push({
+                  orderID: makerOrder.order_id,
+                  sizeMatched: size,
+                  price,
+                  costFilled: size * price,
+                  tokenId: trade.asset_id,
+                });
+              }
+            }
+          }
+        }
+
+        if (fills.length > 0) {
+          this.logger.info("Using trades endpoint for accurate fill prices", {
+            tradeCount: fills.length,
+          });
+          return fills;
+        }
+      } catch (err) {
+        this.logger.warn("Failed to query trades, falling back to order-based fills", {
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    // Fallback: use order data (limit price, may differ from actual fill price)
     for (const id of orderIds) {
       try {
         const order = await this.client.getOrder(id);
@@ -304,7 +360,7 @@ export class ClobService {
           orderID: id,
           sizeMatched,
           price,
-          costFilled: sizeMatched * price, // shares * price-per-share = USD cost
+          costFilled: sizeMatched * price,
           tokenId: order.asset_id,
         });
       } catch (err) {

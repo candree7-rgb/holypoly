@@ -176,7 +176,7 @@ const main = async () => {
     // For live trades, query actual fills from Polymarket
     const isLive = !config.dryRun && pendingTrade.orderIds.length > 0;
     if (isLive) {
-      const fills = await clob.getOrderFills(pendingTrade.orderIds);
+      const fills = await clob.getOrderFills(pendingTrade.orderIds, pendingTrade.conditionId);
 
       // Build tokenId -> side mapping from the original orders
       const tokenSideMap = new Map<string, "Up" | "Down">();
