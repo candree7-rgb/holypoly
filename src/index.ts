@@ -52,7 +52,12 @@ const main = async () => {
   logger.info("Parameters", {
     buyAmountPct: `${config.buyAmountPct}%`,
     edgeThreshold: `${config.edgeThresholdCents}¢`,
+    edgeTiers: `${config.edgeTier2Cents}/${config.edgeTier3Cents}/${config.edgeTier4Cents}¢`,
     maxBuysPerWindow: config.maxBuysPerWindow,
+    maxBuysPerSide: config.maxBuysPerSide,
+    hedgeMode: `dynamic (no hedge above ${config.hedgeEdgeThresholdCents}¢)`,
+    hedgeMaxPrice: `${config.hedgeMaxPriceCents}¢`,
+    entryPrice: `${config.minEntryPriceCents}-${config.maxEntryPriceCents}¢`,
     entryDelay: `${config.entryDelaySeconds}s`,
     dailyLossLimit: `${config.dailyLossLimitPct}%`,
     weeklyLossLimit: `${config.weeklyLossLimitPct}%`,

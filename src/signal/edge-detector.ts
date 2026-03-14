@@ -103,14 +103,20 @@ export class EdgeDetector {
       return noTrade(`BTC flat (delta=$${absDelta.toFixed(2)}) and market near 50/50`);
     }
 
-    // Skip when primary side outside sweet spot (purpledeer: 50-65¢)
+    // Skip when primary side outside entry range (purpledeer: 81% of buys at 40-90¢)
     const primaryAskCents = edge.bestSide === "Up" ? marketUpCents : marketDownCents;
     if (primaryAskCents < this.config.minEntryPriceCents) {
-      return noTrade(`Primary ${edge.bestSide} too cheap (${primaryAskCents}¢ < ${this.config.minEntryPriceCents}¢ — contrarian bet)`);
+      return noTrade(`Primary ${edge.bestSide} too cheap (${primaryAskCents}¢ < ${this.config.minEntryPriceCents}¢)`);
     }
     if (primaryAskCents > this.config.maxEntryPriceCents) {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
     }
+
+    // Determine number of primary orders based on edge strength
+    const numPrimary = this.scalePrimaryOrders(edge.bestEdge);
+
+    // Determine hedge: only at lower edge levels (purpledeer hedges ~31% of windows)
+    const shouldHedge = this.shouldHedge(edge.bestEdge);
 
     // Build grid orders
     const orders = this.buildGridOrders(
@@ -119,7 +125,9 @@ export class EdgeDetector {
       edge.fairUp,
       upBook,
       downBook,
-      buyAmountUsd
+      buyAmountUsd,
+      numPrimary,
+      shouldHedge
     );
 
     if (orders.length === 0) {
@@ -132,14 +140,49 @@ export class EdgeDetector {
       primarySide: edge.bestSide,
       fairUp: edge.fairUp,
       bestEdge: edge.bestEdge,
-      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢)`,
+      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, ${numPrimary}P${shouldHedge ? "+H" : ""})`,
     };
   }
 
   /**
+   * Scale number of primary orders with edge strength.
+   * Based on purpledeer's data: avg 2.3 buys/window, 44% are single-buy.
+   */
+  private scalePrimaryOrders(edgeCents: number): number {
+    const { edgeTier2Cents, edgeTier3Cents, edgeTier4Cents, maxBuysPerSide } = this.config;
+
+    let target: number;
+    if (edgeCents >= edgeTier4Cents) {
+      // 15+: very strong signal, go big (4-5)
+      target = 4 + (edgeCents >= edgeTier4Cents + 5 ? 1 : 0);
+    } else if (edgeCents >= edgeTier3Cents) {
+      // 12-15: strong signal
+      target = 3;
+    } else if (edgeCents >= edgeTier2Cents) {
+      // 8-12: medium signal
+      target = 2;
+    } else {
+      // 5-8: weak signal, minimal position
+      target = 1;
+    }
+
+    return Math.min(target, maxBuysPerSide);
+  }
+
+  /**
+   * Dynamic hedge decision based on edge strength.
+   * purpledeer hedges only 31% of windows — high conviction = NO hedge.
+   */
+  private shouldHedge(edgeCents: number): boolean {
+    // Edge > hedgeEdgeThreshold (12¢): no hedge (high conviction)
+    // Edge 8-12¢: optional hedge
+    // Edge 5-8¢: hedge recommended
+    return edgeCents < this.config.hedgeEdgeThresholdCents;
+  }
+
+  /**
    * Build grid of limit orders at different price levels.
-   * Primary side: 3-5 orders at ask levels up to fair value + 5¢
-   * Hedge side: 1-2 orders at cheap levels (< hedgeMaxPriceCents)
+   * Primary orders scale with edge. Hedge is conditional (31% of windows).
    */
   private buildGridOrders(
     window: WindowInfo,
@@ -147,7 +190,9 @@ export class EdgeDetector {
     fairUp: number,
     upBook: OrderbookSnapshot,
     downBook: OrderbookSnapshot,
-    buyAmountUsd: number
+    buyAmountUsd: number,
+    numPrimary: number,
+    shouldHedge: boolean
   ): GridOrder[] {
     const orders: GridOrder[] = [];
     const hedgeSide: TradeSide = primarySide === "Up" ? "Down" : "Up";
@@ -163,10 +208,9 @@ export class EdgeDetector {
     const primaryMaxPrice = (fairPrimary + 5) / 100; // convert cents to decimal
     const primaryLevels = primaryBook.asks
       .filter((a) => a.price <= primaryMaxPrice)
-      .slice(0, this.config.maxBuysPerSide);
+      .slice(0, numPrimary); // scaled by edge, NOT always maxBuysPerSide
 
     for (const level of primaryLevels) {
-      const size = buyAmountUsd / level.price; // shares = USD / price
       orders.push({
         side: primarySide,
         tokenId: primaryTokenId,
@@ -175,7 +219,7 @@ export class EdgeDetector {
       });
     }
 
-    // If no ask levels available, place at best ask
+    // If no ask levels available, place at best ask (still respect numPrimary)
     if (orders.length === 0 && primaryBook.bestAsk !== null) {
       if (primaryBook.bestAsk <= primaryMaxPrice) {
         orders.push({
@@ -187,12 +231,12 @@ export class EdgeDetector {
       }
     }
 
-    // Hedge side: only if we have primary orders (never hedge without a primary bet)
-    if (orders.length > 0) {
-      const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100;
+    // Hedge side: only when edge is low enough AND opposite side is cheap
+    if (shouldHedge && orders.length > 0) {
+      const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100; // 45¢
       const hedgeLevels = hedgeBook.asks
         .filter((a) => a.price <= hedgeMaxPrice)
-        .slice(0, 2);
+        .slice(0, 1); // max 1 hedge order (purpledeer avg)
 
       for (const level of hedgeLevels) {
         orders.push({
@@ -204,7 +248,7 @@ export class EdgeDetector {
       }
     }
 
-    // Cap total orders
+    // Cap total orders (hard ceiling)
     return orders.slice(0, this.config.maxBuysPerWindow);
   }
 }

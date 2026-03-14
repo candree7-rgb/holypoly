@@ -34,6 +34,15 @@ export interface Config {
   minDeltaThresholdUsd: number;
   volatilityLookbackSeconds: number;
 
+  // Edge-based order scaling tiers (cents)
+  edgeTier2Cents: number; // 5-8: 1 primary order
+  edgeTier3Cents: number; // 8-12: 2 primary orders
+  edgeTier4Cents: number; // 12-15: 3 primary orders
+  // 15+: 4-5 primary orders
+
+  // Dynamic hedge logic
+  hedgeEdgeThresholdCents: number; // No hedge above this edge
+
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
   dailyLossLimitPct: number;
@@ -133,15 +142,23 @@ export const loadConfig = (): Config => {
   // Trading parameters (percentage-based)
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 2); // 2% of balance per order
   const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
-  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
-  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
-  const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 40);
-  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 65);
-  const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 50);
-  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 30);
+  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7); // hard ceiling
+  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 5); // hard ceiling
+  const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
+  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
+  const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
+  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 120);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
   const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
   const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 300);
+
+  // Edge-based order scaling tiers
+  const edgeTier2Cents = parseNumber("EDGE_TIER2_CENTS", 8);
+  const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
+  const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
+
+  // Dynamic hedge logic
+  const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD", 12);
 
   // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10); // 10% of daily starting balance
@@ -204,6 +221,10 @@ export const loadConfig = (): Config => {
     redeemDelaySeconds,
     minDeltaThresholdUsd,
     volatilityLookbackSeconds,
+    edgeTier2Cents,
+    edgeTier3Cents,
+    edgeTier4Cents,
+    hedgeEdgeThresholdCents,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,
