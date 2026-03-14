@@ -1,161 +1,194 @@
 import { Logger } from "../logger.js";
 import type { WindowInfo } from "../types.js";
 
-interface GammaMarket {
+/**
+ * CLOB-based market discovery for 5-minute BTC Up/Down markets.
+ *
+ * These markets are NOT in the Gamma API — they live directly in the CLOB
+ * with a predictable slug format: btc-updown-5m-{unix_timestamp}
+ *
+ * Each slug corresponds to a 5-minute window starting at that timestamp.
+ * The CLOB endpoint GET /markets/{condition_id} returns full market data.
+ */
+
+interface ClobMarket {
   condition_id: string;
   question: string;
+  market_slug: string;
+  end_date_iso: string;
+  active: boolean;
+  closed: boolean;
+  accepting_orders: boolean;
+  neg_risk: boolean;
+  minimum_order_size: number;
+  minimum_tick_size: number;
   tokens: Array<{
     token_id: string;
     outcome: string;
+    price: number;
+    winner: boolean;
   }>;
-  neg_risk: boolean;
-  end_date_iso: string;
-  start_date_iso?: string;
-  description?: string;
-  active: boolean;
-  closed: boolean;
-  game_start_time?: string;
-  // 5-min markets have specific tags/slugs
-  slug?: string;
-  events?: Array<{
-    slug?: string;
-    title?: string;
-  }>;
+  tags: string[];
 }
 
-interface GammaEvent {
-  slug: string;
-  title: string;
-  markets: GammaMarket[];
-}
+export class MarketDiscovery {
+  private clobHost: string;
+  private currentMarket: WindowInfo | null = null;
+  private currentSlug: string | null = null;
 
-/**
- * Polymarket Gamma API client for discovering active 5-minute BTC markets.
- */
-export class GammaClient {
-  private host: string;
-
-  constructor(host: string, private logger: Logger) {
-    this.host = host.replace(/\/$/, "");
-  }
-
-  private async fetchJson<T>(url: string): Promise<T> {
-    const resp = await fetch(url, {
-      headers: {
-        "User-Agent": "holypoly-bot",
-        Accept: "application/json",
-      },
-    });
-    if (!resp.ok) {
-      const text = await resp.text();
-      throw new Error(`Gamma API error ${resp.status}: ${text}`);
-    }
-    return (await resp.json()) as T;
+  constructor(clobHost: string, private logger: Logger) {
+    this.clobHost = clobHost.replace(/\/$/, "");
   }
 
   /**
    * Find the currently active 5-minute BTC Up/Down market.
-   * Returns null if no active market found.
+   *
+   * Strategy: Calculate the current and next window timestamps,
+   * construct the slug, and fetch directly from CLOB.
    */
   async findActive5MinBtcMarket(): Promise<WindowInfo | null> {
-    try {
-      // Search for active BTC 5-minute markets
-      const params = new URLSearchParams({
-        active: "true",
-        closed: "false",
-        limit: "10",
-        order: "end_date_iso",
-        ascending: "true",
-      });
+    const now = Math.floor(Date.now() / 1000);
+    const windowSize = 300; // 5 minutes
 
-      // Try the events endpoint first for 5-min crypto markets
-      const eventsUrl = `${this.host}/events?${params}&slug=bitcoin-5-minute`;
-      let markets: GammaMarket[] = [];
+    // Current window start (rounded down to 5-min boundary)
+    const currentWindowStart = Math.floor(now / windowSize) * windowSize;
+
+    // Try current window, then next window
+    const candidates = [
+      currentWindowStart,
+      currentWindowStart + windowSize,
+    ];
+
+    for (const windowStart of candidates) {
+      const slug = `btc-updown-5m-${windowStart}`;
+
+      // Skip if we already have this market
+      if (slug === this.currentSlug && this.currentMarket) {
+        return this.currentMarket;
+      }
 
       try {
-        const events = await this.fetchJson<GammaEvent[]>(eventsUrl);
-        for (const event of events) {
-          markets.push(...(event.markets || []));
+        const market = await this.fetchMarketBySlug(slug);
+        if (!market) continue;
+
+        // Must be active and accepting orders
+        if (!market.active || market.closed) continue;
+
+        const upToken = market.tokens.find((t) => t.outcome === "Up");
+        const downToken = market.tokens.find((t) => t.outcome === "Down");
+
+        if (!upToken || !downToken) {
+          this.logger.warn("Market missing Up/Down tokens", { slug });
+          continue;
         }
-      } catch {
-        // Fallback: search markets directly
-        const marketsUrl = `${this.host}/markets?${params}&tag=btc-5min`;
-        markets = await this.fetchJson<GammaMarket[]>(marketsUrl);
-      }
 
-      // If still no markets, try broader search
-      if (markets.length === 0) {
-        const broadUrl = `${this.host}/markets?active=true&closed=false&limit=20&order=end_date_iso&ascending=true`;
-        const allMarkets = await this.fetchJson<GammaMarket[]>(broadUrl);
-        markets = allMarkets.filter((m) => {
-          const q = (m.question || "").toLowerCase();
-          return (
-            q.includes("bitcoin") &&
-            (q.includes("up or down") || q.includes("5 min") || q.includes("5-min"))
-          );
-        });
-      }
+        const windowEnd = windowStart + windowSize;
 
-      if (markets.length === 0) {
-        this.logger.debug("No active 5-min BTC market found");
-        return null;
-      }
-
-      // Find the earliest ending active market (= current window)
-      const now = Date.now();
-      const active = markets
-        .filter((m) => m.active && !m.closed)
-        .filter((m) => new Date(m.end_date_iso).getTime() > now)
-        .sort((a, b) => new Date(a.end_date_iso).getTime() - new Date(b.end_date_iso).getTime());
-
-      if (active.length === 0) {
-        this.logger.debug("No upcoming 5-min BTC market window");
-        return null;
-      }
-
-      const market = active[0];
-      const upToken = market.tokens.find(
-        (t) => t.outcome.toLowerCase() === "up" || t.outcome.toLowerCase() === "yes"
-      );
-      const downToken = market.tokens.find(
-        (t) => t.outcome.toLowerCase() === "down" || t.outcome.toLowerCase() === "no"
-      );
-
-      if (!upToken || !downToken) {
-        this.logger.warn("Market missing Up/Down tokens", {
+        this.currentSlug = slug;
+        this.currentMarket = {
           conditionId: market.condition_id,
-          tokens: market.tokens.map((t) => t.outcome),
+          upTokenId: upToken.token_id,
+          downTokenId: downToken.token_id,
+          openingPrice: 0, // Set from Chainlink at window start
+          startTime: windowStart * 1000,
+          endTime: windowEnd * 1000,
+          negRisk: market.neg_risk,
+        };
+
+        this.logger.info("Found 5-min BTC market", {
+          slug,
+          conditionId: market.condition_id.slice(0, 16) + "...",
+          window: `${new Date(windowStart * 1000).toISOString()} - ${new Date(windowEnd * 1000).toISOString()}`,
+          upPrice: upToken.price,
+          downPrice: downToken.price,
         });
-        return null;
+
+        return this.currentMarket;
+      } catch (err) {
+        this.logger.debug("Market fetch failed", { slug, error: (err as Error).message });
       }
-
-      const endTime = new Date(market.end_date_iso).getTime();
-      const startTime = endTime - 5 * 60 * 1000; // 5 minutes before end
-
-      return {
-        conditionId: market.condition_id,
-        upTokenId: upToken.token_id,
-        downTokenId: downToken.token_id,
-        openingPrice: 0, // Will be set from Chainlink at window start
-        startTime,
-        endTime,
-        negRisk: market.neg_risk,
-      };
-    } catch (err) {
-      this.logger.error("Gamma API error", { error: (err as Error).message });
-      return null;
     }
+
+    return null;
   }
 
   /**
-   * Get the orderbook prices for a token.
+   * Fetch a market from the CLOB by trying to find it via condition_id search.
+   * Since CLOB doesn't support slug search directly, we construct
+   * condition_id from the known slug pattern.
    */
-  async getMarketPrices(tokenId: string): Promise<{ bestAsk: number; bestBid: number } | null> {
+  private async fetchMarketBySlug(slug: string): Promise<ClobMarket | null> {
+    // The CLOB has a /markets endpoint but doesn't filter by slug well.
+    // Instead, try the Gamma API which indexes these markets:
     try {
-      // Use CLOB for orderbook data — this is just a helper to check Gamma
-      return null;
+      const gammaUrl = `https://gamma-api.polymarket.com/markets?slug=${slug}&limit=1`;
+      const resp = await fetch(gammaUrl, {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-bot" },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as Array<{
+          conditionId: string;
+          clobTokenIds: string;
+          outcomes: string;
+          endDateIso: string;
+          active: boolean;
+          closed: boolean;
+          negRisk: boolean;
+        }>;
+        if (data.length > 0) {
+          const m = data[0];
+          const tokenIds = JSON.parse(m.clobTokenIds || "[]") as string[];
+          const outcomes = JSON.parse(m.outcomes || "[]") as string[];
+          return {
+            condition_id: m.conditionId,
+            question: "",
+            market_slug: slug,
+            end_date_iso: m.endDateIso,
+            active: m.active,
+            closed: m.closed,
+            accepting_orders: m.active && !m.closed,
+            neg_risk: m.negRisk,
+            minimum_order_size: 5,
+            minimum_tick_size: 0.01,
+            tokens: tokenIds.map((id, i) => ({
+              token_id: id,
+              outcome: outcomes[i] || (i === 0 ? "Up" : "Down"),
+              price: 0.5,
+              winner: false,
+            })),
+            tags: ["5M"],
+          };
+        }
+      }
     } catch {
-      return null;
+      // Gamma failed, try CLOB directly
     }
+
+    // Fallback: try CLOB /markets?market_slug=
+    // Note: CLOB slug search is unreliable, but we can try
+    try {
+      const clobUrl = `${this.clobHost}/markets?market_slug=${slug}`;
+      const resp = await fetch(clobUrl, {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-bot" },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as { data?: ClobMarket[] } | ClobMarket[];
+        const markets = Array.isArray(data) ? data : (data.data || []);
+        const match = markets.find((m) => m.market_slug === slug);
+        if (match) return match;
+      }
+    } catch {
+      // CLOB also failed
+    }
+
+    return null;
+  }
+
+  /**
+   * Clear cached market (call when window ends).
+   */
+  clearCurrent(): void {
+    this.currentMarket = null;
+    this.currentSlug = null;
   }
 }

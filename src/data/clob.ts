@@ -1,5 +1,6 @@
 import {
   ApiKeyCreds,
+  AssetType,
   ClobClient,
   OrderType,
   Side,
@@ -92,6 +93,22 @@ export class ClobService {
       config.funderAddress,
     );
     return new ClobService(client, logger);
+  }
+
+  /**
+   * Get USDC balance from Polymarket account.
+   * Uses the CLOB getBalanceAllowance endpoint (L2 authenticated).
+   */
+  async getBalance(): Promise<number> {
+    try {
+      const result = await this.client.getBalanceAllowance({
+        asset_type: AssetType.COLLATERAL,
+      });
+      return parseFloat(result.balance) || 0;
+    } catch (err) {
+      this.logger.warn("Failed to get balance", { error: (err as Error).message });
+      return 0;
+    }
   }
 
   async getMarketMeta(tokenId: string): Promise<MarketMeta> {

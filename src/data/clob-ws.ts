@@ -1,0 +1,216 @@
+import WebSocket from "ws";
+import { Logger } from "../logger.js";
+
+export interface BookSnapshot {
+  assetId: string;
+  bids: Array<{ price: number; size: number }>;
+  asks: Array<{ price: number; size: number }>;
+  bestBid: number | null;
+  bestAsk: number | null;
+}
+
+/**
+ * Polymarket CLOB WebSocket for realtime orderbook updates.
+ * URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+ * No auth required for market channel.
+ */
+export class ClobWsClient {
+  private ws: WebSocket | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private pingTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectDelay = 1000;
+  private maxReconnectDelay = 30000;
+  private running = false;
+  private subscribedTokens: string[] = [];
+  private books: Map<string, BookSnapshot> = new Map();
+  private onUpdateCallbacks: ((assetId: string, book: BookSnapshot) => void)[] = [];
+
+  constructor(private logger: Logger) {}
+
+  get connected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
+  getBook(tokenId: string): BookSnapshot | null {
+    return this.books.get(tokenId) ?? null;
+  }
+
+  onUpdate(cb: (assetId: string, book: BookSnapshot) => void): void {
+    this.onUpdateCallbacks.push(cb);
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.connect();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+
+  /**
+   * Subscribe to orderbook updates for given token IDs.
+   */
+  subscribe(tokenIds: string[]): void {
+    this.subscribedTokens = tokenIds;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.sendSubscription();
+    }
+  }
+
+  /**
+   * Clear subscriptions and books (call on window transition).
+   */
+  clear(): void {
+    this.subscribedTokens = [];
+    this.books.clear();
+  }
+
+  private sendSubscription(): void {
+    if (!this.ws || this.subscribedTokens.length === 0) return;
+    this.ws.send(JSON.stringify({
+      assets_ids: this.subscribedTokens,
+      type: "market",
+      custom_feature_enabled: true,
+    }));
+    this.logger.debug("CLOB WS subscribed", { tokens: this.subscribedTokens.length });
+  }
+
+  private connect(): void {
+    if (!this.running) return;
+
+    const url = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+    this.logger.debug("CLOB WS connecting");
+
+    this.ws = new WebSocket(url);
+
+    this.ws.on("open", () => {
+      this.logger.info("CLOB WS connected");
+      this.reconnectDelay = 1000;
+
+      // Re-subscribe if we have tokens
+      if (this.subscribedTokens.length > 0) {
+        this.sendSubscription();
+      }
+
+      // Keepalive: ping every 10 seconds
+      this.pingTimer = setInterval(() => {
+        if (this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.send("PING");
+        }
+      }, 10000);
+    });
+
+    this.ws.on("message", (data: WebSocket.Data) => {
+      const raw = data.toString();
+      if (raw === "PONG") return;
+
+      try {
+        const msg = JSON.parse(raw) as {
+          event_type?: string;
+          asset_id?: string;
+          market?: string;
+          bids?: Array<{ price: string; size: string }>;
+          asks?: Array<{ price: string; size: string }>;
+          price_changes?: Array<{
+            asset_id: string;
+            price: string;
+            size: string;
+            side: string;
+            best_bid: string;
+            best_ask: string;
+          }>;
+        };
+
+        if (msg.event_type === "book" && msg.asset_id) {
+          // Full orderbook snapshot
+          const book = this.parseBook(
+            msg.asset_id,
+            msg.bids || [],
+            msg.asks || []
+          );
+          this.books.set(msg.asset_id, book);
+          this.notifyUpdate(msg.asset_id, book);
+        } else if (msg.event_type === "price_change" && msg.price_changes) {
+          // Incremental update — update best bid/ask
+          for (const change of msg.price_changes) {
+            const existing = this.books.get(change.asset_id);
+            if (existing) {
+              existing.bestBid = parseFloat(change.best_bid) || existing.bestBid;
+              existing.bestAsk = parseFloat(change.best_ask) || existing.bestAsk;
+              this.notifyUpdate(change.asset_id, existing);
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    });
+
+    this.ws.on("close", () => {
+      this.logger.warn("CLOB WS disconnected");
+      if (this.pingTimer) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
+      this.scheduleReconnect();
+    });
+
+    this.ws.on("error", (err: Error) => {
+      this.logger.error("CLOB WS error", { error: err.message });
+      this.ws?.close();
+    });
+  }
+
+  private parseBook(
+    assetId: string,
+    rawBids: Array<{ price: string; size: string }>,
+    rawAsks: Array<{ price: string; size: string }>
+  ): BookSnapshot {
+    const bids = rawBids
+      .map((b) => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
+      .filter((b) => b.size > 0)
+      .sort((a, b) => b.price - a.price);
+
+    const asks = rawAsks
+      .map((a) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+      .filter((a) => a.size > 0)
+      .sort((a, b) => a.price - b.price);
+
+    return {
+      assetId,
+      bids,
+      asks,
+      bestBid: bids.length > 0 ? bids[0].price : null,
+      bestAsk: asks.length > 0 ? asks[0].price : null,
+    };
+  }
+
+  private notifyUpdate(assetId: string, book: BookSnapshot): void {
+    for (const cb of this.onUpdateCallbacks) {
+      cb(assetId, book);
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (!this.running) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.connect();
+    }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+  }
+}
