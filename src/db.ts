@@ -174,6 +174,18 @@ export class Database {
     );
   }
 
+  async updateWindowSettlement(
+    conditionId: string,
+    pnl: number,
+    winner: string,
+  ): Promise<void> {
+    await this.pool.query(
+      `UPDATE window_trades SET pnl = $2, winner = $3
+       WHERE condition_id = $1 AND pnl IS NULL`,
+      [conditionId, pnl, winner]
+    );
+  }
+
   // === Redeem Tracking ===
 
   async getRedeemAttempt(conditionId: string): Promise<number> {

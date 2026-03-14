@@ -127,6 +127,78 @@ const main = async () => {
   let tradedThisWindow = false;
   let currentWindowId: string | null = null;
 
+  // Pending trade for settlement tracking (dry run + live)
+  let pendingTrade: {
+    conditionId: string;
+    openingPrice: number;
+    orders: GridOrder[];
+    primarySide: "Up" | "Down";
+    balanceBefore: number;
+  } | null = null;
+
+  /**
+   * Settle a pending trade by checking BTC price vs opening price.
+   * Works for both dry run (simulated) and live trades.
+   */
+  const settlePendingTrade = async () => {
+    if (!pendingTrade) return;
+
+    // Use Chainlink price (settlement oracle), fallback to Binance
+    const settlementPrice = rtds.price ?? binance.price;
+    if (settlementPrice === null) {
+      logger.warn("No settlement price available, skipping P&L calc");
+      pendingTrade = null;
+      return;
+    }
+
+    const winner: "Up" | "Down" = settlementPrice > pendingTrade.openingPrice ? "Up" : "Down";
+    let totalPnl = 0;
+    const orderResults: Array<{ side: string; price: string; amount: string; pnl: string; won: boolean }> = [];
+
+    for (const order of pendingTrade.orders) {
+      const won = order.side === winner;
+      // Binary outcome: win pays $1/share, lose pays $0/share
+      // shares = amount / (price/100), cost = amount
+      // win pnl = shares * 1 - cost = amount * (100/price - 1)
+      // lose pnl = -cost = -amount
+      const pnl = won
+        ? order.amount * (100 / order.price - 1)
+        : -order.amount;
+      totalPnl += pnl;
+      orderResults.push({
+        side: order.side,
+        price: `${order.price.toFixed(1)}¢`,
+        amount: `$${order.amount.toFixed(2)}`,
+        pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+        won,
+      });
+    }
+
+    const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
+    logger.info(`${prefix}`, {
+      conditionId: pendingTrade.conditionId.slice(0, 16) + "...",
+      winner,
+      btcOpening: pendingTrade.openingPrice.toFixed(2),
+      btcSettlement: settlementPrice.toFixed(2),
+      delta: `$${(settlementPrice - pendingTrade.openingPrice).toFixed(2)}`,
+      orders: orderResults,
+      totalPnl: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+      result: totalPnl >= 0 ? "WIN" : "LOSS",
+    });
+
+    // Update risk manager P&L tracking (works for both dry run and live)
+    await riskManager.recordResult(totalPnl);
+
+    // Update DB record with settlement data
+    await db.updateWindowSettlement(
+      pendingTrade.conditionId,
+      totalPnl,
+      winner,
+    );
+
+    pendingTrade = null;
+  };
+
   // === MAIN TRADING LOOP ===
   const tradingLoop = async () => {
     let lastStatusLog = 0;
@@ -162,8 +234,11 @@ const main = async () => {
           continue;
         }
 
-        // New window — reset state + subscribe CLOB WS
+        // New window — settle previous trade + reset state
         if (window.conditionId !== currentWindowId) {
+          // Settle the previous window's trade before starting new one
+          await settlePendingTrade();
+
           currentWindowId = window.conditionId;
           tradedThisWindow = false;
 
@@ -263,6 +338,15 @@ const main = async () => {
         }
 
         tradedThisWindow = true;
+
+        // Store pending trade for settlement P&L calculation
+        pendingTrade = {
+          conditionId: window.conditionId,
+          openingPrice: window.openingPrice,
+          orders: decision.orders,
+          primarySide: decision.primarySide,
+          balanceBefore: balance,
+        };
 
         // Record to database
         await db.recordWindow({
