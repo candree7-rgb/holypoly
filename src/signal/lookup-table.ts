@@ -1,61 +1,62 @@
 /**
- * Empirical fair value lookup table for 5-minute BTC Up/Down markets.
+ * EMPIRICAL fair value lookup table for 5-minute BTC Up/Down markets.
  *
- * Based on observed BTC microstructure:
- * - BTC has fat tails (extreme moves more likely than normal distribution predicts)
- * - Short-term momentum: moves tend to continue more than mean-revert in 5-min windows
- * - The normal CDF underestimates continuation probability at moderate deltas
+ * Built from 104,754 real Binance BTCUSDT 5-minute windows.
+ * Generated: 2026-03-15
  *
- * Table maps (delta_bucket, time_bucket) → P(Up wins) in cents [0-100].
- * Delta is normalized: delta_usd / volatility to make it vol-adjusted.
+ * For each (normalized_delta, time_remaining) cell, this table contains
+ * the ACTUAL historical probability that BTC closes above its opening price.
  *
- * Constructed from empirical BTC 5-min candle analysis and adjusted for
- * purpledeer's observed edge patterns (entries at 50-65¢, ~60% win rate).
+ * Direct measurements at [240, 180, 120, 60] seconds (from 1-min candle boundaries).
+ * Values at [200, 150, 100] are interpolated between measurements.
+ * Values at [30, 10] are extrapolated toward settlement determinism.
+ *
+// Sample counts per (delta, time) cell:
+//  delta= -3.0:     92,    335,    770,   1186 (at 240s, 180s, 120s, 60s)
+//  delta= -2.0:    263,    945,   1726,   2573 (at 240s, 180s, 120s, 60s)
+//  delta= -1.5:    911,   2615,   3846,   5022 (at 240s, 180s, 120s, 60s)
+//  delta= -1.0:   3203,   6106,   7640,   8250 (at 240s, 180s, 120s, 60s)
+//  delta= -0.7:   5541,   7808,   8220,   8003 (at 240s, 180s, 120s, 60s)
+//  delta= -0.5:   8659,   9041,   8519,   8189 (at 240s, 180s, 120s, 60s)
+//  delta= -0.3:  13585,  11654,  10189,   9192 (at 240s, 180s, 120s, 60s)
+//  delta= -0.1:  12521,   9623,   8193,   7384 (at 240s, 180s, 120s, 60s)
+//  delta=  0.0:  15011,   9110,   6825,   5530 (at 240s, 180s, 120s, 60s)
+//  delta=  0.1:  12561,   9468,   8084,   7169 (at 240s, 180s, 120s, 60s)
+//  delta=  0.3:  13686,  11613,  10261,   9176 (at 240s, 180s, 120s, 60s)
+//  delta=  0.5:   8827,   8996,   8608,   8025 (at 240s, 180s, 120s, 60s)
+//  delta=  0.7:   5486,   7655,   7975,   8079 (at 240s, 180s, 120s, 60s)
+//  delta=  1.0:   3090,   5944,   7544,   8301 (at 240s, 180s, 120s, 60s)
+//  delta=  1.5:    907,   2497,   3896,   4975 (at 240s, 180s, 120s, 60s)
+//  delta=  2.0:    284,    948,   1713,   2499 (at 240s, 180s, 120s, 60s)
+//  delta=  3.0:    127,    396,    745,   1201 (at 240s, 180s, 120s, 60s)
  */
 
 // Delta buckets: normalized delta (delta / volatility)
 // Negative = BTC below opening, Positive = BTC above opening
-const DELTA_BUCKETS = [-3.0, -2.0, -1.5, -1.0, -0.7, -0.5, -0.3, -0.1, 0.0, 0.1, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0];
+const DELTA_BUCKETS = [-3, -2, -1.5, -1, -0.7, -0.5, -0.3, -0.1, 0, 0.1, 0.3, 0.5, 0.7, 1, 1.5, 2, 3];
 
 // Time remaining buckets (seconds)
 const TIME_BUCKETS = [240, 200, 150, 100, 60, 30, 10];
 
-/**
- * Empirical P(Up wins) lookup table.
- * Each row is a delta bucket, each column is a time bucket.
- *
- * Key differences from normal CDF:
- * 1. Mean-reversion bias at early timepoints (240s, 200s) — BTC dips/spikes
- *    frequently revert within 5 minutes, so P(continuation) is LOWER than
- *    normal CDF suggests when lots of time remains.
- * 2. Directional confidence only with less time (≤60s) — less time to revert.
- * 3. Conservative at moderate deltas — only give strong edge signal when
- *    the move is large or time is short.
- *
- * Calibrated to avoid the observed failure mode: Bot sees -$20 dip at 60s,
- * bets Down at 67%, but BTC reverts and Up wins. With mean-reversion table,
- * the same dip at 240s remaining gives only ~55% Down, requiring a bigger
- * move or less time before triggering a trade.
- */
 const LOOKUP: number[][] = [
   // delta:        240s   200s   150s   100s    60s    30s    10s
-  /* -3.0 */ [ 12,     8,     5,     3,     2,     1,     1 ],
-  /* -2.0 */ [ 20,    16,    12,     8,     5,     3,     1 ],
-  /* -1.5 */ [ 27,    23,    18,    13,     9,     5,     2 ],
-  /* -1.0 */ [ 34,    30,    25,    20,    14,     8,     3 ],
-  /* -0.7 */ [ 38,    35,    30,    25,    19,    12,     5 ],
-  /* -0.5 */ [ 42,    39,    35,    30,    24,    16,     7 ],
-  /* -0.3 */ [ 45,    43,    40,    36,    31,    23,    12 ],
-  /* -0.1 */ [ 48,    47,    46,    44,    41,    36,    25 ],
-  /*  0.0 */ [ 50,    50,    50,    50,    50,    50,    50 ],
-  /*  0.1 */ [ 52,    53,    54,    56,    59,    64,    75 ],
-  /*  0.3 */ [ 55,    57,    60,    64,    69,    77,    88 ],
-  /*  0.5 */ [ 58,    61,    65,    70,    76,    84,    93 ],
-  /*  0.7 */ [ 62,    65,    70,    75,    81,    88,    95 ],
-  /*  1.0 */ [ 66,    70,    75,    80,    86,    92,    97 ],
-  /*  1.5 */ [ 73,    77,    82,    87,    91,    95,    98 ],
-  /*  2.0 */ [ 80,    84,    88,    92,    95,    97,    99 ],
-  /*  3.0 */ [ 88,    92,    95,    97,    98,    99,    99 ],
+  /*  -3.0 */ [    4,    4,    3,    1,    1,    1,    1 ],
+  /*  -2.0 */ [   10,    6,    3,    1,    1,    1,    1 ],
+  /*  -1.5 */ [   10,    7,    4,    2,    1,    1,    1 ],
+  /*  -1.0 */ [   15,   12,    8,    4,    1,    1,    1 ],
+  /*  -0.7 */ [   22,   18,   13,    8,    4,    3,    2 ],
+  /*  -0.5 */ [   27,   25,   21,   15,    9,    6,    4 ],
+  /*  -0.3 */ [   35,   33,   30,   24,   18,   12,    8 ],
+  /*  -0.1 */ [   42,   41,   39,   37,   33,   22,   14 ],
+  /*   0.0 */ [   50,   50,   50,   50,   49,   50,   50 ],
+  /*   0.1 */ [   57,   59,   60,   64,   68,   79,   86 ],
+  /*   0.3 */ [   65,   67,   70,   76,   82,   88,   92 ],
+  /*   0.5 */ [   71,   75,   80,   85,   91,   94,   96 ],
+  /*   0.7 */ [   78,   82,   86,   91,   96,   97,   98 ],
+  /*   1.0 */ [   85,   88,   92,   96,   98,   99,   99 ],
+  /*   1.5 */ [   90,   93,   96,   98,   99,   99,   99 ],
+  /*   2.0 */ [   91,   95,   98,   99,   99,   99,   99 ],
+  /*   3.0 */ [   95,   98,   99,   99,   99,   99,   99 ],
 ];
 
 /**
