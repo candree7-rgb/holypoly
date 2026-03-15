@@ -87,6 +87,12 @@ export class RiskManager {
       const remaining = Math.ceil((pauseUntil - Date.now()) / 60000);
       return noTrade(`Paused for ${remaining} more minutes (losing streak)`);
     }
+    // Pause served → reset streak so bot can trade normally again
+    if (pauseUntil > 0) {
+      this.logger.info("Losing streak pause served, resetting streak counter");
+      await this.db.setLosingStreak(0);
+      await this.db.setPauseUntil(0);
+    }
 
     // Daily loss limit (%-based)
     const today = dayKeyUtc();
