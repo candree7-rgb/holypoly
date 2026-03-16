@@ -14,6 +14,7 @@ import { RedeemService } from "./data/redeem.js";
 import { VolatilityCalculator } from "./signal/volatility.js";
 import { FairValueEngine } from "./signal/fair-value.js";
 import { EdgeDetector } from "./signal/edge-detector.js";
+import { HedgeMonitor } from "./signal/hedge-monitor.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
@@ -63,7 +64,8 @@ const main = async () => {
     edgeTiers: `${config.edgeTier2Cents}/${config.edgeTier3Cents}/${config.edgeTier4Cents}¢`,
     maxBuysPerWindow: config.maxBuysPerWindow,
     maxBuysPerSide: config.maxBuysPerSide,
-    hedgeMode: `dynamic (no hedge above ${config.hedgeEdgeThresholdCents}¢)`,
+    hedgeMonitor: config.hedgeMonitorEnabled ? `ON (trigger: −${config.hedgeTriggerCents}¢)` : "OFF",
+    hedgeMode: config.hedgeMonitorEnabled ? "reactive (post-entry)" : `legacy (no hedge above ${config.hedgeEdgeThresholdCents}¢)`,
     hedgeMaxPrice: `${config.hedgeMaxPriceCents}¢`,
     entryPrice: `${config.minEntryPriceCents}-${config.maxEntryPriceCents}¢`,
     entryDelay: `${config.entryDelaySeconds}s`,
@@ -118,6 +120,11 @@ const main = async () => {
   // 3. CLOB WebSocket (realtime orderbook)
   const clobWs = new ClobWsClient(logger);
   clobWs.start();
+
+  // Reactive hedge monitor (watches prices post-entry, auto-hedges on drop)
+  const hedgeMonitor = config.hedgeMonitorEnabled
+    ? new HedgeMonitor(clobWs, clob, config, logger, telegram)
+    : null;
 
   // Auto-redeem service
   const redeemService = config.autoRedeem
@@ -338,6 +345,9 @@ const main = async () => {
 
         // New window — settle previous trade + reset state
         if (window.conditionId !== currentWindowId) {
+          // Reset hedge monitor before settling
+          hedgeMonitor?.reset();
+
           // Settle the previous window's trade before starting new one
           await settlePendingTrade();
 
@@ -471,6 +481,34 @@ const main = async () => {
           balanceBefore: balance,
           orderIds: liveOrderIds,
         };
+
+        // Start hedge monitor if enabled
+        if (hedgeMonitor) {
+          const primaryOrders = decision.orders.filter(o => o.side === decision.primarySide);
+          const totalCost = primaryOrders.reduce((sum, o) => sum + o.amount, 0);
+          const totalShares = primaryOrders.reduce((sum, o) => sum + o.amount / (o.price / 100), 0);
+          // Use highest entry price as trigger reference (most conservative)
+          const highestEntryPrice = Math.max(...primaryOrders.map(o => o.price));
+
+          const primaryTokenId = decision.primarySide === "Up" ? window.upTokenId : window.downTokenId;
+          const hedgeTokenId = decision.primarySide === "Up" ? window.downTokenId : window.upTokenId;
+
+          hedgeMonitor.startMonitoring({
+            primarySide: decision.primarySide,
+            entryPriceCents: highestEntryPrice,
+            primaryTokenId,
+            hedgeTokenId,
+            primaryCostUsd: totalCost,
+            primaryShares: totalShares,
+            onHedge: (hedgeOrders, hedgeOrderIds) => {
+              // Add hedge orders to pendingTrade for correct settlement
+              if (pendingTrade) {
+                pendingTrade.orders = [...pendingTrade.orders, ...hedgeOrders];
+                pendingTrade.orderIds = [...pendingTrade.orderIds, ...hedgeOrderIds];
+              }
+            },
+          });
+        }
 
         // Record to database
         await db.recordWindow({

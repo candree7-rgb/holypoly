@@ -171,11 +171,11 @@ export class EdgeDetector {
 
   /**
    * Dynamic hedge decision based on edge strength.
+   * Disabled when hedgeMonitorEnabled=true (reactive hedge replaces upfront hedge).
    * Only hedge at medium conviction (8-12¢). No hedge for weak or strong edges.
-   * Weak (5-8¢): too little edge to waste on both sides.
-   * Strong (12+¢): high conviction, no hedge needed.
    */
   private shouldHedge(edgeCents: number): boolean {
+    if (this.config.hedgeMonitorEnabled) return false;
     return edgeCents >= this.config.edgeTier2Cents && edgeCents < this.config.hedgeEdgeThresholdCents;
   }
 

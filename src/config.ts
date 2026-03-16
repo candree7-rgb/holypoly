@@ -40,8 +40,12 @@ export interface Config {
   edgeTier4Cents: number; // 12-15: 3 primary orders
   // 15+: 4-5 primary orders
 
-  // Dynamic hedge logic
+  // Dynamic hedge logic (legacy upfront hedge)
   hedgeEdgeThresholdCents: number; // No hedge above this edge
+
+  // Reactive hedge monitor (new: monitors prices post-entry, hedges on drop)
+  hedgeMonitorEnabled: boolean;
+  hedgeTriggerCents: number; // Drop in ¢ that triggers hedge (e.g. 3 = hedge at -3¢)
 
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
@@ -151,8 +155,6 @@ export const loadConfig = (): Config => {
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
-  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 120);
-  const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
   const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
   const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 300);
 
@@ -161,8 +163,16 @@ export const loadConfig = (): Config => {
   const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
   const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
 
-  // Dynamic hedge logic
+  // Dynamic hedge logic (legacy)
   const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD", 12);
+
+  // Reactive hedge monitor
+  const hedgeMonitorEnabled = parseBoolean("HEDGE_MONITOR_ENABLED", true);
+  const hedgeTriggerCents = parseNumber("HEDGE_TRIGGER_CENTS", 3);
+
+  // Entry delay (later entry when hedge monitor is active — more confirmed edge)
+  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", hedgeMonitorEnabled ? 210 : 120);
+  const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10); // 10% of daily starting balance
@@ -233,6 +243,8 @@ export const loadConfig = (): Config => {
     edgeTier3Cents,
     edgeTier4Cents,
     hedgeEdgeThresholdCents,
+    hedgeMonitorEnabled,
+    hedgeTriggerCents,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,

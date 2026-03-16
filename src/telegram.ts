@@ -123,6 +123,21 @@ export class TelegramNotifier {
     );
   }
 
+  async alertHedge(
+    hedgeSide: string,
+    entryPrice: number,
+    triggerPrice: number,
+    hedgePrice: number,
+    lockedLoss: number,
+  ): Promise<void> {
+    await this.send(
+      `🛡️ *HEDGE* ${hedgeSide}\n` +
+        `Entry: ${entryPrice.toFixed(1)}¢ → Drop: ${triggerPrice.toFixed(1)}¢\n` +
+        `Hedge at: ${hedgePrice.toFixed(1)}¢\n` +
+        `Locked loss: -$${Math.abs(lockedLoss).toFixed(2)}`,
+    );
+  }
+
   async alertCircuitBreaker(reason: string): Promise<void> {
     await this.send(`🚨 *CIRCUIT BREAKER*\n${reason}`);
   }
