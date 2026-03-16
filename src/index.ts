@@ -94,7 +94,7 @@ const main = async () => {
   // Signal engine
   const volatilityCalc = new VolatilityCalculator(config.volatilityLookbackSeconds);
   const fairValueEngine = new FairValueEngine(volatilityCalc);
-  const edgeDetector = new EdgeDetector(fairValueEngine, clob, config, logger);
+  const edgeDetector = new EdgeDetector(fairValueEngine, clob, config, logger, volatilityCalc);
 
   // Risk manager (%-based, uses CLOB getBalance for real USDC balance)
   const riskManager = new RiskManager(

@@ -44,6 +44,40 @@ export class VolatilityCalculator {
     return Math.max(stdDev5m, 5); // minimum $5 volatility
   }
 
+  /**
+   * Get BTC price change over the last N seconds.
+   * Positive = price went up, negative = price went down.
+   * Returns null if insufficient data.
+   */
+  getRecentMomentum(lookbackSeconds: number): number | null {
+    if (this.prices.length < 2) return null;
+
+    const now = this.prices[this.prices.length - 1].timestamp;
+    const cutoff = now - lookbackSeconds * 1000;
+    const currentPrice = this.prices[this.prices.length - 1].price;
+
+    // Find price closest to cutoff time
+    let pastPrice: number | null = null;
+    for (const p of this.prices) {
+      if (p.timestamp <= cutoff) {
+        pastPrice = p.price;
+      } else {
+        break;
+      }
+    }
+
+    if (pastPrice === null) {
+      // Not enough history; use oldest available
+      if (this.prices.length >= 10) {
+        pastPrice = this.prices[0].price;
+      } else {
+        return null;
+      }
+    }
+
+    return currentPrice - pastPrice;
+  }
+
   private sampleAtInterval(intervalMs: number): number[] {
     if (this.prices.length === 0) return [];
 

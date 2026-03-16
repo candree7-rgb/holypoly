@@ -4,6 +4,7 @@ import type { ClobService, OrderbookSnapshot } from "../data/clob.js";
 import type { Logger } from "../logger.js";
 import type { GridOrder, TradeSide, WindowInfo } from "../types.js";
 import { FairValueEngine } from "./fair-value.js";
+import { VolatilityCalculator } from "./volatility.js";
 
 export interface TradeDecision {
   shouldTrade: boolean;
@@ -23,7 +24,8 @@ export class EdgeDetector {
     private fairValueEngine: FairValueEngine,
     private clob: ClobService,
     private config: Config,
-    private logger: Logger
+    private logger: Logger,
+    private volatilityCalc?: VolatilityCalculator
   ) {}
 
   /**
@@ -95,6 +97,21 @@ export class EdgeDetector {
     // Check minimum edge threshold
     if (edge.bestEdge < this.config.edgeThresholdCents) {
       return noTrade(`Edge too small (${edge.bestEdge.toFixed(1)}¢ < ${this.config.edgeThresholdCents}¢)`);
+    }
+
+    // Momentum filter: skip if BTC is moving against our predicted direction
+    if (this.volatilityCalc && this.config.maxAdverseMomentumUsd > 0) {
+      const momentum = this.volatilityCalc.getRecentMomentum(this.config.momentumLookbackSeconds);
+      if (momentum !== null) {
+        const isAdverse =
+          (edge.bestSide === "Up" && momentum < -this.config.maxAdverseMomentumUsd) ||
+          (edge.bestSide === "Down" && momentum > this.config.maxAdverseMomentumUsd);
+        if (isAdverse) {
+          return noTrade(
+            `Adverse momentum: BTC moved $${momentum.toFixed(0)} in ${this.config.momentumLookbackSeconds}s vs ${edge.bestSide}`
+          );
+        }
+      }
     }
 
     // Check minimum delta threshold (skip flat markets)

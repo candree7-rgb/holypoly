@@ -47,6 +47,10 @@ export interface Config {
   hedgeMonitorEnabled: boolean;
   hedgeTriggerCents: number; // Drop in ¢ that triggers hedge (e.g. 3 = hedge at -3¢)
 
+  // Momentum filter
+  momentumLookbackSeconds: number;
+  maxAdverseMomentumUsd: number;
+
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
   dailyLossLimitPct: number;
@@ -148,8 +152,8 @@ export const loadConfig = (): Config => {
     : undefined;
 
   // Trading parameters (percentage-based)
-  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 2); // 2% of balance per order
-  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
+  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4); // 4% of balance per order (safe with capped losses)
+  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 7); // 7¢ min edge (below this, spread eats profit)
   const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7); // hard ceiling
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 5); // hard ceiling
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
@@ -170,8 +174,12 @@ export const loadConfig = (): Config => {
   const hedgeMonitorEnabled = parseBoolean("HEDGE_MONITOR_ENABLED", true);
   const hedgeTriggerCents = parseNumber("HEDGE_TRIGGER_CENTS", 3);
 
+  // Momentum filter: skip trades where BTC moves against us
+  const momentumLookbackSeconds = parseNumber("MOMENTUM_LOOKBACK_SECONDS", 30);
+  const maxAdverseMomentumUsd = parseNumber("MAX_ADVERSE_MOMENTUM_USD", 15);
+
   // Entry delay (later entry when hedge monitor is active — more confirmed edge)
-  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", hedgeMonitorEnabled ? 210 : 120);
+  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", hedgeMonitorEnabled ? 150 : 120);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Risk management (percentage-based)
@@ -245,6 +253,8 @@ export const loadConfig = (): Config => {
     hedgeEdgeThresholdCents,
     hedgeMonitorEnabled,
     hedgeTriggerCents,
+    momentumLookbackSeconds,
+    maxAdverseMomentumUsd,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,
