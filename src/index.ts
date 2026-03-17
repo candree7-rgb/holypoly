@@ -219,6 +219,7 @@ const main = async () => {
     side: TradeSide,
     buyAmountUsd: number,
     limitPriceCents?: number,
+    marketType: "CURRENT" | "NEXT" = "CURRENT",
   ): Promise<ActivePosition | null> => {
     const tokenId =
       side === "Up" ? window.upTokenId : window.downTokenId;
@@ -316,8 +317,9 @@ const main = async () => {
     // Telegram alert
     telegram.alertTrade(
       side,
-      0,
-      1,
+      entryPriceCents,
+      marketType,
+      limitPriceCents ? "LIMIT" : "MARKET",
       buyAmountUsd,
       balance,
       binance.price ?? 0,
@@ -501,13 +503,6 @@ const main = async () => {
         btcPrice: binance.price?.toFixed(2) ?? "N/A",
       });
 
-      telegram.alertWebhookSignal(
-        direction,
-        timeRemaining > 30 && bestAskCents && bestAskCents <= config.currentMarketMaxPriceCents
-          ? `Enter current market at ${bestAskCents.toFixed(1)}¢`
-          : `Target next market at ~${config.nextMarketLimitPriceCents}¢`,
-      );
-
       // 6. Decision: current market or next market?
       if (
         timeRemaining > 30 &&
@@ -516,7 +511,7 @@ const main = async () => {
       ) {
         // === ENTER CURRENT MARKET ===
         logger.info("Entering CURRENT market (price within threshold)");
-        await enterMarket(window, side, riskCheck.buyAmountUsd);
+        await enterMarket(window, side, riskCheck.buyAmountUsd, undefined, "CURRENT");
       } else {
         // === ENTER NEXT MARKET (early entry) ===
         const now = Math.floor(Date.now() / 1000);
@@ -561,6 +556,7 @@ const main = async () => {
           side,
           riskCheck.buyAmountUsd,
           config.nextMarketLimitPriceCents,
+          "NEXT",
         );
 
         // After timeout, check if filled → convert to market order if not

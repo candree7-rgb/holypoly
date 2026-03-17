@@ -89,18 +89,18 @@ export class TelegramNotifier {
 
   async alertTrade(
     side: string,
-    edge: number,
-    orderCount: number,
+    priceCents: number,
+    marketType: "CURRENT" | "NEXT",
+    orderType: "MARKET" | "LIMIT",
     amount: number,
     balance: number,
     btcPrice: number,
     timeLeft: number,
   ): Promise<void> {
     await this.send(
-      `🟢 *TRADE* ${side}\n` +
-        `Edge: ${edge.toFixed(1)}¢ | Orders: ${orderCount} × $${amount.toFixed(2)}\n` +
-        `BTC: $${btcPrice.toFixed(2)} | Time left: ${timeLeft.toFixed(0)}s\n` +
-        `Balance: $${balance.toFixed(2)}`,
+      `🟢 *${side.toUpperCase()}* @ ${priceCents.toFixed(1)}¢ (${marketType})\n` +
+        `${orderType} | $${amount.toFixed(2)} | Bal: $${balance.toFixed(2)}\n` +
+        `BTC: $${btcPrice.toFixed(2)} | ${timeLeft.toFixed(0)}s left`,
     );
   }
 
@@ -123,31 +123,6 @@ export class TelegramNotifier {
     );
   }
 
-  async alertHedge(
-    hedgeSide: string,
-    entryPrice: number,
-    triggerPrice: number,
-    hedgePrice: number,
-    lockedLoss: number,
-  ): Promise<void> {
-    await this.send(
-      `🛡️ *HEDGE* ${hedgeSide}\n` +
-        `Entry: ${entryPrice.toFixed(1)}¢ → Drop: ${triggerPrice.toFixed(1)}¢\n` +
-        `Hedge at: ${hedgePrice.toFixed(1)}¢\n` +
-        `Locked loss: -$${Math.abs(lockedLoss).toFixed(2)}`,
-    );
-  }
-
-  async alertWebhookSignal(
-    direction: string,
-    action: string,
-  ): Promise<void> {
-    await this.send(
-      `📡 *SIGNAL* ${direction.toUpperCase()}\n` +
-        `Action: ${action}`,
-    );
-  }
-
   async alertSell(
     side: string,
     entryPrice: number,
@@ -157,9 +132,7 @@ export class TelegramNotifier {
     const emoji = pnl >= 0 ? "🟢" : "🔴";
     const sign = pnl >= 0 ? "+" : "";
     await this.send(
-      `${emoji} *SELL* ${side} (counter-signal)\n` +
-        `Entry: ${entryPrice.toFixed(1)}¢ → Sell: ${sellPrice.toFixed(1)}¢\n` +
-        `P&L: ${sign}$${pnl.toFixed(2)}`,
+      `${emoji} *SOLD* ${side.toUpperCase()} ${entryPrice.toFixed(1)}¢ → ${sellPrice.toFixed(1)}¢ (${sign}$${pnl.toFixed(2)})`,
     );
   }
 
