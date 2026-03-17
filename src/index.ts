@@ -514,6 +514,11 @@ const main = async () => {
         await enterMarket(window, side, riskCheck.buyAmountUsd, undefined, "CURRENT");
       } else {
         // === ENTER NEXT MARKET (early entry) ===
+        const skipReason = timeRemaining <= 30
+          ? `${timeRemaining.toFixed(0)}s left`
+          : `${bestAskCents?.toFixed(1)}¢ > ${config.currentMarketMaxPriceCents}¢`;
+        telegram.alertSkip(side, bestAskCents, config.nextMarketLimitPriceCents, skipReason);
+
         const now = Math.floor(Date.now() / 1000);
         const windowSize = 300;
         const nextWindowStart =

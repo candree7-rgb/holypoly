@@ -123,6 +123,19 @@ export class TelegramNotifier {
     );
   }
 
+  async alertSkip(
+    side: string,
+    currentPriceCents: number | null,
+    nextLimitCents: number,
+    reason: string,
+  ): Promise<void> {
+    const price = currentPriceCents ? `${currentPriceCents.toFixed(1)}¢` : "N/A";
+    await this.send(
+      `⏭️ *SKIP* ${side.toUpperCase()} current @ ${price} (${reason})\n` +
+        `→ NEXT @ ${nextLimitCents}¢ limit`,
+    );
+  }
+
   async alertSell(
     side: string,
     entryPrice: number,
