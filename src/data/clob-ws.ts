@@ -107,12 +107,12 @@ export class ClobWsClient {
         this.sendSubscription();
       }
 
-      // Keepalive: ping every 10 seconds
+      // Keepalive: WebSocket-level ping every 30 seconds
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.send("PING");
+          this.ws.ping();
         }
-      }, 10000);
+      }, 30000);
     });
 
     this.ws.on("message", (data: WebSocket.Data) => {
