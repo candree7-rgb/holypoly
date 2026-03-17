@@ -136,7 +136,7 @@ export class RiskManager {
   async recordResult(pnl: number): Promise<void> {
     const today = dayKeyUtc();
     const week = weekKeyUtc();
-    const won = pnl > 0;
+    const won = pnl >= 0;
 
     await this.db.updateDailyPnl(today, pnl, won);
     await this.db.updateWeeklyPnl(week, pnl);

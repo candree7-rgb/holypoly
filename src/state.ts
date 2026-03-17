@@ -96,7 +96,7 @@ export const recordWindowResult = (state: State, result: WindowResult): void => 
   if (result.pnl !== null) {
     state.dailyPnl.totalPnl += result.pnl;
     state.weeklyPnl.totalPnl += result.pnl;
-    if (result.pnl > 0) {
+    if (result.pnl >= 0) {
       state.dailyPnl.wins++;
       state.losingStreak = 0;
     } else {
