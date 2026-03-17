@@ -15,7 +15,20 @@ export class Database {
     });
   }
 
-  async init(): Promise<void> {
+  async init(retries = 5, delayMs = 3000): Promise<void> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        return await this._initSchema();
+      } catch (err) {
+        if (attempt === retries) throw err;
+        const wait = delayMs * attempt;
+        this.logger.info(`DB connect failed (attempt ${attempt}/${retries}), retrying in ${wait}ms…`);
+        await new Promise((r) => setTimeout(r, wait));
+      }
+    }
+  }
+
+  private async _initSchema(): Promise<void> {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS bot_state (
         key TEXT PRIMARY KEY,
