@@ -93,8 +93,16 @@ const parseNumber = (name: string, fallback?: number): number => {
     if (fallback !== undefined) return fallback;
     throw new ConfigError(`Missing required numeric env var: ${name}`);
   }
-  const num = Number(raw);
-  if (!Number.isFinite(num)) throw new ConfigError(`Invalid number for ${name}: ${raw}`);
+  const trimmed = raw.trim();
+  const num = Number(trimmed);
+  if (!Number.isFinite(num)) {
+    // Try parsing just the leading numeric portion (handles values like "52 (default 52)")
+    const match = trimmed.match(/^-?\d+(\.\d+)?/);
+    if (!match) throw new ConfigError(`Invalid number for ${name}: ${raw}`);
+    const parsed = Number(match[0]);
+    if (!Number.isFinite(parsed)) throw new ConfigError(`Invalid number for ${name}: ${raw}`);
+    return parsed;
+  }
   return num;
 };
 
