@@ -11,19 +11,16 @@ import { MarketDiscovery } from "./data/gamma.js";
 import { ClobService } from "./data/clob.js";
 import { DataApiClient } from "./data/data-api.js";
 import { RedeemService } from "./data/redeem.js";
-import { VolatilityCalculator } from "./signal/volatility.js";
-import { FairValueEngine } from "./signal/fair-value.js";
-import { EdgeDetector } from "./signal/edge-detector.js";
-import { HedgeMonitor } from "./signal/hedge-monitor.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
+import { createWebhookServer } from "./webhook.js";
 import { sleep, nowSec } from "./utils.js";
-import type { GridOrder } from "./types.js";
+import type { GridOrder, TradeSide, ActivePosition, WindowInfo } from "./types.js";
 
-const MAIN_LOOP_INTERVAL_MS = 1000;
 const REDEEM_COOLDOWN_SEC = 600;
 const REDEEM_POLL_INTERVAL_MS = 30000;
+const WINDOW_CHECK_INTERVAL_MS = 5000;
 
 const main = async () => {
   if (!globalThis.crypto) {
@@ -56,19 +53,14 @@ const main = async () => {
     logger,
   );
 
-  logger.info("=== HolyPoly Bot Starting ===");
+  logger.info("=== HolyPoly Bot Starting (Webhook Strategy) ===");
   logger.info("Mode", { dryRun: config.dryRun });
   logger.info("Parameters", {
     buyAmountPct: `${config.buyAmountPct}%`,
-    edgeThreshold: `${config.edgeThresholdCents}¢`,
-    edgeTiers: `${config.edgeTier2Cents}/${config.edgeTier3Cents}/${config.edgeTier4Cents}¢`,
-    maxBuysPerWindow: config.maxBuysPerWindow,
-    maxBuysPerSide: config.maxBuysPerSide,
-    hedgeMonitor: config.hedgeMonitorEnabled ? `ON (trigger: −${config.hedgeTriggerCents}¢)` : "OFF",
-    hedgeMode: config.hedgeMonitorEnabled ? "reactive (post-entry)" : `legacy (no hedge above ${config.hedgeEdgeThresholdCents}¢)`,
-    hedgeMaxPrice: `${config.hedgeMaxPriceCents}¢`,
-    entryPrice: `${config.minEntryPriceCents}-${config.maxEntryPriceCents}¢`,
-    entryDelay: `${config.entryDelaySeconds}s`,
+    currentMarketMax: `${config.currentMarketMaxPriceCents}¢`,
+    nextMarketLimit: `${config.nextMarketLimitPriceCents}¢`,
+    limitTimeout: `${config.limitOrderTimeoutMs}ms`,
+    webhookPort: config.webhookPort,
     dailyLossLimit: `${config.dailyLossLimitPct}%`,
     weeklyLossLimit: `${config.weeklyLossLimitPct}%`,
   });
@@ -91,26 +83,18 @@ const main = async () => {
   const dataApi = new DataApiClient(config.dataApiHost, logger);
   const windowManager = new WindowManager(discovery, logger);
 
-  // Signal engine
-  const volatilityCalc = new VolatilityCalculator(config.volatilityLookbackSeconds);
-  const fairValueEngine = new FairValueEngine(volatilityCalc);
-  const edgeDetector = new EdgeDetector(fairValueEngine, clob, config, logger, volatilityCalc);
-
   // Risk manager (%-based, uses CLOB getBalance for real USDC balance)
   const riskManager = new RiskManager(
     config,
     db,
     logger,
-    () => clob.getBalance()
+    () => clob.getBalance(),
   );
 
   // === WebSocket connections ===
 
-  // 1. Binance direct (fastest BTC price, ~100ms)
+  // 1. Binance direct (fastest BTC price, ~100ms) — used for monitoring + opening price
   const binance = new BinanceWsClient(logger);
-  binance.onTick((tick) => {
-    volatilityCalc.addPrice(tick.price, tick.timestamp);
-  });
   binance.start();
 
   // 2. Chainlink via RTDS (settlement reference price)
@@ -120,11 +104,6 @@ const main = async () => {
   // 3. CLOB WebSocket (realtime orderbook)
   const clobWs = new ClobWsClient(logger);
   clobWs.start();
-
-  // Reactive hedge monitor (watches prices post-entry, auto-hedges on drop)
-  const hedgeMonitor = config.hedgeMonitorEnabled
-    ? new HedgeMonitor(clobWs, clob, config, logger, telegram)
-    : null;
 
   // Auto-redeem service
   const redeemService = config.autoRedeem
@@ -147,169 +126,509 @@ const main = async () => {
   const startupBalance = await clob.getBalance();
   telegram.alertStartup(config.dryRun, startupBalance, config.buyAmountPct);
 
-  // Per-window state
-  let tradedThisWindow = false;
-  let currentWindowId: string | null = null;
+  // === Position tracking ===
+  const activePositions = new Map<string, ActivePosition>();
+  let processingSignal = false;
 
-  // Pending trade for settlement tracking (dry run + live)
-  let pendingTrade: {
-    conditionId: string;
-    openingPrice: number;
-    orders: GridOrder[];
-    primarySide: "Up" | "Down";
-    balanceBefore: number;
-    orderIds: string[]; // live order IDs for fill tracking
-  } | null = null;
+  // === Helper: sell a position (counter-signal) ===
+  const sellPosition = async (pos: ActivePosition): Promise<number> => {
+    logger.info("SELLING position (counter-signal)", {
+      side: pos.side,
+      conditionId: pos.conditionId.slice(0, 16) + "...",
+      entry: `${pos.entryPriceCents.toFixed(1)}¢`,
+      shares: pos.shares.toFixed(2),
+    });
 
-  /**
-   * Settle a pending trade by checking BTC price vs opening price.
-   * Works for both dry run (simulated) and live trades.
-   */
-  const settlePendingTrade = async () => {
-    if (!pendingTrade) return;
+    if (config.dryRun) {
+      const book = clobWs.getBook(pos.tokenId);
+      const sellPriceDecimal = book?.bestBid ?? pos.entryPriceCents / 100;
+      const sellPriceCents = sellPriceDecimal * 100;
+      const pnl = ((sellPriceCents - pos.entryPriceCents) / 100) * pos.shares;
 
-    // Use Chainlink price (settlement oracle), fallback to Binance
+      logger.info("DRY_RUN — would sell", {
+        sellPrice: `${sellPriceCents.toFixed(1)}¢`,
+        pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+      });
+
+      telegram.alertSell(pos.side, pos.entryPriceCents, sellPriceCents, pnl);
+      await riskManager.recordResult(pnl);
+      return pnl;
+    }
+
+    // Cancel any open (unfilled) orders first
+    for (const orderId of pos.orderIds) {
+      await clob.cancelOrder(orderId);
+    }
+
+    // Check how many shares actually filled
+    let actualShares = 0;
+    for (const orderId of pos.orderIds) {
+      const filled = await clob.getFilledShares(orderId);
+      actualShares += filled;
+    }
+
+    if (actualShares <= 0) {
+      logger.info("No filled shares to sell (order was not filled)");
+      return 0;
+    }
+
+    // Get best bid for sell price
+    const book = clobWs.getBook(pos.tokenId);
+    let bestBid = book?.bestBid;
+
+    if (!bestBid || bestBid <= 0) {
+      // REST fallback
+      const ob = await clob.getOrderbook(pos.tokenId);
+      bestBid = ob.bestBid;
+    }
+
+    if (!bestBid || bestBid <= 0) {
+      logger.warn("No bid available, cannot sell — holding to settlement");
+      return 0;
+    }
+
+    // Place sell order
+    const result = await clob.placeBatchOrders([
+      {
+        tokenId: pos.tokenId,
+        side: Side.SELL,
+        price: bestBid,
+        size: actualShares,
+      },
+    ]);
+
+    const sellPriceCents = bestBid * 100;
+    const pnl = ((sellPriceCents - pos.entryPriceCents) / 100) * actualShares;
+
+    logger.info("Position sold", {
+      placed: result.placed,
+      sellPrice: `${sellPriceCents.toFixed(1)}¢`,
+      shares: actualShares.toFixed(2),
+      pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+    });
+
+    telegram.alertSell(pos.side, pos.entryPriceCents, sellPriceCents, pnl);
+    await riskManager.recordResult(pnl);
+
+    return pnl;
+  };
+
+  // === Helper: enter a market ===
+  const enterMarket = async (
+    window: WindowInfo,
+    side: TradeSide,
+    buyAmountUsd: number,
+    limitPriceCents?: number,
+  ): Promise<ActivePosition | null> => {
+    const tokenId =
+      side === "Up" ? window.upTokenId : window.downTokenId;
+
+    // Determine entry price
+    let entryPriceCents: number;
+    if (limitPriceCents) {
+      entryPriceCents = limitPriceCents;
+    } else {
+      // Market order — use best ask
+      const book = clobWs.getBook(tokenId);
+      let bestAsk = book?.bestAsk;
+
+      if (!bestAsk) {
+        const ob = await clob.getOrderbook(tokenId);
+        bestAsk = ob.bestAsk ?? undefined;
+      }
+
+      if (!bestAsk) {
+        logger.warn("No ask price available, cannot enter");
+        return null;
+      }
+      entryPriceCents = bestAsk * 100;
+    }
+
+    // Sanity checks
+    if (entryPriceCents < config.minEntryPriceCents || entryPriceCents > config.maxEntryPriceCents) {
+      logger.warn("Entry price outside bounds", {
+        price: `${entryPriceCents.toFixed(1)}¢`,
+        min: config.minEntryPriceCents,
+        max: config.maxEntryPriceCents,
+      });
+      return null;
+    }
+
+    const priceDecimal = entryPriceCents / 100;
+    const shares = buyAmountUsd / priceDecimal;
+    const balance = await riskManager.getBalance();
+
+    const orderType = limitPriceCents ? "LIMIT" : "MARKET";
+    logger.info(`ENTERING market (${orderType})`, {
+      side,
+      price: `${entryPriceCents.toFixed(1)}¢`,
+      amount: `$${buyAmountUsd.toFixed(2)} (${config.buyAmountPct}%)`,
+      shares: shares.toFixed(2),
+      window: `${new Date(window.startTime).toISOString().slice(11, 19)} - ${new Date(window.endTime).toISOString().slice(11, 19)}`,
+      balance: `$${balance.toFixed(2)}`,
+    });
+
+    let orderIds: string[] = [];
+    if (config.dryRun) {
+      logger.info("DRY_RUN — would place order", {
+        side,
+        type: orderType,
+        price: `${entryPriceCents.toFixed(1)}¢`,
+        amount: `$${buyAmountUsd.toFixed(2)}`,
+      });
+    } else {
+      const result = await clob.placeBatchOrders([
+        {
+          tokenId,
+          side: Side.BUY,
+          price: priceDecimal,
+          size: shares,
+        },
+      ]);
+
+      if (result.placed === 0) {
+        logger.warn("Order failed to place");
+        return null;
+      }
+      orderIds = result.orderIds;
+      logger.info("Order placed", {
+        placed: result.placed,
+        orderIds: result.orderIds.map((id) => id.slice(0, 12) + "..."),
+      });
+    }
+
+    const position: ActivePosition = {
+      conditionId: window.conditionId,
+      side,
+      tokenId,
+      entryPriceCents,
+      shares,
+      costUsd: buyAmountUsd,
+      orderIds,
+      openingPrice: window.openingPrice,
+      windowStart: window.startTime,
+      windowEnd: window.endTime,
+      balanceBefore: balance,
+    };
+
+    activePositions.set(window.conditionId, position);
+
+    // Telegram alert
+    telegram.alertTrade(
+      side,
+      0,
+      1,
+      buyAmountUsd,
+      balance,
+      binance.price ?? 0,
+      (window.endTime - Date.now()) / 1000,
+    );
+
+    // Record to database
+    const order: GridOrder = {
+      side,
+      tokenId,
+      price: entryPriceCents,
+      amount: buyAmountUsd,
+    };
+    await db.recordWindow({
+      windowStart: window.startTime,
+      conditionId: window.conditionId,
+      traded: true,
+      primarySide: side,
+      orders: [order],
+      fillCount: 1,
+      pnl: null,
+      winner: null,
+      balanceBefore: balance,
+      balanceAfter: null,
+    });
+
+    return position;
+  };
+
+  // === Settle a position at window end ===
+  const settlePosition = async (pos: ActivePosition): Promise<void> => {
+    if (pos.sold) return;
+
     const settlementPrice = rtds.price ?? binance.price;
     if (settlementPrice === null) {
       logger.warn("No settlement price available, skipping P&L calc");
-      pendingTrade = null;
       return;
     }
 
-    const winner: "Up" | "Down" = settlementPrice > pendingTrade.openingPrice ? "Up" : "Down";
-    let totalPnl = 0;
-    const orderResults: Array<{ side: string; price: string; amount: string; pnl: string; won: boolean }> = [];
+    const winner: TradeSide =
+      settlementPrice > pos.openingPrice ? "Up" : "Down";
+    const won = pos.side === winner;
 
-    // For live trades, query actual fills from Polymarket
-    const isLive = !config.dryRun && pendingTrade.orderIds.length > 0;
+    let totalPnl: number;
+    const isLive = !config.dryRun && pos.orderIds.length > 0;
+
     if (isLive) {
-      const fills = await clob.getOrderFills(pendingTrade.orderIds, pendingTrade.conditionId);
-
-      // Build tokenId -> side mapping from the original orders
-      const tokenSideMap = new Map<string, "Up" | "Down">();
-      for (const order of pendingTrade.orders) {
-        tokenSideMap.set(order.tokenId, order.side as "Up" | "Down");
-      }
-
-      logger.info("Order fills queried", {
-        fills: fills.map((f) => ({
-          orderID: f.orderID.slice(0, 12) + "...",
-          sizeMatched: f.sizeMatched,
-          price: f.price,
-          costFilled: `$${f.costFilled.toFixed(2)}`,
-          tokenId: f.tokenId?.slice(0, 12) + "...",
-          side: tokenSideMap.get(f.tokenId) ?? "unknown",
-        })),
-      });
-
-      // Build a list of orders with actual fill data
-      let totalFilledCost = 0;
-      let totalFilledShares = 0;
+      const fills = await clob.getOrderFills(pos.orderIds, pos.conditionId);
+      totalPnl = 0;
       for (const fill of fills) {
         if (fill.sizeMatched <= 0) continue;
-        totalFilledCost += fill.costFilled;
-        totalFilledShares += fill.sizeMatched;
-
-        // Determine side from the order's tokenId
-        const side = tokenSideMap.get(fill.tokenId) ?? pendingTrade.primarySide;
-        const won = side === winner;
-        const pnl = won
-          ? fill.sizeMatched * (1 - fill.price) // win: shares * ($1 - price)
-          : -fill.costFilled;                     // lose: -cost
-        totalPnl += pnl;
-        orderResults.push({
-          side,
-          price: `${(fill.price * 100).toFixed(1)}¢`,
-          amount: `$${fill.costFilled.toFixed(2)}`,
-          pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-          won,
-        });
+        const fillWon = pos.side === winner;
+        totalPnl += fillWon
+          ? fill.sizeMatched * (1 - fill.price)
+          : -fill.costFilled;
       }
 
-      if (totalFilledCost === 0) {
-        logger.info("No orders were filled, skipping settlement");
-        pendingTrade = null;
+      if (totalPnl === 0 && fills.every((f) => f.sizeMatched <= 0)) {
+        logger.info("No fills — order was not executed, skipping settlement");
         return;
       }
     } else {
-      // Dry run: use planned order amounts (simulated)
-      for (const order of pendingTrade.orders) {
-        const won = order.side === winner;
-        // Binary outcome: win pays $1/share, lose pays $0/share
-        // shares = amount / (price/100), cost = amount
-        // win pnl = shares * 1 - cost = amount * (100/price - 1)
-        // lose pnl = -cost = -amount
-        const pnl = won
-          ? order.amount * (100 / order.price - 1)
-          : -order.amount;
-        totalPnl += pnl;
-        orderResults.push({
-          side: order.side,
-          price: `${order.price.toFixed(1)}¢`,
-          amount: `$${order.amount.toFixed(2)}`,
-          pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-          won,
-        });
-      }
+      totalPnl = won
+        ? pos.costUsd * (100 / pos.entryPriceCents - 1)
+        : -pos.costUsd;
     }
 
     const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
-    logger.info(`${prefix}`, {
-      conditionId: pendingTrade.conditionId.slice(0, 16) + "...",
+    logger.info(prefix, {
       winner,
-      btcOpening: pendingTrade.openingPrice.toFixed(2),
+      side: pos.side,
+      result: won ? "WIN" : "LOSS",
+      pnl: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+      entry: `${pos.entryPriceCents.toFixed(1)}¢`,
+      btcOpen: pos.openingPrice.toFixed(2),
       btcSettlement: settlementPrice.toFixed(2),
-      delta: `$${(settlementPrice - pendingTrade.openingPrice).toFixed(2)}`,
-      orders: orderResults,
-      totalPnl: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
-      result: totalPnl >= 0 ? "WIN" : "LOSS",
+      delta: `$${(settlementPrice - pos.openingPrice).toFixed(2)}`,
     });
 
-    // Update risk manager P&L tracking (works for both dry run and live)
-    // For live trades, log balance change for monitoring (but trust fill-based P&L)
-    // Note: balance-based P&L is unreliable because:
-    //   1. balanceBefore may include recently settled funds from previous trades
-    //   2. balanceAfter may not yet include the current settlement payout
-    const verifiedPnl = totalPnl;
-    if (isLive) {
-      const balanceAfter = await clob.getBalance();
-      const actualPnl = balanceAfter - pendingTrade.balanceBefore;
-      if (Math.abs(actualPnl - totalPnl) > 0.50) {
-        logger.warn("P&L note: balance change differs from fill-based calc (expected due to settlement timing)", {
-          fillBasedPnl: `$${totalPnl.toFixed(2)}`,
-          balanceChangePnl: `$${actualPnl.toFixed(2)}`,
-          balanceBefore: `$${pendingTrade.balanceBefore.toFixed(2)}`,
-          balanceAfter: `$${balanceAfter.toFixed(2)}`,
-        });
-      }
-    }
-    await riskManager.recordResult(verifiedPnl);
+    await riskManager.recordResult(totalPnl);
+    await db.updateWindowSettlement(pos.conditionId, totalPnl, winner);
 
-    // Update DB record with settlement data
-    await db.updateWindowSettlement(
-      pendingTrade.conditionId,
-      verifiedPnl,
-      winner,
-    );
-
-    // Telegram settlement alert
-    const ordersWon = orderResults.filter((o) => o.won).length;
     const dailyStats = await riskManager.getDailyStats();
     telegram.alertSettlement(
       winner,
-      verifiedPnl,
-      ordersWon,
-      orderResults.length,
+      totalPnl,
+      won ? 1 : 0,
+      1,
       dailyStats.totalPnl,
       dailyStats.wins,
       dailyStats.losses,
     );
-
-    pendingTrade = null;
   };
 
-  // === MAIN TRADING LOOP ===
-  const tradingLoop = async () => {
+  // === WEBHOOK SIGNAL HANDLER ===
+  const handleSignal = async (direction: "up" | "down") => {
+    if (processingSignal) {
+      logger.warn("Signal ignored (already processing previous signal)");
+      return;
+    }
+    processingSignal = true;
+
+    try {
+      const side: TradeSide = direction === "up" ? "Up" : "Down";
+
+      // 1. Check existing positions
+      for (const [condId, pos] of activePositions) {
+        if (pos.sold) {
+          activePositions.delete(condId);
+          continue;
+        }
+
+        if (pos.side === side) {
+          logger.info("Already holding position in same direction", { side });
+          return;
+        }
+
+        // Counter-signal → SELL
+        logger.info("Counter-signal detected! Selling existing position", {
+          held: pos.side,
+          newSignal: side,
+        });
+        const pnl = await sellPosition(pos);
+        pos.sold = true;
+        pos.soldPnl = pnl;
+        activePositions.delete(condId);
+      }
+
+      // 2. Risk check
+      const riskCheck = await riskManager.check();
+      if (!riskCheck.allowed) {
+        logger.warn("Risk check blocked", { reason: riskCheck.reason });
+        telegram.alertCircuitBreaker(riskCheck.reason ?? "Unknown");
+        return;
+      }
+
+      // 3. Find current window
+      const window = await windowManager.tick();
+      if (!window) {
+        logger.warn("No active window found");
+        return;
+      }
+
+      // Subscribe CLOB WS to this window's tokens
+      clobWs.clear();
+      clobWs.subscribe([window.upTokenId, window.downTokenId]);
+
+      // Set opening price if not yet set
+      if (window.openingPrice === 0) {
+        const openingPrice = rtds.price ?? binance.price;
+        if (openingPrice) windowManager.setOpeningPrice(openingPrice);
+      }
+
+      // 4. Check time remaining
+      const timeRemaining = windowManager.timeRemaining();
+
+      // 5. Get current market price
+      const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
+
+      // Brief wait for CLOB WS to populate orderbook after subscribe
+      await sleep(500);
+
+      let book = clobWs.getBook(tokenId);
+      let bestAskCents: number | null = null;
+
+      if (book?.bestAsk) {
+        bestAskCents = book.bestAsk * 100;
+      } else {
+        // REST fallback
+        const ob = await clob.getOrderbook(tokenId);
+        bestAskCents = ob.bestAsk ? ob.bestAsk * 100 : null;
+      }
+
+      logger.info("Signal evaluation", {
+        direction,
+        side,
+        window: `${new Date(window.startTime).toISOString().slice(11, 19)} - ${new Date(window.endTime).toISOString().slice(11, 19)}`,
+        timeRemaining: `${timeRemaining.toFixed(0)}s`,
+        bestAsk: bestAskCents ? `${bestAskCents.toFixed(1)}¢` : "N/A",
+        threshold: `${config.currentMarketMaxPriceCents}¢`,
+        btcPrice: binance.price?.toFixed(2) ?? "N/A",
+      });
+
+      telegram.alertWebhookSignal(
+        direction,
+        timeRemaining > 30 && bestAskCents && bestAskCents <= config.currentMarketMaxPriceCents
+          ? `Enter current market at ${bestAskCents.toFixed(1)}¢`
+          : `Target next market at ~${config.nextMarketLimitPriceCents}¢`,
+      );
+
+      // 6. Decision: current market or next market?
+      if (
+        timeRemaining > 30 &&
+        bestAskCents &&
+        bestAskCents <= config.currentMarketMaxPriceCents
+      ) {
+        // === ENTER CURRENT MARKET ===
+        logger.info("Entering CURRENT market (price within threshold)");
+        await enterMarket(window, side, riskCheck.buyAmountUsd);
+      } else {
+        // === ENTER NEXT MARKET (early entry) ===
+        const now = Math.floor(Date.now() / 1000);
+        const windowSize = 300;
+        const nextWindowStart =
+          (Math.floor(now / windowSize) + 1) * windowSize;
+
+        logger.info("Targeting NEXT market", {
+          reason:
+            timeRemaining <= 30
+              ? "window ending soon"
+              : `price ${bestAskCents?.toFixed(1)}¢ > ${config.currentMarketMaxPriceCents}¢`,
+          nextWindow: new Date(nextWindowStart * 1000)
+            .toISOString()
+            .slice(11, 19),
+          limitPrice: `${config.nextMarketLimitPriceCents}¢`,
+        });
+
+        // Try to find the next market
+        const nextWindow =
+          await discovery.findMarketByTimestamp(nextWindowStart);
+        if (!nextWindow) {
+          logger.warn(
+            "Next market not yet available — may not be created yet",
+          );
+          return;
+        }
+
+        // Subscribe to next market tokens
+        clobWs.clear();
+        clobWs.subscribe([nextWindow.upTokenId, nextWindow.downTokenId]);
+
+        // Set opening price
+        if (nextWindow.openingPrice === 0) {
+          const price = rtds.price ?? binance.price;
+          if (price) nextWindow.openingPrice = price;
+        }
+
+        // Place limit order at nextMarketLimitPriceCents
+        const pos = await enterMarket(
+          nextWindow,
+          side,
+          riskCheck.buyAmountUsd,
+          config.nextMarketLimitPriceCents,
+        );
+
+        // After timeout, check if filled → convert to market order if not
+        if (pos && !config.dryRun) {
+          setTimeout(async () => {
+            try {
+              const currentPos = activePositions.get(nextWindow.conditionId);
+              if (!currentPos || currentPos.sold) return;
+
+              // Check fill status
+              let totalFilled = 0;
+              for (const orderId of currentPos.orderIds) {
+                const filled = await clob.getFilledShares(orderId);
+                totalFilled += filled;
+              }
+
+              if (totalFilled <= 0) {
+                logger.info(
+                  "Limit order not filled after timeout, converting to market order",
+                );
+
+                // Cancel limit order
+                for (const orderId of currentPos.orderIds) {
+                  await clob.cancelOrder(orderId);
+                }
+                activePositions.delete(nextWindow.conditionId);
+
+                // Re-enter at market price
+                const riskCheck2 = await riskManager.check();
+                if (riskCheck2.allowed) {
+                  await enterMarket(
+                    nextWindow,
+                    side,
+                    riskCheck2.buyAmountUsd,
+                  );
+                }
+              } else {
+                logger.info("Limit order filled", {
+                  shares: totalFilled.toFixed(2),
+                });
+              }
+            } catch (err) {
+              logger.error("Limit order timeout handler error", {
+                error: (err as Error).message,
+              });
+            }
+          }, config.limitOrderTimeoutMs);
+        }
+      }
+    } catch (err) {
+      logger.error("Signal handler error", { error: (err as Error).message });
+      telegram.alertError((err as Error).message);
+    } finally {
+      processingSignal = false;
+    }
+  };
+
+  // === WEBHOOK SERVER ===
+  const webhook = createWebhookServer(
+    config.webhookPort,
+    logger,
+    config.webhookSecret,
+  );
+  webhook.onSignal(handleSignal);
+  webhook.start();
+
+  // === WINDOW LIFECYCLE LOOP (handles settlement + status) ===
+  const windowLoop = async () => {
     let lastStatusLog = 0;
 
     while (true) {
@@ -327,209 +646,43 @@ const main = async () => {
             chainlinkStale: rtds.isStale,
             clobWs: clobWs.connected,
           });
+          logger.info("Active positions", {
+            count: activePositions.size,
+            positions: Array.from(activePositions.values()).map((p) => ({
+              side: p.side,
+              entry: `${p.entryPriceCents.toFixed(1)}¢`,
+              window: new Date(p.windowStart).toISOString().slice(11, 19),
+            })),
+          });
           lastStatusLog = now;
         }
 
-        // Must have Binance price
-        if (!binance.connected || binance.price === null) {
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // Get current window
-        const window = await windowManager.tick();
-        if (!window) {
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // New window — settle previous trade + reset state
-        if (window.conditionId !== currentWindowId) {
-          // Reset hedge monitor before settling
-          hedgeMonitor?.reset();
-
-          // Settle the previous window's trade before starting new one
-          await settlePendingTrade();
-
-          currentWindowId = window.conditionId;
-          tradedThisWindow = false;
-
-          // Subscribe CLOB WS to this window's tokens
-          clobWs.clear();
-          clobWs.subscribe([window.upTokenId, window.downTokenId]);
-
-          // Set opening price from Chainlink (preferred) or Binance (fallback)
-          if (window.openingPrice === 0) {
-            const openingPrice = rtds.price ?? binance.price;
-            windowManager.setOpeningPrice(openingPrice);
-            logger.info("Window started", {
-              source: rtds.price ? "Chainlink" : "Binance",
-              openingPrice: openingPrice.toFixed(2),
-            });
-          }
-        }
-
-        if (tradedThisWindow) {
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // Wait for entry phase
-        if (!windowManager.isEntryPhase(config.entryDelaySeconds)) {
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // Skip if Chainlink is stale (oracle might be stuck)
-        if (rtds.isStale) {
-          logger.warn("Chainlink stale — skipping window");
-          tradedThisWindow = true;
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // Risk check (returns dynamic buy amount from balance %)
-        const riskCheck = await riskManager.check();
-        if (!riskCheck.allowed) {
-          logger.warn("Risk check blocked", { reason: riskCheck.reason });
-          telegram.alertCircuitBreaker(riskCheck.reason ?? "Unknown");
-          tradedThisWindow = true;
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        const buyAmountUsd = riskCheck.buyAmountUsd;
-
-        // Evaluate edge
-        const timeRemaining = windowManager.timeRemaining();
-        const decision = await edgeDetector.evaluate(
-          window,
-          binance.price,
-          timeRemaining,
-          buyAmountUsd
-        );
-
-        if (!decision.shouldTrade) {
-          logger.debug("Skip window", { reason: decision.reason });
-          tradedThisWindow = true;
-          await sleep(MAIN_LOOP_INTERVAL_MS);
-          continue;
-        }
-
-        // === PLACE ORDERS ===
-        const balance = await riskManager.getBalance();
-        logger.info("TRADING!", {
-          side: decision.primarySide,
-          edge: `${decision.bestEdge.toFixed(1)}¢`,
-          fairUp: `${decision.fairUp}¢`,
-          orders: decision.orders.length,
-          buyAmount: `$${buyAmountUsd.toFixed(2)} (${config.buyAmountPct}% of $${balance.toFixed(2)})`,
-          btcBinance: binance.price.toFixed(2),
-          btcChainlink: rtds.price?.toFixed(2) ?? "N/A",
-          delta: `$${(binance.price - window.openingPrice).toFixed(2)}`,
-          timeLeft: `${timeRemaining.toFixed(0)}s`,
-        });
-
-        // Telegram trade alert
-        telegram.alertTrade(
-          decision.primarySide,
-          decision.bestEdge,
-          decision.orders.length,
-          buyAmountUsd,
-          balance,
-          binance.price,
-          timeRemaining,
-        );
-
-        let liveOrderIds: string[] = [];
-        if (config.dryRun) {
-          logger.info("DRY_RUN — would place:", {
-            orders: decision.orders.map((o) => ({
-              side: o.side,
-              price: `${o.price.toFixed(1)}¢`,
-              amount: `$${o.amount.toFixed(2)}`,
-            })),
-          });
-        } else {
-          const clobOrders = decision.orders.map((o) => ({
-            tokenId: o.tokenId,
-            side: Side.BUY,
-            price: o.price / 100,
-            size: o.amount / (o.price / 100),
-          }));
-
-          const result = await clob.placeBatchOrders(clobOrders);
-          logger.info("Batch result", { placed: result.placed, failed: result.failed, orderIds: result.orderIds });
-
-          // Only track trade if orders were actually placed
-          if (result.placed === 0) {
-            logger.warn("No orders placed (all below minimum or failed), skipping trade tracking");
+        // Check for positions that need settlement (window ended)
+        for (const [condId, pos] of activePositions) {
+          if (pos.sold) {
+            activePositions.delete(condId);
             continue;
           }
 
-          liveOrderIds = result.orderIds;
+          if (now >= pos.windowEnd) {
+            logger.info("Window ended, settling position", {
+              conditionId: condId.slice(0, 16) + "...",
+              side: pos.side,
+            });
+            await settlePosition(pos);
+            activePositions.delete(condId);
+          }
         }
 
-        tradedThisWindow = true;
-
-        // Store pending trade for settlement P&L calculation
-        pendingTrade = {
-          conditionId: window.conditionId,
-          openingPrice: window.openingPrice,
-          orders: decision.orders,
-          primarySide: decision.primarySide,
-          balanceBefore: balance,
-          orderIds: liveOrderIds,
-        };
-
-        // Start hedge monitor if enabled
-        if (hedgeMonitor) {
-          const primaryOrders = decision.orders.filter(o => o.side === decision.primarySide);
-          const totalCost = primaryOrders.reduce((sum, o) => sum + o.amount, 0);
-          const totalShares = primaryOrders.reduce((sum, o) => sum + o.amount / (o.price / 100), 0);
-          // Use highest entry price as trigger reference (most conservative)
-          const highestEntryPrice = Math.max(...primaryOrders.map(o => o.price));
-
-          const primaryTokenId = decision.primarySide === "Up" ? window.upTokenId : window.downTokenId;
-          const hedgeTokenId = decision.primarySide === "Up" ? window.downTokenId : window.upTokenId;
-
-          hedgeMonitor.startMonitoring({
-            primarySide: decision.primarySide,
-            entryPriceCents: highestEntryPrice,
-            primaryTokenId,
-            hedgeTokenId,
-            primaryCostUsd: totalCost,
-            primaryShares: totalShares,
-            onHedge: (hedgeOrders, hedgeOrderIds) => {
-              // Add hedge orders to pendingTrade for correct settlement
-              if (pendingTrade) {
-                pendingTrade.orders = [...pendingTrade.orders, ...hedgeOrders];
-                pendingTrade.orderIds = [...pendingTrade.orderIds, ...hedgeOrderIds];
-              }
-            },
-          });
-        }
-
-        // Record to database
-        await db.recordWindow({
-          windowStart: window.startTime,
-          conditionId: window.conditionId,
-          traded: true,
-          primarySide: decision.primarySide,
-          orders: decision.orders,
-          fillCount: decision.orders.length,
-          pnl: null,
-          winner: null,
-          balanceBefore: balance,
-          balanceAfter: null,
-        });
-
+        // Keep window manager ticking (for discovery cache)
+        await windowManager.tick();
       } catch (err) {
-        logger.error("Trading loop error", { error: (err as Error).message });
-        telegram.alertError((err as Error).message);
+        logger.error("Window loop error", {
+          error: (err as Error).message,
+        });
       }
 
-      await sleep(MAIN_LOOP_INTERVAL_MS);
+      await sleep(WINDOW_CHECK_INTERVAL_MS);
     }
   };
 
@@ -539,7 +692,10 @@ const main = async () => {
 
     while (true) {
       try {
-        const positions = await dataApi.getPositions(config.profileAddress, true);
+        const positions = await dataApi.getPositions(
+          config.profileAddress,
+          true,
+        );
         const now = nowSec();
         const eligible: typeof positions = [];
 
@@ -558,7 +714,9 @@ const main = async () => {
           }
         }
       } catch (err) {
-        logger.error("Redeem loop error", { error: (err as Error).message });
+        logger.error("Redeem loop error", {
+          error: (err as Error).message,
+        });
       }
 
       await sleep(REDEEM_POLL_INTERVAL_MS);
@@ -578,7 +736,7 @@ const main = async () => {
   process.on("SIGTERM", shutdown);
 
   // Run both loops
-  await Promise.all([tradingLoop(), redeemLoop()]);
+  await Promise.all([windowLoop(), redeemLoop()]);
 };
 
 main().catch((err) => {

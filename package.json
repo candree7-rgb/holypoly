@@ -13,8 +13,10 @@
     "@polymarket/builder-relayer-client": "^0.0.8",
     "@polymarket/builder-signing-sdk": "^0.0.8",
     "@polymarket/clob-client": "^5.2.1",
+    "@types/express": "^5.0.6",
     "dotenv": "^17.2.3",
     "ethers": "^5.8.0",
+    "express": "^5.2.1",
     "pg": "^8.20.0",
     "viem": "^2.44.4",
     "ws": "^8.18.0"

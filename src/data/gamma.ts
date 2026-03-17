@@ -204,6 +204,47 @@ export class MarketDiscovery {
   }
 
   /**
+   * Find a specific 5-minute BTC market by window start timestamp.
+   * Used for early entry into next market windows.
+   */
+  async findMarketByTimestamp(windowStartSec: number): Promise<WindowInfo | null> {
+    const slug = `btc-updown-5m-${windowStartSec}`;
+    const windowSize = 300;
+
+    try {
+      const market = await this.fetchMarketBySlug(slug, windowStartSec, windowSize);
+      if (!market) return null;
+
+      const upToken = market.tokens.find((t) => t.outcome === "Up");
+      const downToken = market.tokens.find((t) => t.outcome === "Down");
+
+      if (!upToken || !downToken) {
+        this.logger.warn("Market missing Up/Down tokens", { slug });
+        return null;
+      }
+
+      const startMs = market.start_time_ms ?? windowStartSec * 1000;
+      const endMs = market.end_time_ms ?? (windowStartSec + windowSize) * 1000;
+
+      return {
+        conditionId: market.condition_id,
+        upTokenId: upToken.token_id,
+        downTokenId: downToken.token_id,
+        openingPrice: 0,
+        startTime: startMs,
+        endTime: endMs,
+        negRisk: market.neg_risk,
+      };
+    } catch (err) {
+      this.logger.debug("Market fetch by timestamp failed", {
+        slug,
+        error: (err as Error).message,
+      });
+      return null;
+    }
+  }
+
+  /**
    * Clear cached market (call when window ends).
    */
   clearCurrent(): void {

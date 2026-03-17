@@ -20,36 +20,23 @@ export interface Config {
   profileAddress: string;
   apiCreds?: ApiCreds;
 
+  // Webhook
+  webhookPort: number;
+  webhookSecret?: string;
+
   // Trading parameters (percentage-based for compounding)
-  /** % of wallet balance per individual order (e.g. 2 = 2%) */
+  /** % of wallet balance per individual order (e.g. 4 = 4%) */
   buyAmountPct: number;
-  edgeThresholdCents: number;
   maxBuysPerWindow: number;
-  maxBuysPerSide: number;
-  hedgeMaxPriceCents: number;
+  /** Max price (cents) to enter current market — above this, target next market */
+  currentMarketMaxPriceCents: number;
+  /** Limit order price (cents) for early next-market entry */
+  nextMarketLimitPriceCents: number;
+  /** Timeout (ms) for limit order before switching to market order */
+  limitOrderTimeoutMs: number;
   maxEntryPriceCents: number;
   minEntryPriceCents: number;
-  entryDelaySeconds: number;
   redeemDelaySeconds: number;
-  minDeltaThresholdUsd: number;
-  volatilityLookbackSeconds: number;
-
-  // Edge-based order scaling tiers (cents)
-  edgeTier2Cents: number; // 5-8: 1 primary order
-  edgeTier3Cents: number; // 8-12: 2 primary orders
-  edgeTier4Cents: number; // 12-15: 3 primary orders
-  // 15+: 4-5 primary orders
-
-  // Dynamic hedge logic (legacy upfront hedge)
-  hedgeEdgeThresholdCents: number; // No hedge above this edge
-
-  // Reactive hedge monitor (new: monitors prices post-entry, hedges on drop)
-  hedgeMonitorEnabled: boolean;
-  hedgeTriggerCents: number; // Drop in ¢ that triggers hedge (e.g. 3 = hedge at -3¢)
-
-  // Momentum filter
-  momentumLookbackSeconds: number;
-  maxAdverseMomentumUsd: number;
 
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
@@ -151,42 +138,25 @@ export const loadConfig = (): Config => {
     ? { key: apiKey, secret: apiSecret, passphrase: apiPassphrase }
     : undefined;
 
-  // Trading parameters (percentage-based)
-  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4); // 4% of balance per order (safe with capped losses)
-  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 7); // 7¢ min edge (below this, spread eats profit)
-  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7); // hard ceiling
-  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 5); // hard ceiling
-  const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
+  // Webhook
+  const webhookPort = parseNumber("PORT", 3000); // Railway sets PORT automatically
+  const webhookSecret = getEnv("WEBHOOK_SECRET");
+
+  // Trading parameters
+  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
+  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7);
+  const currentMarketMaxPriceCents = parseNumber("CURRENT_MARKET_MAX_PRICE_CENTS", 58);
+  const nextMarketLimitPriceCents = parseNumber("NEXT_MARKET_LIMIT_PRICE_CENTS", 52);
+  const limitOrderTimeoutMs = parseNumber("LIMIT_ORDER_TIMEOUT_MS", 15000);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
-  const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
-  const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 300);
-
-  // Edge-based order scaling tiers
-  const edgeTier2Cents = parseNumber("EDGE_TIER2_CENTS", 8);
-  const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
-  const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
-
-  // Dynamic hedge logic (legacy)
-  const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD", 12);
-
-  // Reactive hedge monitor
-  const hedgeMonitorEnabled = parseBoolean("HEDGE_MONITOR_ENABLED", true);
-  const hedgeTriggerCents = parseNumber("HEDGE_TRIGGER_CENTS", 3);
-
-  // Momentum filter: skip trades where BTC moves against us
-  const momentumLookbackSeconds = parseNumber("MOMENTUM_LOOKBACK_SECONDS", 30);
-  const maxAdverseMomentumUsd = parseNumber("MAX_ADVERSE_MOMENTUM_USD", 15);
-
-  // Entry delay (later entry when hedge monitor is active — more confirmed edge)
-  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", hedgeMonitorEnabled ? 150 : 120);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Risk management (percentage-based)
-  const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10); // 10% of daily starting balance
-  const weeklyLossLimitPct = parseNumber("WEEKLY_LOSS_LIMIT_PCT", 20); // 20% of weekly starting balance
+  const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10);
+  const weeklyLossLimitPct = parseNumber("WEEKLY_LOSS_LIMIT_PCT", 20);
   const losingStreakPause = parseNumber("LOSING_STREAK_PAUSE", 5);
-  const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50); // absolute floor
+  const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50);
 
   // Database
   const databaseUrl = requireEnv("DATABASE_URL");
@@ -224,7 +194,7 @@ export const loadConfig = (): Config => {
 
   const dryRun = parseBoolean("DRY_RUN", true);
   const debug = parseBoolean("DEBUG", false);
-  const stateFile = getEnv("STATE_FILE") ?? "./data/state.json"; // legacy fallback
+  const stateFile = getEnv("STATE_FILE") ?? "./data/state.json";
 
   return {
     clobHost,
@@ -236,25 +206,16 @@ export const loadConfig = (): Config => {
     funderAddress: funderAddress?.toLowerCase(),
     profileAddress,
     apiCreds,
+    webhookPort,
+    webhookSecret,
     buyAmountPct,
-    edgeThresholdCents,
     maxBuysPerWindow,
-    maxBuysPerSide,
-    hedgeMaxPriceCents,
+    currentMarketMaxPriceCents,
+    nextMarketLimitPriceCents,
+    limitOrderTimeoutMs,
     maxEntryPriceCents,
     minEntryPriceCents,
-    entryDelaySeconds,
     redeemDelaySeconds,
-    minDeltaThresholdUsd,
-    volatilityLookbackSeconds,
-    edgeTier2Cents,
-    edgeTier3Cents,
-    edgeTier4Cents,
-    hedgeEdgeThresholdCents,
-    hedgeMonitorEnabled,
-    hedgeTriggerCents,
-    momentumLookbackSeconds,
-    maxAdverseMomentumUsd,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,

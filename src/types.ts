@@ -45,3 +45,21 @@ export interface Position {
   negativeRisk?: boolean;
   outcome?: string;
 }
+
+/** Tracks a live position entered via webhook signal */
+export interface ActivePosition {
+  conditionId: string;
+  side: TradeSide;
+  tokenId: string;
+  entryPriceCents: number;
+  shares: number;
+  costUsd: number;
+  orderIds: string[];
+  openingPrice: number;
+  windowStart: number;
+  windowEnd: number;
+  balanceBefore: number;
+  /** Set when position is sold before settlement (counter-signal) */
+  sold?: boolean;
+  soldPnl?: number;
+}

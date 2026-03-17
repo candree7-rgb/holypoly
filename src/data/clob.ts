@@ -284,6 +284,37 @@ export class ClobService {
   }
 
   /**
+   * Cancel a specific order by ID.
+   */
+  async cancelOrder(orderId: string): Promise<void> {
+    try {
+      await this.client.cancelOrder({ orderID: orderId });
+      this.logger.debug("Order cancelled", { orderId: orderId.slice(0, 12) + "..." });
+    } catch (err) {
+      this.logger.warn("Failed to cancel order", {
+        orderId: orderId.slice(0, 12) + "...",
+        error: (err as Error).message,
+      });
+    }
+  }
+
+  /**
+   * Get filled shares for a specific order.
+   */
+  async getFilledShares(orderId: string): Promise<number> {
+    try {
+      const order = await this.client.getOrder(orderId);
+      return parseFloat(order.size_matched) || 0;
+    } catch (err) {
+      this.logger.warn("Failed to get fill status", {
+        orderId: orderId.slice(0, 12) + "...",
+        error: (err as Error).message,
+      });
+      return 0;
+    }
+  }
+
+  /**
    * Query actual fill data for placed orders using the trades endpoint.
    * Uses getTrades() for actual execution prices (not limit prices).
    * Falls back to getOrder() if trades lookup fails.

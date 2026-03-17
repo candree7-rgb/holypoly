@@ -138,6 +138,31 @@ export class TelegramNotifier {
     );
   }
 
+  async alertWebhookSignal(
+    direction: string,
+    action: string,
+  ): Promise<void> {
+    await this.send(
+      `📡 *SIGNAL* ${direction.toUpperCase()}\n` +
+        `Action: ${action}`,
+    );
+  }
+
+  async alertSell(
+    side: string,
+    entryPrice: number,
+    sellPrice: number,
+    pnl: number,
+  ): Promise<void> {
+    const emoji = pnl >= 0 ? "🟢" : "🔴";
+    const sign = pnl >= 0 ? "+" : "";
+    await this.send(
+      `${emoji} *SELL* ${side} (counter-signal)\n` +
+        `Entry: ${entryPrice.toFixed(1)}¢ → Sell: ${sellPrice.toFixed(1)}¢\n` +
+        `P&L: ${sign}$${pnl.toFixed(2)}`,
+    );
+  }
+
   async alertCircuitBreaker(reason: string): Promise<void> {
     await this.send(`🚨 *CIRCUIT BREAKER*\n${reason}`);
   }
