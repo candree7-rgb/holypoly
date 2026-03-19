@@ -14,8 +14,9 @@ import type { FairValueEngine } from "../signal/fair-value.js";
  *
  * Strategy:
  * 1. Winner bought → IMMEDIATELY try to fill loser at ANY profitable price
- * 2. Poll every 100ms — buy 100% of loser as soon as pair cost < breakeven
- * 3. After 5s → bail out (sell winner back)
+ * 2. React to WS orderbook updates (event-driven, no polling)
+ * 3. Safety timer every 2s as fallback (in case WS update missed)
+ * 4. After 5s → bail out (sell winner back)
  *
  * NO tranches. NO trailing. NO DCA. Just fill or bail.
  */
@@ -25,8 +26,8 @@ export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: n
 /** Polymarket taker fee (~2%) */
 const TAKER_FEE_PCT = 0.02;
 
-/** How often to check loser price (ms) */
-const POLL_INTERVAL_MS = 100;
+/** Safety fallback interval — WS is primary, this is just a backup (ms) */
+const SAFETY_CHECK_INTERVAL_MS = 2000;
 
 /** Phase 1: Fill if profitable (pair < 98¢ after fees) */
 const PHASE1_MAX_PAIR_CENTS = 98;
@@ -130,10 +131,11 @@ export class ArbCompletionMonitor {
       phases: `0-3s: fill<98¢ | 3-5s: fill≤100¢ | 5s+: bail`,
     });
 
-    // Start aggressive polling
-    this.pollTimer = setInterval(() => this.checkAndFill(), POLL_INTERVAL_MS);
+    // WS-driven: onPriceUpdate fires on every orderbook change (primary path)
+    // Safety fallback timer in case WS misses an update
+    this.pollTimer = setInterval(() => this.checkAndFill(), SAFETY_CHECK_INTERVAL_MS);
 
-    // Also try immediately
+    // Try immediately with current book data
     this.checkAndFill();
   }
 
