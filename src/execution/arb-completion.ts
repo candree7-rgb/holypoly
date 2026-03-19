@@ -26,17 +26,23 @@ export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: n
 /** Safety fallback interval — WS is primary, this is just a backup (ms) */
 const SAFETY_CHECK_INTERVAL_MS = 2000;
 
-/** Phase 1: Fill if pair cost < 98¢ (guaranteed profit even after max fees) */
-const PHASE1_MAX_PAIR_CENTS = 98;
+/** Polymarket taker fee: 2% on each side. Both winner and loser orders pay this. */
+const TAKER_FEE_PCT = 0.02;
 
-/** Phase 2: Accept pair ≤ 100¢ (break-even — settlement pays 100¢, fees are small at extreme prices) */
+/** Phase 1: Fill if pair cost < 92¢ (guaranteed ~4¢ profit after ~4¢ fees on both sides)
+ * Math: payout $1.00 - pair cost $0.92 = $0.08 gross - ~$0.04 fees = ~$0.04 net profit */
+const PHASE1_MAX_PAIR_CENTS = 92;
+
+/** Phase 2: Accept pair ≤ 96¢ (still profitable after fees)
+ * Math: payout $1.00 - pair cost $0.96 = $0.04 gross - ~$0.04 fees ≈ break-even
+ * This is the absolute floor — below this we lose money on every hedge. */
 const PHASE2_AFTER_MS = 5000;
-const PHASE2_MAX_PAIR_CENTS = 100;
+const PHASE2_MAX_PAIR_CENTS = 96;
 
-/** Phase 3: After this many ms, bail out entirely.
- * 90s gives Polymarket time to correct — the market WILL adjust, it just needs time.
- * Windows are 5 minutes, so 90s is still conservative. */
-const BAILOUT_AFTER_MS = 90000;
+/** Phase 3: After 20s, bail out and hold naked.
+ * Naked directional with a real edge is BETTER than hedging at >96¢ pair cost.
+ * Don't wait 90s hoping for a miracle — if loser hasn't dropped by 20s, it won't. */
+const BAILOUT_AFTER_MS = 20000;
 
 interface HedgeState {
   active: boolean;
@@ -82,9 +88,9 @@ export class ArbCompletionMonitor {
 
   /**
    * Start seeking loser side. Simple 3-phase approach:
-   * Phase 1 (0-3s): Fill if pair cost < 98¢ (profitable after fees)
-   * Phase 2 (3-5s): Fill if pair cost ≤ 100¢ (break-even OK)
-   * Phase 3 (5s+):  Bail out — sell winner back
+   * Phase 1 (0-5s): Fill if pair cost < 92¢ (profitable after 2% fees on both sides)
+   * Phase 2 (5-20s): Fill if pair cost ≤ 96¢ (break-even after fees)
+   * Phase 3 (20s+):  Bail out — hold naked (positive EV from edge)
    */
   startSeeking(params: {
     winnerSide: TradeSide;
@@ -133,7 +139,7 @@ export class ArbCompletionMonitor {
       pairCost: pairCost ? `${pairCost.toFixed(1)}¢` : "N/A",
       profitableAt: `≤${(PHASE1_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
       breakEvenAt: `≤${(PHASE2_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
-      phases: `0-5s: fill<98¢ | 5-90s: fill≤100¢ | 90s+: bail`,
+      phases: `0-5s: fill<92¢ | 5-20s: fill≤96¢ | 20s+: bail (naked)`,
     });
 
     // WS-driven: onPriceUpdate fires on every orderbook change (primary path)
@@ -304,7 +310,10 @@ export class ArbCompletionMonitor {
 
     const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
     const pairCost = this.state.winnerAvgPriceCents + askCents;
-    const profitCents = 100 - pairCost; // fees are dynamic & small at extreme prices
+    // Fees: 2% taker fee on BOTH sides (winner already paid, loser will pay)
+    const winnerFeeCents = this.state.winnerAvgPriceCents * TAKER_FEE_PCT;
+    const loserFeeCents = askCents * TAKER_FEE_PCT;
+    const profitCents = 100 - pairCost - winnerFeeCents - loserFeeCents;
     const priceDecimal = askCents / 100;
     const shares = this.state.winnerShares;
     const costUsd = shares * priceDecimal;

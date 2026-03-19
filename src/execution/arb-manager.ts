@@ -187,8 +187,11 @@ export class ArbManager {
     const downProportion = this.downShares > 0 ? balanced / this.downShares : 0;
     const balancedCost = this.upCostUsd * upProportion + this.downCostUsd * downProportion;
 
+    // Deduct 2% taker fee on both sides
+    const fees = balancedCost * 0.02;
+
     // Balanced pairs pay $1.00 per share at settlement
-    return balanced - balancedCost;
+    return balanced - balancedCost - fees;
   }
 
   private getTotalCost(): number {

@@ -205,7 +205,7 @@ const main = async () => {
         const fee = fill.costFilled * TAKER_FEE_PCT;
         totalFees += fee;
         totalPnl += won
-          ? fill.sizeMatched * (1 - fill.price) - fee
+          ? (fill.sizeMatched - fill.costFilled - fee)
           : -(fill.costFilled + fee);
       }
       if (totalPnl === 0 && fills.every((f) => f.sizeMatched <= 0)) {

@@ -254,7 +254,7 @@ export class EdgeDetector {
       base *= decay;
     }
 
-    return Math.max(5, base); // absolute floor: 5¢ (need margin for ~2% fees + slippage)
+    return Math.max(7, base); // absolute floor: 7¢ (2¢ taker fee + 5¢ minimum profit margin)
   }
 
   /**
