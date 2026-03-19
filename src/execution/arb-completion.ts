@@ -144,18 +144,21 @@ export class ArbCompletionMonitor {
     // Old formula (+1¢) guaranteed loss after fees.
     const emergencyPrice = 100 - params.winnerAvgPriceCents - 2; // break-even after ~2% fees
 
-    // Get current loser ask for IMMEDIATE T1 fill
+    // Get current loser ask for reference (may still be expensive — market hasn't adjusted yet)
     const book = this.clobWs.getBook(params.loserTokenId);
     const currentLoserAsk = book?.bestAsk ? book.bestAsk * 100 : null;
 
-    // T1 target = current ask (fill NOW), T2/T3 trail below T1's fill price
-    const t1Target = currentLoserAsk ?? (100 - params.winnerAvgPriceCents - this.config.minProfitCents);
+    // T1 target = PROFITABLE price (wait for market to adjust, don't fill at current expensive ask)
+    // We bought winner at X¢. For profit we need loser ≤ (100 - X - minProfit)¢
+    const t1Target = 100 - params.winnerAvgPriceCents - this.config.minProfitCents;
 
-    // Build DCA tranches — T1 at market, T2/T3 relative to T1
+    // If current loser ask is already at or below our target, we can fill immediately
+    const canFillNow = currentLoserAsk !== null && currentLoserAsk <= t1Target;
+
+    // Build DCA tranches — T1 at profitable target, T2/T3 trail below T1
     const tranches: TrancheState[] = TRANCHE_CONFIG.map((tc) => ({
       pct: tc.pct,
       shares: params.winnerShares * tc.pct,
-      // T1: current ask price, T2/T3: below T1 by bonus amount
       maxPriceCents: Math.max(t1Target - tc.bonusCents, 5),
       filled: false,
       fillPriceCents: 0,
@@ -189,10 +192,12 @@ export class ArbCompletionMonitor {
     this.onCompleteCallback = params.onComplete;
 
     const loserSide: TradeSide = params.winnerSide === "Up" ? "Down" : "Up";
-    this.logger.info("Arb completion v3 started (immediate T1 + trailing DCA)", {
+    this.logger.info("Arb completion v4 started (wait for market adjustment + DCA)", {
       seeking: loserSide,
       currentLoserAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
+      canFillNow,
       t1Target: `≤${t1Target.toFixed(1)}¢`,
+      pairCostIfNow: currentLoserAsk ? `${(params.winnerAvgPriceCents + currentLoserAsk).toFixed(1)}¢` : "N/A",
       tranches: tranches.map((t, i) => `T${i + 1}: ${(t.pct * 100).toFixed(0)}% @ ≤${t.maxPriceCents.toFixed(1)}¢`),
       emergencyPrice: `≤${emergencyPrice.toFixed(1)}¢`,
       shares: params.winnerShares.toFixed(2),
@@ -201,12 +206,21 @@ export class ArbCompletionMonitor {
 
     this.checkTimer = setInterval(() => this.periodicCheck(), 500);
 
-    // IMMEDIATE T1 FILL: Don't wait, fill T1 right now at current ask
-    this.fillT1Immediately(currentLoserAsk).catch((err) => {
-      this.logger.warn("Immediate T1 fill failed, falling back to reactive", {
-        error: (err as Error).message,
+    // Only fill T1 immediately if loser is ALREADY at profitable price
+    // Otherwise, wait for market to adjust (reactive via onPriceUpdate)
+    if (canFillNow) {
+      this.fillT1Immediately(currentLoserAsk).catch((err) => {
+        this.logger.warn("Immediate T1 fill failed, falling back to reactive", {
+          error: (err as Error).message,
+        });
       });
-    });
+    } else {
+      this.logger.info("Loser too expensive now — waiting for market to adjust", {
+        currentAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
+        targetPrice: `≤${t1Target.toFixed(1)}¢`,
+        expectedDrop: currentLoserAsk ? `${(currentLoserAsk - t1Target).toFixed(1)}¢` : "N/A",
+      });
+    }
   }
 
   /**
@@ -240,13 +254,13 @@ export class ArbCompletionMonitor {
 
     // Check if filling at this price is acceptable (within emergency limit)
     if (askCents > this.state.emergencyPriceCents) {
-      this.logger.warn("T1 immediate fill: loser ask too expensive, triggering bail-out", {
+      // Don't bail out — market hasn't adjusted yet. Wait for price to drop.
+      this.logger.info("T1: loser still too expensive, waiting for market adjustment", {
         loserAsk: `${askCents.toFixed(1)}¢`,
         maxAcceptable: `${this.state.emergencyPriceCents.toFixed(1)}¢`,
         pairCost: `${(this.state.winnerAvgPriceCents + askCents).toFixed(1)}¢`,
       });
-      // Trigger bail-out: sell winner back instead of holding naked
-      await this.bailOut();
+      this.state.t1FillInFlight = false; // release guard so onPriceUpdate can catch it
       return;
     }
 
@@ -583,15 +597,18 @@ export class ArbCompletionMonitor {
     }
 
     // === MOMENTUM REVERSAL CHECK ===
-    if (this.volatilityCalc && this.state.phase === "trailing") {
+    // Only trigger emergency if BTC is reversing hard AND T1 is already filled.
+    // If T1 isn't filled yet, a reversal actually helps us (loser gets cheaper).
+    const t1Filled = this.state.tranches[0]?.filled ?? false;
+    if (t1Filled && this.volatilityCalc && this.state.phase === "trailing") {
       const momentum = this.volatilityCalc.getRecentMomentum(5);
       if (momentum !== null) {
         const adverse =
-          (this.state.winnerSide === "Up" && momentum < -20) ||
-          (this.state.winnerSide === "Down" && momentum > 20);
+          (this.state.winnerSide === "Up" && momentum < -40) ||
+          (this.state.winnerSide === "Down" && momentum > 40);
 
-        if (adverse && elapsed > 3000) {
-          this.logger.warn("BTC reversing — emergency fill remaining tranches", {
+        if (adverse && elapsed > 5000) {
+          this.logger.warn("BTC reversing hard — emergency fill remaining tranches", {
             momentum: `$${momentum.toFixed(0)}`,
             elapsed: `${(elapsed / 1000).toFixed(1)}s`,
             unfilledTranches: unfilled.length,
@@ -638,17 +655,18 @@ export class ArbCompletionMonitor {
 
     // The edge for our side specifically
     const ourEdge = this.state.winnerSide === "Up" ? edge.upEdge : edge.downEdge;
+    const t1Filled = this.state.tranches[0]?.filled ?? false;
 
-    // If edge has collapsed below stop-loss level
-    if (ourEdge < EDGE_STOP_LOSS_CENTS && elapsed > 2000) {
+    // Only trigger edge stop-loss if T1 is already filled.
+    // Before T1, the market is still adjusting — edge changes are expected.
+    if (t1Filled && ourEdge < EDGE_STOP_LOSS_CENTS && elapsed > 5000) {
       const unfilled = this.state.tranches.filter((t) => !t.filled);
       if (unfilled.length > 0) {
-        this.logger.warn("EDGE STOP-LOSS triggered — edge evaporated", {
+        this.logger.warn("EDGE STOP-LOSS triggered — edge evaporated after T1", {
           ourEdge: `${ourEdge.toFixed(1)}¢`,
           stopLoss: `${EDGE_STOP_LOSS_CENTS}¢`,
           elapsed: `${(elapsed / 1000).toFixed(1)}s`,
           unfilledTranches: unfilled.length,
-          action: unfilled.length === this.state.tranches.length ? "emergency fill ALL" : "emergency fill remaining",
         });
         this.emergencyFillRemaining().catch((err) => {
           this.logger.error("Edge stop-loss emergency failed", { error: (err as Error).message });

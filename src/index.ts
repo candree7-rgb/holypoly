@@ -57,7 +57,7 @@ const main = async () => {
     logger,
   );
 
-  logger.info("=== HolyPoly Bot Starting (Hybrid Edge+Arb Strategy) ===");
+  logger.info("=== HolyPoly Bot Starting (Edge → Wait → Arb Strategy) ===");
   logger.info("Mode", { dryRun: config.dryRun });
   logger.info("Edge parameters", {
     edgeThreshold: `${config.edgeThresholdCents}¢`,
@@ -65,11 +65,11 @@ const main = async () => {
     entryDelay: `${config.entryDelaySeconds}s`,
     scanInterval: `${config.scanIntervalMs}ms`,
   });
-  logger.info("Arb parameters", {
+  logger.info("Arb completion parameters", {
     minProfit: `${config.minProfitCents}¢/pair`,
     maxRoundTrips: config.maxRoundTripsPerWindow,
-    maxUnhedged: `${config.maxUnhedgedPct}%`,
-    arbTimeout: `${config.arbCompletionTimeoutMs}ms`,
+    arbTimeout: `${(config.arbCompletionTimeoutMs / 1000).toFixed(0)}s`,
+    strategy: "wait for market adjustment, then fill loser side via DCA",
   });
   logger.info("Risk", {
     buyAmountPct: `${config.buyAmountPct}%`,

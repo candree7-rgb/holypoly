@@ -1,4 +1,3 @@
-import { Side } from "@polymarket/clob-client";
 import type { Config } from "../config.js";
 import type { ClobService, OrderbookSnapshot } from "../data/clob.js";
 import type { Logger } from "../logger.js";
@@ -144,24 +143,6 @@ export class EdgeDetector {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
     }
 
-    // === PRE-ENTRY SPREAD CHECK (fee-aware) ===
-    // Pair must be profitable AFTER fees (~2¢ total for both legs).
-    // Max pair cost = 100¢ - minProfitCents - 2¢ fees
-    const maxPairCost = 100 - this.config.minProfitCents - 2; // e.g. 100 - 4 - 2 = 94¢
-    const pairCost = primaryAskCents + loserAskCents;
-    if (pairCost > maxPairCost) {
-      return noTrade(
-        `Spread too tight for profit: ${primaryAskCents}¢ + ${loserAskCents}¢ = ${pairCost}¢ (max ${maxPairCost}¢ after fees)`,
-      );
-    }
-    if (pairCost > maxPairCost - 2) {
-      this.logger.debug("Marginal spread — close to fee threshold", {
-        pairCost: `${pairCost}¢`,
-        maxAllowed: `${maxPairCost}¢`,
-        profitAfterFees: `${(100 - pairCost - 2).toFixed(1)}¢`,
-      });
-    }
-
     // === ORDERBOOK DEPTH CONFIRMATION ===
     // If buying Up: we want primary (Up) ask side thin (easy to buy) + loser (Down) bid depth high
     // Imbalance > 1 on primary = more buy pressure = confirms our direction
@@ -210,10 +191,7 @@ export class EdgeDetector {
       return noTrade(`Orderbook too thin: $${primaryBook.askDepthUsd.toFixed(2)} ask depth vs $${confidenceScaledAmount.toFixed(2)} wanted`);
     }
 
-    // Hedge decision
-    const shouldHedge = this.shouldHedge(edge.bestEdge, edge.regime);
-
-    // Build orders
+    // Build orders (directional — no hedge needed)
     const orders = this.buildGridOrders(
       window,
       edge.bestSide,
@@ -222,7 +200,6 @@ export class EdgeDetector {
       downBook,
       depthCappedAmount,
       numPrimary,
-      shouldHedge,
     );
 
     if (orders.length === 0) {
@@ -238,7 +215,7 @@ export class EdgeDetector {
       confidence: depthAdjustedConfidence,
       regime: edge.regime,
       depthConfirmation,
-      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, conf=${(depthAdjustedConfidence * 100).toFixed(0)}%, depth=${depthConfirmation.toFixed(1)}x, ${numPrimary}P${shouldHedge ? "+½H" : ""}, ${edge.regime} vol)`,
+      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, conf=${(depthAdjustedConfidence * 100).toFixed(0)}%, depth=${depthConfirmation.toFixed(1)}x, ${numPrimary} orders, ${edge.regime} vol)`,
     };
   }
 
@@ -291,15 +268,6 @@ export class EdgeDetector {
     return Math.min(target, maxBuysPerSide);
   }
 
-  /**
-   * Hedge decision: skip hedge in high-vol (too expensive) and at strong edges.
-   */
-  private shouldHedge(edgeCents: number, regime: VolatilityRegime): boolean {
-    if (this.config.hedgeMonitorEnabled) return false;
-    if (regime === "high") return false; // spreads too wide
-    return edgeCents >= this.config.edgeTier2Cents && edgeCents < this.config.hedgeEdgeThresholdCents;
-  }
-
   private buildGridOrders(
     window: WindowInfo,
     primarySide: TradeSide,
@@ -308,15 +276,11 @@ export class EdgeDetector {
     downBook: OrderbookSnapshot,
     buyAmountUsd: number,
     numPrimary: number,
-    shouldHedge: boolean,
   ): GridOrder[] {
     const orders: GridOrder[] = [];
-    const hedgeSide: TradeSide = primarySide === "Up" ? "Down" : "Up";
 
     const primaryBook = primarySide === "Up" ? upBook : downBook;
-    const hedgeBook = hedgeSide === "Up" ? upBook : downBook;
     const primaryTokenId = primarySide === "Up" ? window.upTokenId : window.downTokenId;
-    const hedgeTokenId = hedgeSide === "Up" ? window.upTokenId : window.downTokenId;
 
     const fairPrimary = primarySide === "Up" ? fairUp : 100 - fairUp;
 
@@ -366,24 +330,6 @@ export class EdgeDetector {
           tokenId: primaryTokenId,
           price: primaryBook.bestAsk * 100,
           amount: cappedAmount,
-        });
-      }
-    }
-
-    // Hedge side: half-size, only when decided
-    if (shouldHedge && orders.length > 0) {
-      const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100;
-      const hedgeLevels = hedgeBook.asks
-        .filter((a) => a.price <= hedgeMaxPrice)
-        .slice(0, 1);
-
-      const hedgeAmount = buyAmountUsd * 0.5;
-      for (const level of hedgeLevels) {
-        orders.push({
-          side: hedgeSide,
-          tokenId: hedgeTokenId,
-          price: level.price * 100,
-          amount: hedgeAmount,
         });
       }
     }
