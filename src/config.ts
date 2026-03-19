@@ -187,7 +187,7 @@ export const loadConfig = (): Config => {
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
   const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
-  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 55);
+  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
