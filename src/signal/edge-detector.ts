@@ -192,6 +192,24 @@ export class EdgeDetector {
     // Scale buy amount by confidence (reduce exposure when data is thin)
     const confidenceScaledAmount = buyAmountUsd * Math.max(0.5, depthAdjustedConfidence);
 
+    // === DEPTH-AWARE SIZING ===
+    // Cap buy amount to 40% of available ask depth (prevent market impact)
+    const depthCappedAmount = Math.min(
+      confidenceScaledAmount,
+      primaryBook.askDepthUsd * 0.4,
+    );
+    if (depthCappedAmount < confidenceScaledAmount * 0.5) {
+      this.logger.debug("Depth cap active — reducing position size", {
+        wanted: `$${confidenceScaledAmount.toFixed(2)}`,
+        available: `$${primaryBook.askDepthUsd.toFixed(2)}`,
+        capped: `$${depthCappedAmount.toFixed(2)}`,
+      });
+    }
+    // Don't enter if available depth is too thin (< $5 or < 30% of desired)
+    if (depthCappedAmount < 5 || depthCappedAmount < confidenceScaledAmount * 0.3) {
+      return noTrade(`Orderbook too thin: $${primaryBook.askDepthUsd.toFixed(2)} ask depth vs $${confidenceScaledAmount.toFixed(2)} wanted`);
+    }
+
     // Hedge decision
     const shouldHedge = this.shouldHedge(edge.bestEdge, edge.regime);
 
@@ -202,7 +220,7 @@ export class EdgeDetector {
       edge.fairUp,
       upBook,
       downBook,
-      confidenceScaledAmount,
+      depthCappedAmount,
       numPrimary,
       shouldHedge,
     );

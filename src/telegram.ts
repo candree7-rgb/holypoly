@@ -8,6 +8,14 @@ import type { Logger } from "./logger.js";
 export class TelegramNotifier {
   private enabled: boolean;
   private apiUrl: string;
+  /** Dedup: track last send time per alert type to prevent flooding */
+  private lastAlertTime: Map<string, number> = new Map();
+  /** Minimum interval between same-type alerts (ms) */
+  private alertCooldownMs = 30000; // 30s dedup window
+  /** Max alerts per 5-minute window */
+  private alertCount = 0;
+  private alertWindowStart = Date.now();
+  private maxAlertsPerWindow = 15;
 
   constructor(
     private token: string | undefined,
@@ -26,9 +34,41 @@ export class TelegramNotifier {
     }
   }
 
+  /**
+   * Check if this alert type should be sent (dedup + throttle).
+   * Returns false if same alert type sent within cooldown, or global rate exceeded.
+   */
+  private shouldSend(alertType: string): boolean {
+    const now = Date.now();
+
+    // Reset 5-minute window
+    if (now - this.alertWindowStart > 300000) {
+      this.alertCount = 0;
+      this.alertWindowStart = now;
+    }
+
+    // Global throttle
+    if (this.alertCount >= this.maxAlertsPerWindow) {
+      this.logger.debug("Telegram throttled", { alertType, count: this.alertCount });
+      return false;
+    }
+
+    // Per-type dedup
+    const lastTime = this.lastAlertTime.get(alertType) ?? 0;
+    if (now - lastTime < this.alertCooldownMs) {
+      this.logger.debug("Telegram dedup", { alertType, lastAgo: `${((now - lastTime) / 1000).toFixed(0)}s` });
+      return false;
+    }
+
+    this.lastAlertTime.set(alertType, now);
+    this.alertCount++;
+    return true;
+  }
+
   /** Send a message with Markdown, fallback to plaintext on error. */
-  async send(message: string): Promise<boolean> {
+  async send(message: string, alertType?: string): Promise<boolean> {
     if (!this.enabled) return false;
+    if (alertType && !this.shouldSend(alertType)) return false;
 
     try {
       let resp = await fetch(this.apiUrl, {
@@ -128,7 +168,7 @@ export class TelegramNotifier {
   }
 
   async alertError(error: string): Promise<void> {
-    await this.send(`⚠️ *ERROR*\n${error}`);
+    await this.send(`⚠️ *ERROR*\n${error}`, `error:${error.slice(0, 30)}`);
   }
 
   async alertHedge(

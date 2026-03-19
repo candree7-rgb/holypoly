@@ -32,7 +32,8 @@ const weekKeyUtc = (date = new Date()): string => {
 export class RiskManager {
   private cachedBalance: number = 0;
   private lastBalanceFetch: number = 0;
-  private balanceCacheTtlMs = 60000; // refresh balance every 60s
+  /** Balance cache: 5s during active trading, 30s idle */
+  private balanceCacheTtlMs = 5000;
 
   constructor(
     private config: Config,
@@ -42,7 +43,7 @@ export class RiskManager {
   ) {}
 
   /**
-   * Get current wallet balance (cached for 60s).
+   * Get current wallet balance (cached for 5s).
    */
   async getBalance(): Promise<number> {
     const now = Date.now();
@@ -54,13 +55,34 @@ export class RiskManager {
     return this.cachedBalance;
   }
 
+  /** Invalidate balance cache (call after fills/settlement) */
+  invalidateBalanceCache(): void {
+    this.lastBalanceFetch = 0;
+  }
+
   /**
    * Calculate buy amount in USD from current balance.
-   * BUY_AMOUNT_PCT=2 + balance=$1000 → $20 per order
+   * Uses tiered sizing for scalability:
+   *   ≤$1000:  buyAmountPct (default 4%)
+   *   $1000-5000: buyAmountPct * 0.5 (e.g. 2%)
+   *   $5000+: buyAmountPct * 0.25 (e.g. 1%)
+   * This prevents orderbook depth issues at higher balances.
    */
   async calculateBuyAmount(): Promise<number> {
     const balance = await this.getBalance();
-    return balance * (this.config.buyAmountPct / 100);
+    return balance * (this.getEffectiveBuyPct(balance) / 100);
+  }
+
+  /**
+   * Get effective buy percentage, scaled by balance tier.
+   * Prevents oversized orders that exceed orderbook depth.
+   */
+  getEffectiveBuyPct(balance: number): number {
+    const base = this.config.buyAmountPct;
+    if (balance <= 1000) return base;
+    if (balance <= 5000) return base * 0.5;
+    if (balance <= 20000) return base * 0.25;
+    return base * 0.1; // $20k+: 0.4% = $80 max per order at $20k
   }
 
   /**
@@ -68,7 +90,7 @@ export class RiskManager {
    */
   async check(): Promise<RiskCheck> {
     const balance = await this.getBalance();
-    const buyAmountUsd = balance * (this.config.buyAmountPct / 100);
+    const buyAmountUsd = balance * (this.getEffectiveBuyPct(balance) / 100);
 
     const noTrade = (reason: string): RiskCheck => ({
       allowed: false,
@@ -175,7 +197,7 @@ export class RiskManager {
 
     this.logger.info("Risk status", {
       balance: `$${balance.toFixed(2)}`,
-      buyAmount: `$${(balance * this.config.buyAmountPct / 100).toFixed(2)} (${this.config.buyAmountPct}%)`,
+      buyAmount: `$${(balance * this.getEffectiveBuyPct(balance) / 100).toFixed(2)} (${this.getEffectiveBuyPct(balance).toFixed(1)}% effective, ${this.config.buyAmountPct}% base)`,
       dailyPnl: `$${daily.totalPnl.toFixed(2)}`,
       dailyTrades: daily.windowsTraded,
       dailyWinRate: daily.windowsTraded > 0

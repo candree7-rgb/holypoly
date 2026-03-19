@@ -255,8 +255,32 @@ const main = async () => {
       btcSettle: settlementPrice.toFixed(2),
     });
 
-    await riskManager.recordResult(totalPnl);
-    await db.updateWindowSettlement(window.conditionId, totalPnl, winner);
+    // Atomic settlement: all DB writes in one transaction
+    const won = totalPnl >= 0;
+    const today = new Date();
+    const dailyDate = `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, "0")}-${String(today.getUTCDate()).padStart(2, "0")}`;
+    const weekStart = new Date(today);
+    weekStart.setUTCDate(today.getUTCDate() - today.getUTCDay());
+    const weeklyWeek = `${weekStart.getUTCFullYear()}-W${String(weekStart.getUTCMonth() + 1).padStart(2, "0")}${String(weekStart.getUTCDate()).padStart(2, "0")}`;
+
+    try {
+      await db.settleWindowAtomic({
+        conditionId: window.conditionId,
+        pnl: totalPnl,
+        winner,
+        dailyDate,
+        weeklyWeek,
+        won,
+      });
+    } catch {
+      // Fallback to non-atomic if transaction fails
+      logger.warn("Atomic settlement failed, using fallback");
+      await riskManager.recordResult(totalPnl);
+      await db.updateWindowSettlement(window.conditionId, totalPnl, winner);
+    }
+
+    // Invalidate balance cache after settlement
+    riskManager.invalidateBalanceCache();
 
     // Record outcome for cross-window continuation bias
     windowMemory.recordOutcome(winner, settlementPrice - window.openingPrice);
@@ -271,6 +295,29 @@ const main = async () => {
       dailyStats.wins,
       dailyStats.losses,
     );
+  };
+
+  // === FLASH CRASH CIRCUIT BREAKER ===
+  let circuitBreakerUntil = 0;
+
+  const checkCircuitBreaker = (): boolean => {
+    const now = Date.now();
+    if (now < circuitBreakerUntil) return true; // still paused
+
+    // Check if volatility spiked (>2x normal high threshold = flash crash)
+    const vol = volatilityCalc.getVolatility();
+    if (vol > 160) { // 2x highVolThreshold($80) = extreme
+      const pauseMs = 180000; // 3 minute pause
+      circuitBreakerUntil = now + pauseMs;
+      logger.warn("CIRCUIT BREAKER — extreme volatility, pausing", {
+        volatility: `$${vol.toFixed(1)}`,
+        threshold: "$160",
+        pauseMinutes: 3,
+      });
+      telegram.alertCircuitBreaker(`Extreme volatility: $${vol.toFixed(0)}. Pausing 3 min.`);
+      return true;
+    }
+    return false;
   };
 
   // === MAIN HYBRID LOOP ===
@@ -367,6 +414,12 @@ const main = async () => {
         // Need Binance price
         const btcPrice = binance.price;
         if (!btcPrice) {
+          await sleep(config.scanIntervalMs);
+          continue;
+        }
+
+        // Circuit breaker: pause on extreme volatility
+        if (checkCircuitBreaker()) {
           await sleep(config.scanIntervalMs);
           continue;
         }

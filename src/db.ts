@@ -208,6 +208,71 @@ export class Database {
     );
   }
 
+  /**
+   * Atomic settlement: wraps recordResult + updateWindowSettlement in a transaction.
+   * Prevents partial writes (e.g. P&L recorded but settlement not, or vice versa).
+   */
+  async settleWindowAtomic(params: {
+    conditionId: string;
+    pnl: number;
+    winner: string;
+    dailyDate: string;
+    weeklyWeek: string;
+    won: boolean;
+  }): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // Update window settlement
+      await client.query(
+        `UPDATE window_trades SET pnl = $2, winner = $3
+         WHERE condition_id = $1 AND pnl IS NULL`,
+        [params.conditionId, params.pnl, params.winner]
+      );
+
+      // Update daily P&L
+      await client.query(
+        `UPDATE daily_snapshots SET
+          total_pnl = total_pnl + $2,
+          windows_traded = windows_traded + 1,
+          wins = wins + $3,
+          losses = losses + $4
+         WHERE date = $1`,
+        [params.dailyDate, params.pnl, params.won ? 1 : 0, params.won ? 0 : 1]
+      );
+
+      // Update weekly P&L
+      await client.query(
+        "UPDATE weekly_snapshots SET total_pnl = total_pnl + $2 WHERE week = $1",
+        [params.weeklyWeek, params.pnl]
+      );
+
+      // Update losing streak
+      if (params.won) {
+        await client.query(
+          `INSERT INTO bot_state (key, value, updated_at) VALUES ('losing_streak', '0', NOW())
+           ON CONFLICT (key) DO UPDATE SET value = '0', updated_at = NOW()`
+        );
+      } else {
+        await client.query(
+          `INSERT INTO bot_state (key, value, updated_at) VALUES ('losing_streak', '0', NOW())
+           ON CONFLICT (key) DO UPDATE SET value = to_jsonb((bot_state.value::int + 1)), updated_at = NOW()`
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      this.logger.error("Settlement transaction failed, rolling back", {
+        error: (err as Error).message,
+      });
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   // === Redeem Tracking ===
 
   async getRedeemAttempt(conditionId: string): Promise<number> {
