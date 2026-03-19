@@ -140,7 +140,9 @@ export class ArbCompletionMonitor {
     timeRemainingSeconds: number;
     onComplete: ArbCompletionCallback;
   }): void {
-    const emergencyPrice = 100 - params.winnerAvgPriceCents + 1; // max 1¢ loss
+    // Emergency max: 100¢ - winner price - 2¢ fees. Allows 0¢ profit at worst.
+    // Old formula (+1¢) guaranteed loss after fees.
+    const emergencyPrice = 100 - params.winnerAvgPriceCents - 2; // break-even after ~2% fees
 
     // Get current loser ask for IMMEDIATE T1 fill
     const book = this.clobWs.getBook(params.loserTokenId);
@@ -281,14 +283,18 @@ export class ArbCompletionMonitor {
   private async bailOut(): Promise<void> {
     if (!this.state) return;
 
+    const winnerSide = this.state.winnerSide;
+    const winnerShares = this.state.winnerShares;
+    const winnerCostUsd = this.state.winnerShares * this.state.winnerAvgPriceCents / 100;
+
     this.logger.warn("BAIL-OUT: Selling winner shares back", {
-      side: this.state.winnerSide,
-      shares: this.state.winnerShares.toFixed(2),
+      side: winnerSide,
+      shares: winnerShares.toFixed(2),
       reason: "Loser side too expensive, arb not completable",
     });
 
     this.telegram.alertError(
-      `Bail-out: Selling ${this.state.winnerSide} ${this.state.winnerShares.toFixed(1)} shares. Loser too expensive for arb.`,
+      `Bail-out: Selling ${winnerSide} ${winnerShares.toFixed(1)} shares. Loser too expensive for arb.`,
     );
 
     if (this.config.dryRun) {
@@ -303,12 +309,12 @@ export class ArbCompletionMonitor {
             tokenId: this.state.winnerTokenId,
             side: Side.SELL,
             price: bestBid,
-            size: this.state.winnerShares,
+            size: winnerShares,
           }]);
           if (result.placed > 0) {
             this.logger.info("Bail-out sell order placed", {
               price: `${(bestBid * 100).toFixed(1)}¢`,
-              shares: this.state.winnerShares.toFixed(2),
+              shares: winnerShares.toFixed(2),
             });
           } else {
             this.logger.error("Bail-out sell order rejected — holding naked");
@@ -321,7 +327,15 @@ export class ArbCompletionMonitor {
       }
     }
 
-    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+    // CRITICAL: Reverse the winner shares from ArbManager so settlement doesn't
+    // count them as a naked position. The shares have been sold back (or simulated).
+    this.arbManager.recordFill(winnerSide, -winnerShares, -winnerCostUsd);
+    this.logger.info("Bail-out: reversed winner position in ArbManager", {
+      side: winnerSide,
+      reversedShares: winnerShares.toFixed(2),
+    });
+
+    const loserSide: TradeSide = winnerSide === "Up" ? "Down" : "Up";
     this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
   }
 
