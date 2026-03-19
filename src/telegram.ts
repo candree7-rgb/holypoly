@@ -130,4 +130,34 @@ export class TelegramNotifier {
   async alertError(error: string): Promise<void> {
     await this.send(`⚠️ *ERROR*\n${error}`);
   }
+
+  async alertHedge(
+    hedgeSide: string,
+    entryPriceCents: number,
+    triggerPriceCents: number,
+    hedgePriceCents: number,
+    lockedLoss: number,
+  ): Promise<void> {
+    await this.send(
+      `🛡 *HEDGE* ${hedgeSide}\n` +
+        `Entry: ${entryPriceCents.toFixed(1)}¢ → Trigger: ${triggerPriceCents.toFixed(1)}¢\n` +
+        `Hedge @ ${hedgePriceCents.toFixed(1)}¢ | Locked loss: -$${lockedLoss.toFixed(2)}`,
+    );
+  }
+
+  async alertEdgeEntry(
+    side: string,
+    edgeCents: number,
+    fairUp: number,
+    regime: string,
+    confidence: number,
+    amount: number,
+    numOrders: number,
+  ): Promise<void> {
+    await this.send(
+      `⚡ *EDGE ${side.toUpperCase()}* ${edgeCents.toFixed(1)}¢\n` +
+        `Fair: ${fairUp}¢ | Conf: ${(confidence * 100).toFixed(0)}% | Vol: ${regime}\n` +
+        `$${amount.toFixed(2)} × ${numOrders} orders`,
+    );
+  }
 }

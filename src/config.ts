@@ -20,7 +20,7 @@ export interface Config {
   profileAddress: string;
   apiCreds?: ApiCreds;
 
-  // Webhook
+  // Webhook (kept for optional hybrid mode)
   webhookPort: number;
   webhookSecret?: string;
 
@@ -28,15 +28,36 @@ export interface Config {
   /** % of wallet balance per individual order (e.g. 4 = 4%) */
   buyAmountPct: number;
   maxBuysPerWindow: number;
-  /** Max price (cents) to enter current market — above this, target next market */
-  currentMarketMaxPriceCents: number;
-  /** Limit order price (cents) for early next-market entry */
-  nextMarketLimitPriceCents: number;
-  /** Timeout (ms) for limit order before switching to market order */
-  limitOrderTimeoutMs: number;
+  maxBuysPerSide: number;
   maxEntryPriceCents: number;
   minEntryPriceCents: number;
   redeemDelaySeconds: number;
+
+  // Edge detection parameters
+  /** Minimum edge (cents) to enter a trade */
+  edgeThresholdCents: number;
+  /** Edge tier thresholds for position scaling */
+  edgeTier2Cents: number;
+  edgeTier3Cents: number;
+  edgeTier4Cents: number;
+  /** Minimum BTC delta (USD) to consider trading */
+  minDeltaThresholdUsd: number;
+  /** Max adverse momentum (USD) before skipping trade */
+  maxAdverseMomentumUsd: number;
+  /** Seconds to look back for momentum check */
+  momentumLookbackSeconds: number;
+  /** Seconds to look back for volatility calculation */
+  volatilityLookbackSeconds: number;
+  /** Seconds to wait after window start before scanning */
+  entryDelaySeconds: number;
+  /** How often (ms) to scan for edge opportunities */
+  scanIntervalMs: number;
+
+  // Hedge parameters
+  hedgeMonitorEnabled: boolean;
+  hedgeTriggerCents: number;
+  hedgeEdgeThresholdCents: number;
+  hedgeMaxPriceCents: number;
 
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
@@ -152,13 +173,29 @@ export const loadConfig = (): Config => {
 
   // Trading parameters
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
-  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7);
-  const currentMarketMaxPriceCents = parseNumber("CURRENT_MARKET_MAX_PRICE_CENTS", 70);
-  const nextMarketLimitPriceCents = parseNumber("NEXT_MARKET_LIMIT_PRICE_CENTS", 52);
-  const limitOrderTimeoutMs = parseNumber("LIMIT_ORDER_TIMEOUT_MS", 15000);
+  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
+  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
+
+  // Edge detection parameters
+  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
+  const edgeTier2Cents = parseNumber("EDGE_TIER2_CENTS", 8);
+  const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
+  const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
+  const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
+  const maxAdverseMomentumUsd = parseNumber("MAX_ADVERSE_MOMENTUM_USD", 50);
+  const momentumLookbackSeconds = parseNumber("MOMENTUM_LOOKBACK_SECONDS", 30);
+  const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 120);
+  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 30);
+  const scanIntervalMs = parseNumber("SCAN_INTERVAL_MS", 2000);
+
+  // Hedge parameters
+  const hedgeMonitorEnabled = parseBoolean("HEDGE_MONITOR_ENABLED", true);
+  const hedgeTriggerCents = parseNumber("HEDGE_TRIGGER_CENTS", 5);
+  const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD_CENTS", 12);
+  const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
 
   // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10);
@@ -218,12 +255,24 @@ export const loadConfig = (): Config => {
     webhookSecret,
     buyAmountPct,
     maxBuysPerWindow,
-    currentMarketMaxPriceCents,
-    nextMarketLimitPriceCents,
-    limitOrderTimeoutMs,
+    maxBuysPerSide,
     maxEntryPriceCents,
     minEntryPriceCents,
     redeemDelaySeconds,
+    edgeThresholdCents,
+    edgeTier2Cents,
+    edgeTier3Cents,
+    edgeTier4Cents,
+    minDeltaThresholdUsd,
+    maxAdverseMomentumUsd,
+    momentumLookbackSeconds,
+    volatilityLookbackSeconds,
+    entryDelaySeconds,
+    scanIntervalMs,
+    hedgeMonitorEnabled,
+    hedgeTriggerCents,
+    hedgeEdgeThresholdCents,
+    hedgeMaxPriceCents,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,

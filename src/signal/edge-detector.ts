@@ -1,0 +1,305 @@
+import { Side } from "@polymarket/clob-client";
+import type { Config } from "../config.js";
+import type { ClobService, OrderbookSnapshot } from "../data/clob.js";
+import type { Logger } from "../logger.js";
+import type { GridOrder, TradeSide, WindowInfo } from "../types.js";
+import { FairValueEngine } from "./fair-value.js";
+import type { VolatilityCalculator, VolatilityRegime } from "./volatility.js";
+
+export interface TradeDecision {
+  shouldTrade: boolean;
+  orders: GridOrder[];
+  primarySide: TradeSide;
+  fairUp: number;
+  bestEdge: number;
+  confidence: number;
+  regime: VolatilityRegime;
+  reason: string;
+}
+
+/**
+ * Improved Edge Detector v2.
+ *
+ * Key improvements over v1:
+ * - Dynamic edge thresholds based on volatility regime
+ *   (lower threshold in high-vol = more opportunities, higher in low-vol = better odds)
+ * - Confidence-weighted position sizing (scale with data quality)
+ * - Latency-aware entry: considers time needed to fill orders
+ * - Acceleration filter: prefer trades where BTC is moving in our direction
+ * - Better grid order construction with spread-aware pricing
+ */
+export class EdgeDetector {
+  constructor(
+    private fairValueEngine: FairValueEngine,
+    private clob: ClobService,
+    private config: Config,
+    private logger: Logger,
+    private volatilityCalc: VolatilityCalculator,
+  ) {}
+
+  async evaluate(
+    window: WindowInfo,
+    currentBtcPrice: number,
+    timeRemainingSeconds: number,
+    buyAmountUsd: number,
+  ): Promise<TradeDecision> {
+    const noTrade = (reason: string): TradeDecision => ({
+      shouldTrade: false,
+      orders: [],
+      primarySide: "Up",
+      fairUp: 50,
+      bestEdge: 0,
+      confidence: 0,
+      regime: "normal",
+      reason,
+    });
+
+    // Skip if too late (need time for order fills + settlement buffer)
+    if (timeRemainingSeconds < 20) {
+      return noTrade("Too late in window (<20s)");
+    }
+
+    // Get orderbook for both sides
+    let upBook: OrderbookSnapshot;
+    let downBook: OrderbookSnapshot;
+    try {
+      [upBook, downBook] = await Promise.all([
+        this.clob.getOrderbook(window.upTokenId),
+        this.clob.getOrderbook(window.downTokenId),
+      ]);
+    } catch (err) {
+      return noTrade(`Orderbook fetch failed: ${(err as Error).message}`);
+    }
+
+    if (upBook.bestAsk === null || downBook.bestAsk === null) {
+      return noTrade("No asks available");
+    }
+
+    const marketUpCents = Math.round(upBook.bestAsk * 100);
+    const marketDownCents = Math.round(downBook.bestAsk * 100);
+
+    // Calculate edge with confidence
+    const edge = this.fairValueEngine.calculateEdge(
+      currentBtcPrice,
+      window.openingPrice,
+      timeRemainingSeconds,
+      marketUpCents,
+      marketDownCents,
+    );
+
+    this.logger.debug("Edge evaluation", {
+      delta: (currentBtcPrice - window.openingPrice).toFixed(2),
+      fairUp: edge.fairUp,
+      marketUp: marketUpCents,
+      marketDown: marketDownCents,
+      upEdge: edge.upEdge.toFixed(1),
+      downEdge: edge.downEdge.toFixed(1),
+      bestSide: edge.bestSide,
+      bestEdge: edge.bestEdge.toFixed(1),
+      confidence: edge.confidence.toFixed(2),
+      regime: edge.regime,
+      timeLeft: timeRemainingSeconds,
+    });
+
+    // Dynamic edge threshold based on volatility regime
+    const effectiveThreshold = this.getAdaptiveThreshold(edge.regime, timeRemainingSeconds);
+
+    if (edge.bestEdge < effectiveThreshold) {
+      return noTrade(
+        `Edge too small (${edge.bestEdge.toFixed(1)}¢ < ${effectiveThreshold.toFixed(1)}¢ [${edge.regime}])`,
+      );
+    }
+
+    // Momentum filter: skip if BTC moving against our side
+    if (this.config.maxAdverseMomentumUsd > 0) {
+      const momentum = this.volatilityCalc.getRecentMomentum(this.config.momentumLookbackSeconds);
+      if (momentum !== null) {
+        const isAdverse =
+          (edge.bestSide === "Up" && momentum < -this.config.maxAdverseMomentumUsd) ||
+          (edge.bestSide === "Down" && momentum > this.config.maxAdverseMomentumUsd);
+        if (isAdverse) {
+          return noTrade(
+            `Adverse momentum: $${momentum.toFixed(0)} in ${this.config.momentumLookbackSeconds}s vs ${edge.bestSide}`,
+          );
+        }
+      }
+    }
+
+    // Skip flat markets near 50/50
+    const absDelta = Math.abs(currentBtcPrice - window.openingPrice);
+    if (absDelta < this.config.minDeltaThresholdUsd && marketUpCents >= 45 && marketUpCents <= 55) {
+      return noTrade(`BTC flat (delta=$${absDelta.toFixed(2)}) and market near 50/50`);
+    }
+
+    // Price bounds check
+    const primaryAskCents = edge.bestSide === "Up" ? marketUpCents : marketDownCents;
+    if (primaryAskCents < this.config.minEntryPriceCents) {
+      return noTrade(`Primary ${edge.bestSide} too cheap (${primaryAskCents}¢ < ${this.config.minEntryPriceCents}¢)`);
+    }
+    if (primaryAskCents > this.config.maxEntryPriceCents) {
+      return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
+    }
+
+    // Scale position by edge strength AND confidence
+    const numPrimary = this.scalePrimaryOrders(edge.bestEdge, edge.confidence);
+
+    // Scale buy amount by confidence (reduce exposure when data is thin)
+    const confidenceScaledAmount = buyAmountUsd * Math.max(0.5, edge.confidence);
+
+    // Hedge decision
+    const shouldHedge = this.shouldHedge(edge.bestEdge, edge.regime);
+
+    // Build orders
+    const orders = this.buildGridOrders(
+      window,
+      edge.bestSide,
+      edge.fairUp,
+      upBook,
+      downBook,
+      confidenceScaledAmount,
+      numPrimary,
+      shouldHedge,
+    );
+
+    if (orders.length === 0) {
+      return noTrade("No viable order levels found");
+    }
+
+    return {
+      shouldTrade: true,
+      orders,
+      primarySide: edge.bestSide,
+      fairUp: edge.fairUp,
+      bestEdge: edge.bestEdge,
+      confidence: edge.confidence,
+      regime: edge.regime,
+      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, conf=${(edge.confidence * 100).toFixed(0)}%, ${numPrimary}P${shouldHedge ? "+½H" : ""}, ${edge.regime} vol)`,
+    };
+  }
+
+  /**
+   * Adaptive edge threshold by volatility regime and time remaining.
+   *
+   * High vol → lower threshold (edges appear and vanish quickly, take them)
+   * Low vol → higher threshold (markets are tight, need bigger edge to overcome spread)
+   * Late in window → lower threshold (less time for edge to evaporate)
+   */
+  private getAdaptiveThreshold(regime: VolatilityRegime, timeRemaining: number): number {
+    let base = this.config.edgeThresholdCents;
+
+    // Regime adjustment
+    if (regime === "high") base *= 0.7;      // -30% for high vol
+    if (regime === "low") base *= 1.3;       // +30% for low vol
+
+    // Time decay: reduce threshold as window approaches end
+    // At 240s: full threshold. At 30s: 60% of threshold.
+    if (timeRemaining < 120) {
+      const decay = 0.6 + 0.4 * (timeRemaining / 120);
+      base *= decay;
+    }
+
+    return Math.max(3, base); // absolute floor: 3¢
+  }
+
+  /**
+   * Scale orders by edge strength and confidence.
+   * Confidence < 0.7 caps at 2 orders (thin data = smaller position).
+   */
+  private scalePrimaryOrders(edgeCents: number, confidence: number): number {
+    const { edgeTier2Cents, edgeTier3Cents, edgeTier4Cents, maxBuysPerSide } = this.config;
+
+    let target: number;
+    if (edgeCents >= edgeTier4Cents) {
+      target = 4 + (edgeCents >= edgeTier4Cents + 5 ? 1 : 0);
+    } else if (edgeCents >= edgeTier3Cents) {
+      target = 3;
+    } else if (edgeCents >= edgeTier2Cents) {
+      target = 2;
+    } else {
+      target = 1;
+    }
+
+    // Cap by confidence
+    if (confidence < 0.5) target = Math.min(target, 1);
+    else if (confidence < 0.7) target = Math.min(target, 2);
+
+    return Math.min(target, maxBuysPerSide);
+  }
+
+  /**
+   * Hedge decision: skip hedge in high-vol (too expensive) and at strong edges.
+   */
+  private shouldHedge(edgeCents: number, regime: VolatilityRegime): boolean {
+    if (this.config.hedgeMonitorEnabled) return false;
+    if (regime === "high") return false; // spreads too wide
+    return edgeCents >= this.config.edgeTier2Cents && edgeCents < this.config.hedgeEdgeThresholdCents;
+  }
+
+  private buildGridOrders(
+    window: WindowInfo,
+    primarySide: TradeSide,
+    fairUp: number,
+    upBook: OrderbookSnapshot,
+    downBook: OrderbookSnapshot,
+    buyAmountUsd: number,
+    numPrimary: number,
+    shouldHedge: boolean,
+  ): GridOrder[] {
+    const orders: GridOrder[] = [];
+    const hedgeSide: TradeSide = primarySide === "Up" ? "Down" : "Up";
+
+    const primaryBook = primarySide === "Up" ? upBook : downBook;
+    const hedgeBook = hedgeSide === "Up" ? upBook : downBook;
+    const primaryTokenId = primarySide === "Up" ? window.upTokenId : window.downTokenId;
+    const hedgeTokenId = hedgeSide === "Up" ? window.upTokenId : window.downTokenId;
+
+    const fairPrimary = primarySide === "Up" ? fairUp : 100 - fairUp;
+
+    // Primary side: buy at ask levels up to fairValue + 5¢
+    const primaryMaxPrice = (fairPrimary + 5) / 100;
+    const primaryLevels = primaryBook.asks
+      .filter((a) => a.price <= primaryMaxPrice)
+      .slice(0, numPrimary);
+
+    for (const level of primaryLevels) {
+      orders.push({
+        side: primarySide,
+        tokenId: primaryTokenId,
+        price: level.price * 100,
+        amount: buyAmountUsd,
+      });
+    }
+
+    // Fallback: place at best ask if no levels match
+    if (orders.length === 0 && primaryBook.bestAsk !== null) {
+      if (primaryBook.bestAsk <= primaryMaxPrice) {
+        orders.push({
+          side: primarySide,
+          tokenId: primaryTokenId,
+          price: primaryBook.bestAsk * 100,
+          amount: buyAmountUsd,
+        });
+      }
+    }
+
+    // Hedge side: half-size, only when decided
+    if (shouldHedge && orders.length > 0) {
+      const hedgeMaxPrice = this.config.hedgeMaxPriceCents / 100;
+      const hedgeLevels = hedgeBook.asks
+        .filter((a) => a.price <= hedgeMaxPrice)
+        .slice(0, 1);
+
+      const hedgeAmount = buyAmountUsd * 0.5;
+      for (const level of hedgeLevels) {
+        orders.push({
+          side: hedgeSide,
+          tokenId: hedgeTokenId,
+          price: level.price * 100,
+          amount: hedgeAmount,
+        });
+      }
+    }
+
+    return orders.slice(0, this.config.maxBuysPerWindow);
+  }
+}
