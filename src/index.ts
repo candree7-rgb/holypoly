@@ -189,34 +189,43 @@ const main = async () => {
     const winner: TradeSide = settlementPrice > window.openingPrice ? "Up" : "Down";
     let totalPnl: number;
 
+    // Polymarket taker fee: 2% per fill
+    const TAKER_FEE_PCT = 0.02;
+
     const isLive = !config.dryRun && windowOrderIds.length > 0;
     if (isLive) {
       const fills = await clob.getOrderFills(windowOrderIds, window.conditionId);
       totalPnl = 0;
+      let totalFees = 0;
       for (const fill of fills) {
         if (fill.sizeMatched <= 0) continue;
-        // Determine which side this fill belongs to
         const fillSide: TradeSide =
           fill.tokenId === window.upTokenId ? "Up" : "Down";
         const won = fillSide === winner;
+        const fee = fill.costFilled * TAKER_FEE_PCT;
+        totalFees += fee;
         totalPnl += won
-          ? fill.sizeMatched * (1 - fill.price)
-          : -fill.costFilled;
+          ? fill.sizeMatched * (1 - fill.price) - fee
+          : -(fill.costFilled + fee);
       }
       if (totalPnl === 0 && fills.every((f) => f.sizeMatched <= 0)) {
         logger.info("No fills this window, skipping settlement");
         return;
       }
+      logger.debug("Fee impact", { totalFees: `$${totalFees.toFixed(4)}` });
     } else {
-      // Dry run: calculate from arb state
+      // Dry run: calculate from arb state (with fee deduction)
       totalPnl = 0;
+      const totalCost = state.upCostUsd + state.downCostUsd;
+      const totalFees = totalCost * TAKER_FEE_PCT;
       const balanced = Math.min(state.upShares, state.downShares);
       if (balanced > 0) {
-        // Balanced pairs: guaranteed $1.00 payout
+        // Balanced pairs: guaranteed $1.00 payout minus cost and fees
         const upProp = state.upShares > 0 ? balanced / state.upShares : 0;
         const downProp = state.downShares > 0 ? balanced / state.downShares : 0;
         const balancedCost = state.upCostUsd * upProp + state.downCostUsd * downProp;
-        totalPnl += balanced - balancedCost; // $1.00 per share - cost
+        const balancedFees = balancedCost * TAKER_FEE_PCT;
+        totalPnl += balanced - balancedCost - balancedFees;
       }
       // Unhedged portion
       const unhedged = Math.abs(state.upShares - state.downShares);
@@ -226,8 +235,12 @@ const main = async () => {
         const unhedgedCost = unhedgedSide === "Up"
           ? state.upCostUsd * (unhedged / state.upShares)
           : state.downCostUsd * (unhedged / state.downShares);
-        totalPnl += unhedgedWon ? (unhedged - unhedgedCost) : -unhedgedCost;
+        const unhedgedFees = unhedgedCost * TAKER_FEE_PCT;
+        totalPnl += unhedgedWon
+          ? (unhedged - unhedgedCost - unhedgedFees)
+          : -(unhedgedCost + unhedgedFees);
       }
+      logger.debug("Fee impact (dry run)", { totalFees: `$${totalFees.toFixed(4)}` });
     }
 
     const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
@@ -493,6 +506,9 @@ const main = async () => {
         });
 
         // === STEP 2: START ARB COMPLETION — seek loser side ===
+        const winnerTokenId = decision.primarySide === "Up"
+          ? window.upTokenId
+          : window.downTokenId;
         const loserTokenId = decision.primarySide === "Up"
           ? window.downTokenId
           : window.upTokenId;
@@ -501,6 +517,7 @@ const main = async () => {
           winnerSide: decision.primarySide,
           winnerAvgPriceCents: avgEntry,
           winnerShares: totalShares,
+          winnerTokenId,
           loserTokenId,
           window,
           currentBtcPrice: btcPrice,

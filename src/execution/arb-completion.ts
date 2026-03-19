@@ -10,17 +10,19 @@ import type { VolatilityCalculator } from "../signal/volatility.js";
 import type { FairValueEngine } from "../signal/fair-value.js";
 
 /**
- * ArbCompletionMonitor v2: Trailing DCA + Edge Stop-Loss
+ * ArbCompletionMonitor v3: Immediate T1 + Trailing DCA + Edge Stop-Loss
  *
- * Key improvements over v1:
- * 1. TRAILING DCA: Buy loser in tranches (50/30/20) instead of all-at-once
- *    → Captures better avg price as loser continues dropping
- * 2. EDGE STOP-LOSS: Monitor edge continuously, emergency close if edge evaporates
- *    → Don't wait for full reversal, cut early
- * 3. DYNAMIC TARGET: Trail the target price down as loser drops
- *    → If loser drops to 25¢ and our target was 43¢, buy at 25¢ not 43¢
- * 4. PROFIT LOCK LEVELS: Lock partial profit at different levels
- *    → First tranche locks minimum profit, subsequent tranches are bonus
+ * Key improvements over v2:
+ * 1. IMMEDIATE T1: Fill 60% at current ask IMMEDIATELY (no waiting for targets)
+ *    → Locks profit NOW instead of waiting 15s for unrealistic targets
+ * 2. DYNAMIC TARGETS: T2/T3 targets derived from actual T1 fill price, not theory
+ * 3. REVERSAL GUARD: If loser rises after T1, stop trailing and accept partial hedge
+ *    → Threshold scales with volatility (1-4¢ adaptive)
+ * 4. BAIL-OUT: If hedge impossible (loser too expensive), sell winner back via FOK
+ *    → Better than holding naked position to settlement
+ * 5. RACE GUARD: t1FillInFlight flag prevents double-fill from concurrent paths
+ * 6. FEE AWARENESS: All P&L calculations account for 2% taker fee
+ * 7. TIMEOUT FIX: Emergency fills ALL remaining tranches on timeout (no 40% naked gap)
  */
 
 export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[]) => void;
@@ -45,6 +47,7 @@ interface MonitorState {
   winnerSide: TradeSide;
   winnerAvgPriceCents: number;
   winnerShares: number;
+  winnerTokenId: string;
   loserTokenId: string;
   /** Initial target (100 - winner - minProfit) */
   baseTargetPriceCents: number;
@@ -64,6 +67,8 @@ interface MonitorState {
   allOrderIds: string[];
   /** Resting maker order ID for T1 (cancelled on emergency) */
   restingOrderId: string | null;
+  /** Guard: T1 fill is in-flight (prevents double-fill from WS + immediate) */
+  t1FillInFlight: boolean;
   /** Last edge check timestamp */
   lastEdgeCheckAt: number;
   /** Current BTC price for edge monitoring */
@@ -89,6 +94,9 @@ const TRANCHE_CONFIG = [
   { pct: 0.25, bonusCents: 3 },   // T2: only if 3¢ better than T1
   { pct: 0.15, bonusCents: 6 },   // T3: only if 6¢ better than T1
 ];
+
+/** Polymarket taker fee (2%) — must be accounted for in all P&L calculations */
+const TAKER_FEE_PCT = 0.02;
 
 /** Edge stop-loss: if edge shrinks below this, emergency close */
 const EDGE_STOP_LOSS_CENTS = 2;
@@ -125,6 +133,7 @@ export class ArbCompletionMonitor {
     winnerSide: TradeSide;
     winnerAvgPriceCents: number;
     winnerShares: number;
+    winnerTokenId: string;
     loserTokenId: string;
     window: WindowInfo;
     currentBtcPrice: number;
@@ -156,6 +165,7 @@ export class ArbCompletionMonitor {
       winnerSide: params.winnerSide,
       winnerAvgPriceCents: params.winnerAvgPriceCents,
       winnerShares: params.winnerShares,
+      winnerTokenId: params.winnerTokenId,
       loserTokenId: params.loserTokenId,
       baseTargetPriceCents: t1Target,
       emergencyPriceCents: emergencyPrice,
@@ -167,6 +177,7 @@ export class ArbCompletionMonitor {
       totalCostUsd: 0,
       allOrderIds: [],
       restingOrderId: null,
+      t1FillInFlight: false,
       lastEdgeCheckAt: Date.now(),
       currentBtcPrice: params.currentBtcPrice,
       openingPrice: params.window.openingPrice,
@@ -204,7 +215,10 @@ export class ArbCompletionMonitor {
     if (!this.state) return;
 
     const t1 = this.state.tranches[0];
-    if (t1.filled) return;
+    if (t1.filled || this.state.t1FillInFlight) return;
+
+    // Set guard BEFORE async work to prevent race with onPriceUpdate
+    this.state.t1FillInFlight = true;
 
     // Get fresh ask if not provided
     let askCents = currentAskCents;
@@ -267,10 +281,6 @@ export class ArbCompletionMonitor {
   private async bailOut(): Promise<void> {
     if (!this.state) return;
 
-    const winnerTokenId = this.state.winnerSide === "Up"
-      ? this.state.loserTokenId.replace(/down/i, "up") // fallback
-      : this.state.loserTokenId.replace(/up/i, "down");
-
     this.logger.warn("BAIL-OUT: Selling winner shares back", {
       side: this.state.winnerSide,
       shares: this.state.winnerShares.toFixed(2),
@@ -283,9 +293,33 @@ export class ArbCompletionMonitor {
 
     if (this.config.dryRun) {
       this.logger.info("DRY_RUN — bail-out sell simulated");
+    } else {
+      // Actually sell the winner shares back via FOK
+      try {
+        const book = this.clobWs.getBook(this.state.winnerTokenId);
+        const bestBid = book?.bestBid;
+        if (bestBid && bestBid > 0) {
+          const result = await this.clob.placeBatchOrders([{
+            tokenId: this.state.winnerTokenId,
+            side: Side.SELL,
+            price: bestBid,
+            size: this.state.winnerShares,
+          }]);
+          if (result.placed > 0) {
+            this.logger.info("Bail-out sell order placed", {
+              price: `${(bestBid * 100).toFixed(1)}¢`,
+              shares: this.state.winnerShares.toFixed(2),
+            });
+          } else {
+            this.logger.error("Bail-out sell order rejected — holding naked");
+          }
+        } else {
+          this.logger.error("Bail-out: no bid for winner side — holding naked");
+        }
+      } catch (err) {
+        this.logger.error("Bail-out sell failed", { error: (err as Error).message });
+      }
     }
-    // Note: actual SELL order would go here for live mode.
-    // For now, complete with 0 loser shares (naked but flagged as bail-out).
 
     const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
     this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
@@ -350,13 +384,16 @@ export class ArbCompletionMonitor {
       }
     }
 
-    // === REVERSAL GUARD ===
-    // If T1 filled but loser is now rising above T1 fill price + 2¢, stop trailing.
-    // Accept what we have — don't wait for T2/T3 that will never come.
+    // === REVERSAL GUARD (volatility-adaptive) ===
+    // If T1 filled but loser is rising, stop trailing and accept what we have.
+    // Threshold scales with volatility: tighter in calm markets, wider in volatile ones.
     const t1 = this.state.tranches[0];
     if (t1.filled) {
       const unfilled = this.state.tranches.filter((t) => !t.filled);
-      if (unfilled.length > 0 && askCents > t1.fillPriceCents + 2) {
+      const reversalThreshold = this.volatilityCalc
+        ? Math.max(1, Math.min(4, 1 + this.volatilityCalc.getVolatility() * 0.02))
+        : 2;
+      if (unfilled.length > 0 && askCents > t1.fillPriceCents + reversalThreshold) {
         this.logger.info("Reversal guard — loser rising, accepting partial hedge", {
           t1Fill: `${t1.fillPriceCents.toFixed(1)}¢`,
           currentAsk: `${askCents.toFixed(1)}¢`,
@@ -375,8 +412,8 @@ export class ArbCompletionMonitor {
       const tranche = this.state.tranches[i];
       if (tranche.filled) continue;
 
-      // Skip T1 if resting order is active
-      if (i === 0 && this.state.restingOrderId) continue;
+      // Skip T1 if fill is already in-flight or resting order active (prevent double-fill)
+      if (i === 0 && (this.state.t1FillInFlight || this.state.restingOrderId)) continue;
 
       // Trailing logic: fill at ACTUAL price when it hits tranche target
       if (askCents <= tranche.maxPriceCents) {
@@ -553,30 +590,19 @@ export class ArbCompletionMonitor {
       }
     }
 
-    // === TIMEOUT: Handle remaining tranches ===
+    // === TIMEOUT: Emergency fill ALL remaining tranches ===
     if (elapsed > this.config.arbCompletionTimeoutMs && this.state.phase === "trailing") {
       const filledCount = this.state.tranches.filter((t) => t.filled).length;
-
-      if (filledCount > 0) {
-        // T1 filled but T2/T3 didn't — that's fine, complete with what we have
-        this.logger.info("Arb completion timeout — completing with filled tranches", {
-          elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-          filledTranches: filledCount,
-          unfilledTranches: unfilled.length,
-          hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
-        });
-        const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
-      } else {
-        // Nothing filled at all — emergency fill
-        this.logger.warn("Arb completion timeout — T1 never filled, emergency fill", {
-          elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-          unfilledTranches: unfilled.length,
-        });
-        this.emergencyFillRemaining().catch((err) => {
-          this.logger.error("Emergency fill failed", { error: (err as Error).message });
-        });
-      }
+      this.logger.warn("Arb completion timeout — emergency fill remaining", {
+        elapsed: `${(elapsed / 1000).toFixed(1)}s`,
+        filledTranches: filledCount,
+        unfilledTranches: unfilled.length,
+        hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
+      });
+      // Always emergency fill remaining — don't leave 40% unhedged
+      this.emergencyFillRemaining().catch((err) => {
+        this.logger.error("Emergency fill failed", { error: (err as Error).message });
+      });
     }
   }
 
@@ -658,14 +684,16 @@ export class ArbCompletionMonitor {
     }
 
     const totalCost = this.state.winnerAvgPriceCents + askCents;
-    const pnlPerPair = 100 - totalCost;
+    const feeCostCents = (this.state.winnerAvgPriceCents + askCents) * TAKER_FEE_PCT;
+    const pnlPerPair = 100 - totalCost - feeCostCents;
 
     this.logger.info("EMERGENCY FILL remaining tranches", {
       side: loserSide,
       price: `${askCents.toFixed(1)}¢`,
       shares: remainingShares.toFixed(2),
       totalCost: `${totalCost.toFixed(1)}¢/pair`,
-      pnlPerPair: `${pnlPerPair >= 0 ? "+" : ""}${pnlPerPair.toFixed(1)}¢`,
+      fees: `${feeCostCents.toFixed(1)}¢`,
+      pnlPerPair: `${pnlPerPair >= 0 ? "+" : ""}${pnlPerPair.toFixed(1)}¢ (after fees)`,
     });
 
     // Accept up to emergency price (1¢ loss per pair max)

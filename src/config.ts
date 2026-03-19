@@ -210,7 +210,7 @@ export const loadConfig = (): Config => {
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
 
   // Arb completion parameters
-  const minProfitCents = parseNumber("MIN_PROFIT_CENTS", 2);
+  const minProfitCents = parseNumber("MIN_PROFIT_CENTS", 4);
   const maxRoundTripsPerWindow = parseNumber("MAX_ROUND_TRIPS_PER_WINDOW", 3);
   const maxUnhedgedPct = parseNumber("MAX_UNHEDGED_PCT", 11);
   const maxWindowExposurePct = parseNumber("MAX_WINDOW_EXPOSURE_PCT", 15);
