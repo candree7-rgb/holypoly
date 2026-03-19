@@ -705,13 +705,12 @@ export class ArbCompletionMonitor {
     }
 
     if (!askCents) {
-      this.logger.error("No loser price — holding partially hedged", {
+      this.logger.error("No loser price — bailing out of winner position", {
         filledShares: this.state.totalSharesFilled.toFixed(2),
         unhedgedShares: remainingShares.toFixed(2),
       });
-      this.telegram.alertError(`Emergency fill failed: no ${loserSide} price. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked.`);
-      // Complete with what we have
-      this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+      this.telegram.alertError(`Emergency fill failed: no ${loserSide} price. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked. Bailing out.`);
+      await this.bailOut();
       return;
     }
 
@@ -764,22 +763,23 @@ export class ArbCompletionMonitor {
         this.state.allOrderIds.push(...result.orderIds);
         this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
       } else {
-        this.logger.error("Emergency order rejected — holding partially hedged");
-        this.telegram.alertError("Emergency fill order rejected. Manual intervention needed.");
-        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+        this.logger.error("Emergency order rejected — bailing out");
+        this.telegram.alertError("Emergency fill order rejected. Bailing out of winner position.");
+        await this.bailOut();
       }
     } else {
-      // Price too high — complete with whatever we have
-      this.logger.warn("Emergency price too high, completing with partial hedge", {
+      // Price too high — bail out (sell winner back) instead of holding naked
+      this.logger.warn("Emergency price too high — bailing out of winner position", {
         loserAsk: `${askCents.toFixed(1)}¢`,
         maxAcceptable: `${this.state.emergencyPriceCents.toFixed(1)}¢`,
         hedgedShares: this.state.totalSharesFilled.toFixed(2),
         nakedShares: remainingShares.toFixed(2),
       });
       this.telegram.alertError(
-        `Arb partial: ${loserSide} at ${askCents.toFixed(1)}¢ too expensive. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked.`,
+        `Arb partial: ${loserSide} at ${askCents.toFixed(1)}¢ too expensive. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked. Bailing out.`,
       );
-      this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+      // Bail out: sell winner shares back instead of holding naked to settlement
+      await this.bailOut();
     }
   }
 

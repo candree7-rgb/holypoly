@@ -80,6 +80,13 @@ export class EdgeDetector {
     const marketUpCents = Math.round(upBook.bestAsk * 100);
     const marketDownCents = Math.round(downBook.bestAsk * 100);
 
+    // Sanity check: in a binary market, Up ask + Down ask should be ~100¢
+    // If sum > 105¢, orderbook is broken/stale — don't trade
+    const askSum = marketUpCents + marketDownCents;
+    if (askSum > 105) {
+      return noTrade(`Orderbook broken: Up ${marketUpCents}¢ + Down ${marketDownCents}¢ = ${askSum}¢ (>105¢)`);
+    }
+
     // Calculate edge with confidence
     const edge = this.fairValueEngine.calculateEdge(
       currentBtcPrice,
