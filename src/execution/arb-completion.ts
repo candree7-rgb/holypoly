@@ -29,15 +29,15 @@ const TAKER_FEE_PCT = 0.02;
 /** Safety fallback interval — WS is primary, this is just a backup (ms) */
 const SAFETY_CHECK_INTERVAL_MS = 2000;
 
-/** Phase 1: Fill if profitable (pair < 98¢ after fees) */
+/** Phase 1: Fill if profitable (pair + fees < 98¢) */
 const PHASE1_MAX_PAIR_CENTS = 98;
 
-/** Phase 2: After this many ms, accept break-even (pair ≤ 100¢) */
-const PHASE2_AFTER_MS = 3000;
+/** Phase 2: After this many ms, accept break-even (pair + fees ≤ 100¢) */
+const PHASE2_AFTER_MS = 5000;
 const PHASE2_MAX_PAIR_CENTS = 100;
 
 /** Phase 3: After this many ms, bail out entirely */
-const BAILOUT_AFTER_MS = 5000;
+const BAILOUT_AFTER_MS = 15000;
 
 interface HedgeState {
   active: boolean;
@@ -52,6 +52,10 @@ interface HedgeState {
   totalSharesFilled: number;
   totalCostUsd: number;
   allOrderIds: string[];
+  /** Best (lowest) loser ask seen during monitoring */
+  bestLoserAskSeen: number;
+  /** Initial loser ask when monitoring started */
+  initialLoserAsk: number | null;
   /** BTC price for edge monitoring */
   currentBtcPrice: number;
   openingPrice: number;
@@ -114,6 +118,8 @@ export class ArbCompletionMonitor {
       totalSharesFilled: 0,
       totalCostUsd: 0,
       allOrderIds: [],
+      bestLoserAskSeen: currentLoserAsk ?? 999,
+      initialLoserAsk: currentLoserAsk,
       currentBtcPrice: params.currentBtcPrice,
       openingPrice: params.window.openingPrice,
       timeRemainingSeconds: params.timeRemainingSeconds,
@@ -128,7 +134,7 @@ export class ArbCompletionMonitor {
       pairCost: pairCost ? `${pairCost.toFixed(1)}¢` : "N/A",
       profitableAt: `≤${(PHASE1_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
       breakEvenAt: `≤${(PHASE2_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
-      phases: `0-3s: fill<98¢ | 3-5s: fill≤100¢ | 5s+: bail`,
+      phases: `0-5s: fill<98¢ | 5-15s: fill≤100¢ | 15s+: bail`,
     });
 
     // WS-driven: onPriceUpdate fires on every orderbook change (primary path)
@@ -205,6 +211,11 @@ export class ArbCompletionMonitor {
     const book = this.clobWs.getBook(this.state.loserTokenId);
     const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
     if (!askCents) return; // no price yet, wait for next tick
+
+    // Track best (lowest) loser price seen
+    if (askCents < this.state.bestLoserAskSeen) {
+      this.state.bestLoserAskSeen = askCents;
+    }
 
     const pairCost = this.state.winnerAvgPriceCents + askCents;
     const feeCents = pairCost * TAKER_FEE_PCT;
@@ -338,15 +349,27 @@ export class ArbCompletionMonitor {
       }
     }
 
+    const bestSeen = this.state.bestLoserAskSeen;
+    const initialAsk = this.state.initialLoserAsk;
+    const neededForProfit = PHASE1_MAX_PAIR_CENTS - this.state.winnerAvgPriceCents;
+    const neededForBreakeven = PHASE2_MAX_PAIR_CENTS - this.state.winnerAvgPriceCents;
+    const elapsedSec = ((Date.now() - this.state.startedAt) / 1000).toFixed(1);
+
     this.logger.warn("BAIL-OUT: Selling winner shares back", {
       side: winnerSide,
       shares: winnerShares.toFixed(2),
-      elapsed: `${((Date.now() - this.state.startedAt) / 1000).toFixed(1)}s`,
-      loserAsk: askCents ? `${askCents.toFixed(1)}¢` : "N/A",
+      elapsed: `${elapsedSec}s`,
+      loserAskNow: askCents ? `${askCents.toFixed(1)}¢` : "N/A",
+      loserAskInitial: initialAsk ? `${initialAsk.toFixed(1)}¢` : "N/A",
+      bestLoserAskSeen: `${bestSeen.toFixed(1)}¢`,
+      priceDropSeen: initialAsk ? `${(initialAsk - bestSeen).toFixed(1)}¢` : "N/A",
+      neededForProfit: `≤${neededForProfit.toFixed(1)}¢`,
+      neededForBreakeven: `≤${neededForBreakeven.toFixed(1)}¢`,
+      gap: `${(bestSeen - neededForBreakeven).toFixed(1)}¢ away from break-even`,
     });
 
     this.telegram.alertError(
-      `Bail-out: Selling ${winnerSide} ${winnerShares.toFixed(1)} shares after 5s. Loser too expensive.`,
+      `Bail-out: ${winnerSide} ${winnerShares.toFixed(0)}sh after ${elapsedSec}s. Loser best=${bestSeen.toFixed(0)}¢, need≤${neededForBreakeven.toFixed(0)}¢, gap=${(bestSeen - neededForBreakeven).toFixed(0)}¢`,
     );
 
     if (this.config.dryRun) {
