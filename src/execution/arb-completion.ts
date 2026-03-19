@@ -23,16 +23,13 @@ import type { FairValueEngine } from "../signal/fair-value.js";
 
 export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[]) => void;
 
-/** Polymarket taker fee (~2%) */
-const TAKER_FEE_PCT = 0.02;
-
 /** Safety fallback interval — WS is primary, this is just a backup (ms) */
 const SAFETY_CHECK_INTERVAL_MS = 2000;
 
-/** Phase 1: Fill if profitable (pair + fees < 98¢) */
+/** Phase 1: Fill if pair cost < 98¢ (guaranteed profit even after max fees) */
 const PHASE1_MAX_PAIR_CENTS = 98;
 
-/** Phase 2: After this many ms, accept break-even (pair + fees ≤ 100¢) */
+/** Phase 2: Accept pair ≤ 100¢ (break-even — settlement pays 100¢, fees are small at extreme prices) */
 const PHASE2_AFTER_MS = 5000;
 const PHASE2_MAX_PAIR_CENTS = 100;
 
@@ -264,11 +261,10 @@ export class ArbCompletionMonitor {
     }
 
     const pairCost = this.state!.winnerAvgPriceCents + askCents;
-    const feeCents = pairCost * TAKER_FEE_PCT;
 
-    // Phase 1: profitable fill (pair + fees < 98¢)
+    // Phase 1: profitable fill (pair < 98¢)
     if (elapsed < PHASE2_AFTER_MS) {
-      if (pairCost + feeCents <= PHASE1_MAX_PAIR_CENTS) {
+      if (pairCost <= PHASE1_MAX_PAIR_CENTS) {
         this.state!.fillInFlight = true;
         this.fillLoser(askCents, "profitable").catch((err) => {
           this.logger.error("Profitable fill failed — will retry on next update", {
@@ -283,8 +279,8 @@ export class ArbCompletionMonitor {
       return;
     }
 
-    // Phase 2: break-even fill (pair + fees ≤ 100¢)
-    if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
+    // Phase 2: break-even fill (pair ≤ 100¢ — settlement pays 100¢)
+    if (pairCost <= PHASE2_MAX_PAIR_CENTS) {
       this.state!.fillInFlight = true;
       this.fillLoser(askCents, "breakeven").catch((err) => {
         this.logger.error("Break-even fill failed — will retry on next update", {
@@ -306,7 +302,7 @@ export class ArbCompletionMonitor {
 
     const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
     const pairCost = this.state.winnerAvgPriceCents + askCents;
-    const profitCents = 100 - pairCost - (pairCost * TAKER_FEE_PCT);
+    const profitCents = 100 - pairCost; // fees are dynamic & small at extreme prices
     const priceDecimal = askCents / 100;
     const shares = this.state.winnerShares;
     const costUsd = shares * priceDecimal;
@@ -344,7 +340,7 @@ export class ArbCompletionMonitor {
       const maxPair = (Date.now() - this.state.startedAt) >= PHASE2_AFTER_MS
         ? PHASE2_MAX_PAIR_CENTS
         : PHASE1_MAX_PAIR_CENTS;
-      if (freshPairCost + freshPairCost * TAKER_FEE_PCT > maxPair) {
+      if (freshPairCost > maxPair) {
         this.logger.info("Fresh price too expensive — aborting fill, will retry");
         this.state.fillInFlight = false;
         return;
@@ -390,9 +386,8 @@ export class ArbCompletionMonitor {
     const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
     if (askCents) {
       const pairCost = this.state.winnerAvgPriceCents + askCents;
-      const feeCents = pairCost * TAKER_FEE_PCT;
       // Accept anything ≤ 100¢ (break-even) before bailing
-      if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
+      if (pairCost <= PHASE2_MAX_PAIR_CENTS) {
         this.logger.info("Last-second fill opportunity — filling instead of bailing");
         await this.fillLoser(askCents, "last-chance");
         return;
