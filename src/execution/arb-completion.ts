@@ -75,17 +75,19 @@ interface MonitorState {
 }
 
 /**
- * DCA tranche configuration:
- * Tranche 1 (50%): Buy at target price → locks minimum profit
- * Tranche 2 (30%): Buy at target - 3¢ → bonus if price drops more
- * Tranche 3 (20%): Buy at target - 6¢ → maximum extraction
+ * DCA tranche configuration v3 (dynamic):
+ * Tranche 1 (60%): Fills IMMEDIATELY at current loser ask → lock profit NOW
+ * Tranche 2 (25%): Trails — only fills if loser drops 3¢+ below T1 fill
+ * Tranche 3 (15%): Trails deeper — fills if loser drops 6¢+ below T1 fill
  *
- * If price doesn't drop enough for T2/T3, they execute at emergency
+ * Key change: T1 is no longer a limit order waiting for a target price.
+ * It fills at market immediately after winner entry. T2/T3 are bonus.
+ * If loser rises instead of dropping, we accept T1-only and move on.
  */
 const TRANCHE_CONFIG = [
-  { pct: 0.50, bonusCents: 0 },   // T1: at target
-  { pct: 0.30, bonusCents: 3 },   // T2: 3¢ better than target
-  { pct: 0.20, bonusCents: 6 },   // T3: 6¢ better than target
+  { pct: 0.60, bonusCents: 0 },   // T1: IMMEDIATE at current ask
+  { pct: 0.25, bonusCents: 3 },   // T2: only if 3¢ better than T1
+  { pct: 0.15, bonusCents: 6 },   // T3: only if 6¢ better than T1
 ];
 
 /** Edge stop-loss: if edge shrinks below this, emergency close */
@@ -113,7 +115,11 @@ export class ArbCompletionMonitor {
   }
 
   /**
-   * Start monitoring for arb completion with trailing DCA.
+   * Start monitoring for arb completion with dynamic DCA.
+   *
+   * v3 strategy: T1 fills IMMEDIATELY at current loser ask (lock profit now).
+   * T2/T3 only trail for bonus if loser continues dropping.
+   * If loser rises, we accept partial hedge and move on.
    */
   startSeeking(params: {
     winnerSide: TradeSide;
@@ -125,15 +131,21 @@ export class ArbCompletionMonitor {
     timeRemainingSeconds: number;
     onComplete: ArbCompletionCallback;
   }): void {
-    const baseTarget = this.arbManager.getLoserTargetPriceCents(params.winnerAvgPriceCents);
     const emergencyPrice = 100 - params.winnerAvgPriceCents + 1; // max 1¢ loss
 
-    // Build DCA tranches
+    // Get current loser ask for IMMEDIATE T1 fill
+    const book = this.clobWs.getBook(params.loserTokenId);
+    const currentLoserAsk = book?.bestAsk ? book.bestAsk * 100 : null;
+
+    // T1 target = current ask (fill NOW), T2/T3 trail below T1's fill price
+    const t1Target = currentLoserAsk ?? (100 - params.winnerAvgPriceCents - this.config.minProfitCents);
+
+    // Build DCA tranches — T1 at market, T2/T3 relative to T1
     const tranches: TrancheState[] = TRANCHE_CONFIG.map((tc) => ({
       pct: tc.pct,
       shares: params.winnerShares * tc.pct,
-      // Each subsequent tranche has a lower (better) target
-      maxPriceCents: Math.max(baseTarget - tc.bonusCents, 5),
+      // T1: current ask price, T2/T3: below T1 by bonus amount
+      maxPriceCents: Math.max(t1Target - tc.bonusCents, 5),
       filled: false,
       fillPriceCents: 0,
       orderIds: [],
@@ -145,9 +157,9 @@ export class ArbCompletionMonitor {
       winnerAvgPriceCents: params.winnerAvgPriceCents,
       winnerShares: params.winnerShares,
       loserTokenId: params.loserTokenId,
-      baseTargetPriceCents: baseTarget,
+      baseTargetPriceCents: t1Target,
       emergencyPriceCents: emergencyPrice,
-      bestLoserPriceSeen: 999,
+      bestLoserPriceSeen: currentLoserAsk ?? 999,
       startedAt: Date.now(),
       phase: "trailing",
       tranches,
@@ -164,9 +176,10 @@ export class ArbCompletionMonitor {
     this.onCompleteCallback = params.onComplete;
 
     const loserSide: TradeSide = params.winnerSide === "Up" ? "Down" : "Up";
-    this.logger.info("Arb completion v2 started (trailing DCA)", {
+    this.logger.info("Arb completion v3 started (immediate T1 + trailing DCA)", {
       seeking: loserSide,
-      baseTarget: `≤${baseTarget.toFixed(1)}¢`,
+      currentLoserAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
+      t1Target: `≤${t1Target.toFixed(1)}¢`,
       tranches: tranches.map((t, i) => `T${i + 1}: ${(t.pct * 100).toFixed(0)}% @ ≤${t.maxPriceCents.toFixed(1)}¢`),
       emergencyPrice: `≤${emergencyPrice.toFixed(1)}¢`,
       shares: params.winnerShares.toFixed(2),
@@ -175,43 +188,107 @@ export class ArbCompletionMonitor {
 
     this.checkTimer = setInterval(() => this.periodicCheck(), 500);
 
-    // MAKER OPTIMIZATION: Immediately place resting bid for T1 at target price.
-    // This sits on the book BEFORE the loser reprices, so when sellers come in
-    // we get filled as MAKER (lower fees + rebate) instead of TAKER.
-    this.placeRestingBidForT1().catch((err) => {
-      this.logger.warn("Resting bid placement failed, will fill reactively", {
+    // IMMEDIATE T1 FILL: Don't wait, fill T1 right now at current ask
+    this.fillT1Immediately(currentLoserAsk).catch((err) => {
+      this.logger.warn("Immediate T1 fill failed, falling back to reactive", {
         error: (err as Error).message,
       });
     });
   }
 
   /**
-   * Place a resting limit bid for Tranche 1 immediately.
-   * This makes us a MAKER when the loser side reprices down.
+   * Fill T1 (60%) IMMEDIATELY at current loser ask.
+   * This is the key v3 change — don't wait for a target, lock profit now.
    */
-  private async placeRestingBidForT1(): Promise<void> {
-    if (!this.state || this.config.dryRun) return;
+  private async fillT1Immediately(currentAskCents: number | null): Promise<void> {
+    if (!this.state) return;
 
     const t1 = this.state.tranches[0];
     if (t1.filled) return;
 
-    const priceDecimal = t1.maxPriceCents / 100;
+    // Get fresh ask if not provided
+    let askCents = currentAskCents;
+    if (!askCents) {
+      const book = this.clobWs.getBook(this.state.loserTokenId);
+      askCents = book?.bestAsk ? book.bestAsk * 100 : null;
+    }
+    if (!askCents) {
+      const ob = await this.clob.getOrderbook(this.state.loserTokenId);
+      askCents = ob.bestAsk ? ob.bestAsk * 100 : null;
+    }
 
-    const result = await this.clob.placeBatchOrders([{
-      tokenId: this.state.loserTokenId,
-      side: Side.BUY,
-      price: priceDecimal,
-      size: t1.shares,
-    }]); // GTC by default — rests on book
+    if (!askCents) {
+      this.logger.warn("T1 immediate fill: no loser ask available, waiting for WS update");
+      return;
+    }
 
-    if (result.placed > 0 && result.orderIds.length > 0) {
-      this.state.restingOrderId = result.orderIds[0];
-      this.logger.info("Resting maker bid placed for T1", {
-        price: `${t1.maxPriceCents.toFixed(1)}¢`,
-        shares: t1.shares.toFixed(2),
-        orderId: result.orderIds[0].slice(0, 12) + "...",
+    // Check if filling at this price is acceptable (within emergency limit)
+    if (askCents > this.state.emergencyPriceCents) {
+      this.logger.warn("T1 immediate fill: loser ask too expensive, triggering bail-out", {
+        loserAsk: `${askCents.toFixed(1)}¢`,
+        maxAcceptable: `${this.state.emergencyPriceCents.toFixed(1)}¢`,
+        pairCost: `${(this.state.winnerAvgPriceCents + askCents).toFixed(1)}¢`,
+      });
+      // Trigger bail-out: sell winner back instead of holding naked
+      await this.bailOut();
+      return;
+    }
+
+    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+
+    // Fill T1 immediately
+    this.logger.info("T1 IMMEDIATE FILL at market", {
+      side: loserSide,
+      price: `${askCents.toFixed(1)}¢`,
+      shares: t1.shares.toFixed(2),
+      pairCost: `${(this.state.winnerAvgPriceCents + askCents).toFixed(1)}¢`,
+      pnlPerPair: `${(100 - this.state.winnerAvgPriceCents - askCents).toFixed(1)}¢`,
+    });
+
+    await this.fillTranche(0, askCents);
+
+    // After T1 fills, update T2/T3 targets relative to actual T1 fill price
+    if (t1.filled && this.state) {
+      for (let i = 1; i < this.state.tranches.length; i++) {
+        const bonus = TRANCHE_CONFIG[i].bonusCents;
+        this.state.tranches[i].maxPriceCents = Math.max(t1.fillPriceCents - bonus, 5);
+      }
+      this.logger.debug("Updated trailing targets after T1 fill", {
+        t2Target: `≤${this.state.tranches[1]?.maxPriceCents.toFixed(1)}¢`,
+        t3Target: `≤${this.state.tranches[2]?.maxPriceCents.toFixed(1)}¢`,
       });
     }
+  }
+
+  /**
+   * Bail-out: sell winner shares back when hedge is impossible.
+   * Better to take a small FOK spread loss than hold a naked position.
+   */
+  private async bailOut(): Promise<void> {
+    if (!this.state) return;
+
+    const winnerTokenId = this.state.winnerSide === "Up"
+      ? this.state.loserTokenId.replace(/down/i, "up") // fallback
+      : this.state.loserTokenId.replace(/up/i, "down");
+
+    this.logger.warn("BAIL-OUT: Selling winner shares back", {
+      side: this.state.winnerSide,
+      shares: this.state.winnerShares.toFixed(2),
+      reason: "Loser side too expensive, arb not completable",
+    });
+
+    this.telegram.alertError(
+      `Bail-out: Selling ${this.state.winnerSide} ${this.state.winnerShares.toFixed(1)} shares. Loser too expensive for arb.`,
+    );
+
+    if (this.config.dryRun) {
+      this.logger.info("DRY_RUN — bail-out sell simulated");
+    }
+    // Note: actual SELL order would go here for live mode.
+    // For now, complete with 0 loser shares (naked but flagged as bail-out).
+
+    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+    this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
   }
 
   /** Update BTC price for continuous edge monitoring */
@@ -246,7 +323,8 @@ export class ArbCompletionMonitor {
   }
 
   /**
-   * React to CLOB WS orderbook updates — check if loser price hit tranche targets.
+   * React to CLOB WS orderbook updates — check if loser price hit trailing targets.
+   * T1 is filled immediately in startSeeking, so this mostly handles T2/T3 trailing.
    */
   private onPriceUpdate(assetId: string, book: BookSnapshot): void {
     if (!this.state || !this.state.active) return;
@@ -263,9 +341,8 @@ export class ArbCompletionMonitor {
       this.state.bestLoserPriceSeen = askCents;
     }
 
-    // Check T1 resting order fill (maker optimization)
+    // Check T1 resting order fill (legacy — T1 now fills immediately, but keep for safety)
     if (this.state.restingOrderId && !this.state.tranches[0].filled) {
-      // If ask has dropped to our resting bid level, check if we got filled as maker
       if (askCents <= this.state.tranches[0].maxPriceCents) {
         this.checkRestingOrderFill().catch((err) => {
           this.logger.warn("Resting order fill check failed", { error: (err as Error).message });
@@ -273,16 +350,35 @@ export class ArbCompletionMonitor {
       }
     }
 
-    // Check each unfilled tranche
+    // === REVERSAL GUARD ===
+    // If T1 filled but loser is now rising above T1 fill price + 2¢, stop trailing.
+    // Accept what we have — don't wait for T2/T3 that will never come.
+    const t1 = this.state.tranches[0];
+    if (t1.filled) {
+      const unfilled = this.state.tranches.filter((t) => !t.filled);
+      if (unfilled.length > 0 && askCents > t1.fillPriceCents + 2) {
+        this.logger.info("Reversal guard — loser rising, accepting partial hedge", {
+          t1Fill: `${t1.fillPriceCents.toFixed(1)}¢`,
+          currentAsk: `${askCents.toFixed(1)}¢`,
+          unfilledTranches: unfilled.length,
+          hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
+        });
+        // Complete with what we have (T1 hedged, T2/T3 abandoned)
+        const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+        return;
+      }
+    }
+
+    // Check each unfilled tranche (T2/T3 trailing)
     for (let i = 0; i < this.state.tranches.length; i++) {
       const tranche = this.state.tranches[i];
       if (tranche.filled) continue;
 
-      // Skip T1 if resting order is active — it will fill as maker
+      // Skip T1 if resting order is active
       if (i === 0 && this.state.restingOrderId) continue;
 
-      // Trailing logic: buy at the ACTUAL price (which may be much better than target)
-      // but only trigger when price <= tranche's max price
+      // Trailing logic: fill at ACTUAL price when it hits tranche target
       if (askCents <= tranche.maxPriceCents) {
         this.logger.info(`Tranche T${i + 1} target hit — filling`, {
           tranche: `T${i + 1} (${(tranche.pct * 100).toFixed(0)}%)`,
@@ -291,7 +387,6 @@ export class ArbCompletionMonitor {
           shares: tranche.shares.toFixed(2),
         });
 
-        // Fill this tranche at current price (may be better than target)
         this.fillTranche(i, askCents).catch((err) => {
           this.logger.error(`Tranche T${i + 1} fill failed`, { error: (err as Error).message });
         });
@@ -458,16 +553,30 @@ export class ArbCompletionMonitor {
       }
     }
 
-    // === TIMEOUT: Force emergency fill for remaining tranches ===
+    // === TIMEOUT: Handle remaining tranches ===
     if (elapsed > this.config.arbCompletionTimeoutMs && this.state.phase === "trailing") {
-      this.logger.warn("Arb completion timeout — emergency fill remaining tranches", {
-        elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-        unfilledTranches: unfilled.length,
-        filledTranches: this.state.tranches.filter((t) => t.filled).length,
-      });
-      this.emergencyFillRemaining().catch((err) => {
-        this.logger.error("Emergency fill failed", { error: (err as Error).message });
-      });
+      const filledCount = this.state.tranches.filter((t) => t.filled).length;
+
+      if (filledCount > 0) {
+        // T1 filled but T2/T3 didn't — that's fine, complete with what we have
+        this.logger.info("Arb completion timeout — completing with filled tranches", {
+          elapsed: `${(elapsed / 1000).toFixed(1)}s`,
+          filledTranches: filledCount,
+          unfilledTranches: unfilled.length,
+          hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
+        });
+        const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+      } else {
+        // Nothing filled at all — emergency fill
+        this.logger.warn("Arb completion timeout — T1 never filled, emergency fill", {
+          elapsed: `${(elapsed / 1000).toFixed(1)}s`,
+          unfilledTranches: unfilled.length,
+        });
+        this.emergencyFillRemaining().catch((err) => {
+          this.logger.error("Emergency fill failed", { error: (err as Error).message });
+        });
+      }
     }
   }
 

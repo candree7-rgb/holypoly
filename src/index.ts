@@ -367,6 +367,19 @@ const main = async () => {
 
         // Check if ArbManager allows new entry
         const balance = await riskManager.getBalance();
+
+        // Check unhedged exposure limit
+        if (arbManager.isOverExposed(balance)) {
+          const state = arbManager.getState();
+          logger.warn("Over-exposed — blocking new trades", {
+            unhedgedShares: state.unhedgedShares.toFixed(1),
+            unhedgedSide: state.unhedgedSide,
+            maxUnhedgedPct: `${config.maxUnhedgedPct}%`,
+          });
+          await sleep(config.scanIntervalMs);
+          continue;
+        }
+
         const arbCheck = arbManager.canEnterNewTrade(balance);
         if (!arbCheck.allowed) {
           logger.debug("Arb manager blocked", { reason: arbCheck.reason });
@@ -497,11 +510,13 @@ const main = async () => {
             windowOrderIds.push(...loserOrderIds);
 
             const state = arbManager.getState();
+            const avgLoserCents = shares > 0 ? (costUsd / shares) * 100 : 0;
+            const totalPairCostCents = shares > 0 ? avgEntry + avgLoserCents : 0;
             logger.info("Arb completion filled", {
               side,
               shares: shares.toFixed(2),
               cost: `$${costUsd.toFixed(2)}`,
-              totalPairCost: `${(avgEntry + costUsd / shares * 100).toFixed(1)}¢`,
+              totalPairCost: shares > 0 ? `${totalPairCostCents.toFixed(1)}¢` : "N/A (no fills)",
               lockedProfit: `$${state.lockedProfit.toFixed(2)}`,
               roundTrips: state.roundTrips,
             });

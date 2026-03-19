@@ -136,11 +136,30 @@ export class EdgeDetector {
 
     // Price bounds check
     const primaryAskCents = edge.bestSide === "Up" ? marketUpCents : marketDownCents;
+    const loserAskCents = edge.bestSide === "Up" ? marketDownCents : marketUpCents;
     if (primaryAskCents < this.config.minEntryPriceCents) {
       return noTrade(`Primary ${edge.bestSide} too cheap (${primaryAskCents}¢ < ${this.config.minEntryPriceCents}¢)`);
     }
     if (primaryAskCents > this.config.maxEntryPriceCents) {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
+    }
+
+    // === PRE-ENTRY SPREAD CHECK ===
+    // Verify arb is completable: winner + loser must leave room for profit
+    // Emergency max = 100 - winner + 1¢ (1¢ loss tolerance)
+    const emergencyMaxLoser = 100 - primaryAskCents + 1;
+    if (loserAskCents > emergencyMaxLoser) {
+      return noTrade(
+        `Spread too wide: ${primaryAskCents}¢ + ${loserAskCents}¢ = ${primaryAskCents + loserAskCents}¢ (>${100 + 1}¢ max)`,
+      );
+    }
+    // Prefer: warn if pair cost > 98¢ (marginal profit)
+    const pairCost = primaryAskCents + loserAskCents;
+    if (pairCost > 100 - this.config.minProfitCents) {
+      this.logger.debug("Tight spread — arb may not complete at target", {
+        pairCost: `${pairCost}¢`,
+        minProfit: `${this.config.minProfitCents}¢`,
+      });
     }
 
     // === ORDERBOOK DEPTH CONFIRMATION ===
