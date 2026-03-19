@@ -144,21 +144,21 @@ export class EdgeDetector {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
     }
 
-    // === PRE-ENTRY SPREAD CHECK ===
-    // Verify arb is completable: winner + loser must leave room for profit
-    // Emergency max = 100 - winner + 1¢ (1¢ loss tolerance)
-    const emergencyMaxLoser = 100 - primaryAskCents + 1;
-    if (loserAskCents > emergencyMaxLoser) {
+    // === PRE-ENTRY SPREAD CHECK (fee-aware) ===
+    // Pair must be profitable AFTER fees (~2¢ total for both legs).
+    // Max pair cost = 100¢ - minProfitCents - 2¢ fees
+    const maxPairCost = 100 - this.config.minProfitCents - 2; // e.g. 100 - 4 - 2 = 94¢
+    const pairCost = primaryAskCents + loserAskCents;
+    if (pairCost > maxPairCost) {
       return noTrade(
-        `Spread too wide: ${primaryAskCents}¢ + ${loserAskCents}¢ = ${primaryAskCents + loserAskCents}¢ (>${100 + 1}¢ max)`,
+        `Spread too tight for profit: ${primaryAskCents}¢ + ${loserAskCents}¢ = ${pairCost}¢ (max ${maxPairCost}¢ after fees)`,
       );
     }
-    // Prefer: warn if pair cost > 98¢ (marginal profit)
-    const pairCost = primaryAskCents + loserAskCents;
-    if (pairCost > 100 - this.config.minProfitCents) {
-      this.logger.debug("Tight spread — arb may not complete at target", {
+    if (pairCost > maxPairCost - 2) {
+      this.logger.debug("Marginal spread — close to fee threshold", {
         pairCost: `${pairCost}¢`,
-        minProfit: `${this.config.minProfitCents}¢`,
+        maxAllowed: `${maxPairCost}¢`,
+        profitAfterFees: `${(100 - pairCost - 2).toFixed(1)}¢`,
       });
     }
 
