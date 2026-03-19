@@ -87,12 +87,11 @@ export class EdgeDetector {
       return noTrade(`Orderbook broken: Up ${marketUpCents}¢ + Down ${marketDownCents}¢ = ${askSum}¢ (>105¢)`);
     }
 
-    // HEDGE PROFITABILITY GATE: Only enter when askSum is low enough for hedge to fill.
-    // Normal market: askSum ≈ 100-102¢ → hedge impossible (pair cost > 100¢).
-    // During dumps/mispricing: askSum drops to 95-98¢ → hedge profitable.
-    // This is THE key filter: no discount = no trade.
+    // askSum sanity: reject clearly broken books.
+    // We DON'T require askSum < 100 at entry — the hedge fills LATER as market corrects.
+    // Strategy: buy winner now → Polymarket corrects → loser drops → buy loser.
     if (askSum > this.config.maxEntryAskSumCents) {
-      return noTrade(`No hedge room: askSum ${askSum}¢ > ${this.config.maxEntryAskSumCents}¢ (need discount)`);
+      return noTrade(`Orderbook overpriced: askSum ${askSum}¢ > ${this.config.maxEntryAskSumCents}¢`);
     }
 
     // Calculate edge with confidence

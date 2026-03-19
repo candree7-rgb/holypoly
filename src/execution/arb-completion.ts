@@ -33,8 +33,10 @@ const PHASE1_MAX_PAIR_CENTS = 98;
 const PHASE2_AFTER_MS = 5000;
 const PHASE2_MAX_PAIR_CENTS = 100;
 
-/** Phase 3: After this many ms, bail out entirely */
-const BAILOUT_AFTER_MS = 15000;
+/** Phase 3: After this many ms, bail out entirely.
+ * 90s gives Polymarket time to correct — the market WILL adjust, it just needs time.
+ * Windows are 5 minutes, so 90s is still conservative. */
+const BAILOUT_AFTER_MS = 90000;
 
 interface HedgeState {
   active: boolean;
@@ -131,7 +133,7 @@ export class ArbCompletionMonitor {
       pairCost: pairCost ? `${pairCost.toFixed(1)}¢` : "N/A",
       profitableAt: `≤${(PHASE1_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
       breakEvenAt: `≤${(PHASE2_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
-      phases: `0-5s: fill<98¢ | 5-15s: fill≤100¢ | 15s+: bail`,
+      phases: `0-5s: fill<98¢ | 5-90s: fill≤100¢ | 90s+: bail`,
     });
 
     // WS-driven: onPriceUpdate fires on every orderbook change (primary path)

@@ -191,7 +191,7 @@ export const loadConfig = (): Config => {
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
-  const maxEntryAskSumCents = parseNumber("MAX_ENTRY_ASK_SUM_CENTS", 98);
+  const maxEntryAskSumCents = parseNumber("MAX_ENTRY_ASK_SUM_CENTS", 103);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Edge detection parameters

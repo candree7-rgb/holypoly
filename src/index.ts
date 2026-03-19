@@ -304,17 +304,18 @@ const main = async () => {
     const now = Date.now();
     if (now < circuitBreakerUntil) return true; // still paused
 
-    // Check if volatility spiked (>2x normal high threshold = flash crash)
+    // Only pause on truly extreme flash crashes (>$500 5-min move)
+    // High volatility ($100-300) is GOOD — it creates the mispricings we profit from.
     const vol = volatilityCalc.getVolatility();
-    if (vol > 160) { // 2x highVolThreshold($80) = extreme
-      const pauseMs = 180000; // 3 minute pause
+    if (vol > 500) {
+      const pauseMs = 60000; // 1 minute pause (shorter — we want back in fast)
       circuitBreakerUntil = now + pauseMs;
-      logger.warn("CIRCUIT BREAKER — extreme volatility, pausing", {
+      logger.warn("CIRCUIT BREAKER — extreme flash crash, brief pause", {
         volatility: `$${vol.toFixed(1)}`,
-        threshold: "$160",
-        pauseMinutes: 3,
+        threshold: "$500",
+        pauseSeconds: 60,
       });
-      telegram.alertCircuitBreaker(`Extreme volatility: $${vol.toFixed(0)}. Pausing 3 min.`);
+      telegram.alertCircuitBreaker(`Flash crash: $${vol.toFixed(0)} vol. Pausing 1 min.`);
       return true;
     }
     return false;
