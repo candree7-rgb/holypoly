@@ -187,12 +187,12 @@ export const loadConfig = (): Config => {
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
   const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
-  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
+  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 55);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Edge detection parameters
-  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
+  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 8);
   const edgeTier2Cents = parseNumber("EDGE_TIER2_CENTS", 8);
   const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
   const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
