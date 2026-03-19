@@ -10,104 +10,57 @@ import type { VolatilityCalculator } from "../signal/volatility.js";
 import type { FairValueEngine } from "../signal/fair-value.js";
 
 /**
- * ArbCompletionMonitor v3: Immediate T1 + Trailing DCA + Edge Stop-Loss
+ * ArbCompletionMonitor v5: SIMPLE & FAST
  *
- * Key improvements over v2:
- * 1. IMMEDIATE T1: Fill 60% at current ask IMMEDIATELY (no waiting for targets)
- *    → Locks profit NOW instead of waiting 15s for unrealistic targets
- * 2. DYNAMIC TARGETS: T2/T3 targets derived from actual T1 fill price, not theory
- * 3. REVERSAL GUARD: If loser rises after T1, stop trailing and accept partial hedge
- *    → Threshold scales with volatility (1-4¢ adaptive)
- * 4. BAIL-OUT: If hedge impossible (loser too expensive), sell winner back via FOK
- *    → Better than holding naked position to settlement
- * 5. RACE GUARD: t1FillInFlight flag prevents double-fill from concurrent paths
- * 6. FEE AWARENESS: All P&L calculations account for 2% taker fee
- * 7. TIMEOUT FIX: Emergency fills ALL remaining tranches on timeout (no 40% naked gap)
+ * Strategy:
+ * 1. Winner bought → IMMEDIATELY try to fill loser at ANY profitable price
+ * 2. Poll every 100ms — buy 100% of loser as soon as pair cost < breakeven
+ * 3. After 5s → bail out (sell winner back)
+ *
+ * NO tranches. NO trailing. NO DCA. Just fill or bail.
  */
 
 export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[]) => void;
 
-interface TrancheState {
-  /** Share of total to buy (0-1) */
-  pct: number;
-  /** Shares to buy in this tranche */
-  shares: number;
-  /** Max price (cents) for this tranche */
-  maxPriceCents: number;
-  /** Actually filled? */
-  filled: boolean;
-  /** Price we actually got */
-  fillPriceCents: number;
-  /** Order IDs for this tranche */
-  orderIds: string[];
-}
+/** Polymarket taker fee (~2%) */
+const TAKER_FEE_PCT = 0.02;
 
-interface MonitorState {
+/** How often to check loser price (ms) */
+const POLL_INTERVAL_MS = 100;
+
+/** Phase 1: Fill if profitable (pair < 98¢ after fees) */
+const PHASE1_MAX_PAIR_CENTS = 98;
+
+/** Phase 2: After this many ms, accept break-even (pair ≤ 100¢) */
+const PHASE2_AFTER_MS = 3000;
+const PHASE2_MAX_PAIR_CENTS = 100;
+
+/** Phase 3: After this many ms, bail out entirely */
+const BAILOUT_AFTER_MS = 5000;
+
+interface HedgeState {
   active: boolean;
   winnerSide: TradeSide;
   winnerAvgPriceCents: number;
   winnerShares: number;
   winnerTokenId: string;
   loserTokenId: string;
-  /** Initial target (100 - winner - minProfit) */
-  baseTargetPriceCents: number;
-  /** Emergency max price (100 - winner + 1¢ loss max) */
-  emergencyPriceCents: number;
-  /** Best loser price seen so far (for trailing) */
-  bestLoserPriceSeen: number;
   startedAt: number;
-  phase: "trailing" | "emergency" | "done";
-  /** DCA tranches */
-  tranches: TrancheState[];
-  /** Total shares filled across all tranches */
+  filled: boolean;
+  fillInFlight: boolean;
   totalSharesFilled: number;
-  /** Total cost across all tranches */
   totalCostUsd: number;
-  /** All order IDs across tranches */
   allOrderIds: string[];
-  /** Resting maker order ID for T1 (cancelled on emergency) */
-  restingOrderId: string | null;
-  /** Guard: T1 fill is in-flight (prevents double-fill from WS + immediate) */
-  t1FillInFlight: boolean;
-  /** Last edge check timestamp */
-  lastEdgeCheckAt: number;
-  /** Current BTC price for edge monitoring */
+  /** BTC price for edge monitoring */
   currentBtcPrice: number;
-  /** Window opening price for edge recalc */
   openingPrice: number;
-  /** Time remaining in window */
   timeRemainingSeconds: number;
 }
 
-/**
- * DCA tranche configuration v3 (dynamic):
- * Tranche 1 (60%): Fills IMMEDIATELY at current loser ask → lock profit NOW
- * Tranche 2 (25%): Trails — only fills if loser drops 3¢+ below T1 fill
- * Tranche 3 (15%): Trails deeper — fills if loser drops 6¢+ below T1 fill
- *
- * Key change: T1 is no longer a limit order waiting for a target price.
- * It fills at market immediately after winner entry. T2/T3 are bonus.
- * If loser rises instead of dropping, we accept T1-only and move on.
- */
-const TRANCHE_CONFIG = [
-  { pct: 0.60, bonusCents: 0 },   // T1: IMMEDIATE at current ask
-  { pct: 0.25, bonusCents: 3 },   // T2: only if 3¢ better than T1
-  { pct: 0.15, bonusCents: 6 },   // T3: only if 6¢ better than T1
-];
-
-/** Polymarket taker fee (2%) — must be accounted for in all P&L calculations */
-const TAKER_FEE_PCT = 0.02;
-
-/** Edge stop-loss: if edge shrinks below this, emergency close */
-const EDGE_STOP_LOSS_CENTS = 2;
-
-/** How often to recheck edge (ms) */
-const EDGE_RECHECK_INTERVAL_MS = 500;
-
 export class ArbCompletionMonitor {
-  private state: MonitorState | null = null;
+  private state: HedgeState | null = null;
   private onCompleteCallback: ArbCompletionCallback | null = null;
-  private checkTimer: ReturnType<typeof setInterval> | null = null;
+  private pollTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     private clobWs: ClobWsClient,
@@ -119,15 +72,15 @@ export class ArbCompletionMonitor {
     private volatilityCalc?: VolatilityCalculator,
     private fairValueEngine?: FairValueEngine,
   ) {
+    // Also react to WS price updates for faster detection
     this.clobWs.onUpdate(this.onPriceUpdate.bind(this));
   }
 
   /**
-   * Start monitoring for arb completion with dynamic DCA.
-   *
-   * v3 strategy: T1 fills IMMEDIATELY at current loser ask (lock profit now).
-   * T2/T3 only trail for bonus if loser continues dropping.
-   * If loser rises, we accept partial hedge and move on.
+   * Start seeking loser side. Simple 3-phase approach:
+   * Phase 1 (0-3s): Fill if pair cost < 98¢ (profitable after fees)
+   * Phase 2 (3-5s): Fill if pair cost ≤ 100¢ (break-even OK)
+   * Phase 3 (5s+):  Bail out — sell winner back
    */
   startSeeking(params: {
     winnerSide: TradeSide;
@@ -140,30 +93,12 @@ export class ArbCompletionMonitor {
     timeRemainingSeconds: number;
     onComplete: ArbCompletionCallback;
   }): void {
-    // Emergency max: 100¢ - winner price - 2¢ fees. Allows 0¢ profit at worst.
-    // Old formula (+1¢) guaranteed loss after fees.
-    const emergencyPrice = 100 - params.winnerAvgPriceCents - 2; // break-even after ~2% fees
+    const loserSide: TradeSide = params.winnerSide === "Up" ? "Down" : "Up";
 
-    // Get current loser ask for reference (may still be expensive — market hasn't adjusted yet)
+    // Get current loser ask for initial log
     const book = this.clobWs.getBook(params.loserTokenId);
     const currentLoserAsk = book?.bestAsk ? book.bestAsk * 100 : null;
-
-    // T1 target = PROFITABLE price (wait for market to adjust, don't fill at current expensive ask)
-    // We bought winner at X¢. For profit we need loser ≤ (100 - X - minProfit)¢
-    const t1Target = 100 - params.winnerAvgPriceCents - this.config.minProfitCents;
-
-    // If current loser ask is already at or below our target, we can fill immediately
-    const canFillNow = currentLoserAsk !== null && currentLoserAsk <= t1Target;
-
-    // Build DCA tranches — T1 at profitable target, T2/T3 trail below T1
-    const tranches: TrancheState[] = TRANCHE_CONFIG.map((tc) => ({
-      pct: tc.pct,
-      shares: params.winnerShares * tc.pct,
-      maxPriceCents: Math.max(t1Target - tc.bonusCents, 5),
-      filled: false,
-      fillPriceCents: 0,
-      orderIds: [],
-    }));
+    const pairCost = currentLoserAsk ? params.winnerAvgPriceCents + currentLoserAsk : null;
 
     this.state = {
       active: true,
@@ -172,18 +107,12 @@ export class ArbCompletionMonitor {
       winnerShares: params.winnerShares,
       winnerTokenId: params.winnerTokenId,
       loserTokenId: params.loserTokenId,
-      baseTargetPriceCents: t1Target,
-      emergencyPriceCents: emergencyPrice,
-      bestLoserPriceSeen: currentLoserAsk ?? 999,
       startedAt: Date.now(),
-      phase: "trailing",
-      tranches,
+      filled: false,
+      fillInFlight: false,
       totalSharesFilled: 0,
       totalCostUsd: 0,
       allOrderIds: [],
-      restingOrderId: null,
-      t1FillInFlight: false,
-      lastEdgeCheckAt: Date.now(),
       currentBtcPrice: params.currentBtcPrice,
       openingPrice: params.window.openingPrice,
       timeRemainingSeconds: params.timeRemainingSeconds,
@@ -191,169 +120,24 @@ export class ArbCompletionMonitor {
 
     this.onCompleteCallback = params.onComplete;
 
-    const loserSide: TradeSide = params.winnerSide === "Up" ? "Down" : "Up";
-    this.logger.info("Arb completion v4 started (wait for market adjustment + DCA)", {
+    this.logger.info("Arb completion v5 — seeking loser (SIMPLE MODE)", {
       seeking: loserSide,
+      winnerPrice: `${params.winnerAvgPriceCents.toFixed(1)}¢`,
       currentLoserAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
-      canFillNow,
-      t1Target: `≤${t1Target.toFixed(1)}¢`,
-      pairCostIfNow: currentLoserAsk ? `${(params.winnerAvgPriceCents + currentLoserAsk).toFixed(1)}¢` : "N/A",
-      tranches: tranches.map((t, i) => `T${i + 1}: ${(t.pct * 100).toFixed(0)}% @ ≤${t.maxPriceCents.toFixed(1)}¢`),
-      emergencyPrice: `≤${emergencyPrice.toFixed(1)}¢`,
-      shares: params.winnerShares.toFixed(2),
-      timeout: `${this.config.arbCompletionTimeoutMs}ms`,
+      pairCost: pairCost ? `${pairCost.toFixed(1)}¢` : "N/A",
+      profitableAt: `≤${(PHASE1_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
+      breakEvenAt: `≤${(PHASE2_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
+      phases: `0-3s: fill<98¢ | 3-5s: fill≤100¢ | 5s+: bail`,
     });
 
-    this.checkTimer = setInterval(() => this.periodicCheck(), 500);
+    // Start aggressive polling
+    this.pollTimer = setInterval(() => this.checkAndFill(), POLL_INTERVAL_MS);
 
-    // Only fill T1 immediately if loser is ALREADY at profitable price
-    // Otherwise, wait for market to adjust (reactive via onPriceUpdate)
-    if (canFillNow) {
-      this.fillT1Immediately(currentLoserAsk).catch((err) => {
-        this.logger.warn("Immediate T1 fill failed, falling back to reactive", {
-          error: (err as Error).message,
-        });
-      });
-    } else {
-      this.logger.info("Loser too expensive now — waiting for market to adjust", {
-        currentAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
-        targetPrice: `≤${t1Target.toFixed(1)}¢`,
-        expectedDrop: currentLoserAsk ? `${(currentLoserAsk - t1Target).toFixed(1)}¢` : "N/A",
-      });
-    }
+    // Also try immediately
+    this.checkAndFill();
   }
 
-  /**
-   * Fill T1 (60%) IMMEDIATELY at current loser ask.
-   * This is the key v3 change — don't wait for a target, lock profit now.
-   */
-  private async fillT1Immediately(currentAskCents: number | null): Promise<void> {
-    if (!this.state) return;
-
-    const t1 = this.state.tranches[0];
-    if (t1.filled || this.state.t1FillInFlight) return;
-
-    // Set guard BEFORE async work to prevent race with onPriceUpdate
-    this.state.t1FillInFlight = true;
-
-    // Get fresh ask if not provided
-    let askCents = currentAskCents;
-    if (!askCents) {
-      const book = this.clobWs.getBook(this.state.loserTokenId);
-      askCents = book?.bestAsk ? book.bestAsk * 100 : null;
-    }
-    if (!askCents) {
-      const ob = await this.clob.getOrderbook(this.state.loserTokenId);
-      askCents = ob.bestAsk ? ob.bestAsk * 100 : null;
-    }
-
-    if (!askCents) {
-      this.logger.warn("T1 immediate fill: no loser ask available, waiting for WS update");
-      return;
-    }
-
-    // Check if filling at this price is acceptable (within emergency limit)
-    if (askCents > this.state.emergencyPriceCents) {
-      // Don't bail out — market hasn't adjusted yet. Wait for price to drop.
-      this.logger.info("T1: loser still too expensive, waiting for market adjustment", {
-        loserAsk: `${askCents.toFixed(1)}¢`,
-        maxAcceptable: `${this.state.emergencyPriceCents.toFixed(1)}¢`,
-        pairCost: `${(this.state.winnerAvgPriceCents + askCents).toFixed(1)}¢`,
-      });
-      this.state.t1FillInFlight = false; // release guard so onPriceUpdate can catch it
-      return;
-    }
-
-    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-
-    // Fill T1 immediately
-    this.logger.info("T1 IMMEDIATE FILL at market", {
-      side: loserSide,
-      price: `${askCents.toFixed(1)}¢`,
-      shares: t1.shares.toFixed(2),
-      pairCost: `${(this.state.winnerAvgPriceCents + askCents).toFixed(1)}¢`,
-      pnlPerPair: `${(100 - this.state.winnerAvgPriceCents - askCents).toFixed(1)}¢`,
-    });
-
-    await this.fillTranche(0, askCents);
-
-    // After T1 fills, update T2/T3 targets relative to actual T1 fill price
-    if (t1.filled && this.state) {
-      for (let i = 1; i < this.state.tranches.length; i++) {
-        const bonus = TRANCHE_CONFIG[i].bonusCents;
-        this.state.tranches[i].maxPriceCents = Math.max(t1.fillPriceCents - bonus, 5);
-      }
-      this.logger.debug("Updated trailing targets after T1 fill", {
-        t2Target: `≤${this.state.tranches[1]?.maxPriceCents.toFixed(1)}¢`,
-        t3Target: `≤${this.state.tranches[2]?.maxPriceCents.toFixed(1)}¢`,
-      });
-    }
-  }
-
-  /**
-   * Bail-out: sell winner shares back when hedge is impossible.
-   * Better to take a small FOK spread loss than hold a naked position.
-   */
-  private async bailOut(): Promise<void> {
-    if (!this.state) return;
-
-    const winnerSide = this.state.winnerSide;
-    const winnerShares = this.state.winnerShares;
-    const winnerCostUsd = this.state.winnerShares * this.state.winnerAvgPriceCents / 100;
-
-    this.logger.warn("BAIL-OUT: Selling winner shares back", {
-      side: winnerSide,
-      shares: winnerShares.toFixed(2),
-      reason: "Loser side too expensive, arb not completable",
-    });
-
-    this.telegram.alertError(
-      `Bail-out: Selling ${winnerSide} ${winnerShares.toFixed(1)} shares. Loser too expensive for arb.`,
-    );
-
-    if (this.config.dryRun) {
-      this.logger.info("DRY_RUN — bail-out sell simulated");
-    } else {
-      // Actually sell the winner shares back via FOK
-      try {
-        const book = this.clobWs.getBook(this.state.winnerTokenId);
-        const bestBid = book?.bestBid;
-        if (bestBid && bestBid > 0) {
-          const result = await this.clob.placeBatchOrders([{
-            tokenId: this.state.winnerTokenId,
-            side: Side.SELL,
-            price: bestBid,
-            size: winnerShares,
-          }]);
-          if (result.placed > 0) {
-            this.logger.info("Bail-out sell order placed", {
-              price: `${(bestBid * 100).toFixed(1)}¢`,
-              shares: winnerShares.toFixed(2),
-            });
-          } else {
-            this.logger.error("Bail-out sell order rejected — holding naked");
-          }
-        } else {
-          this.logger.error("Bail-out: no bid for winner side — holding naked");
-        }
-      } catch (err) {
-        this.logger.error("Bail-out sell failed", { error: (err as Error).message });
-      }
-    }
-
-    // CRITICAL: Reverse the winner shares from ArbManager so settlement doesn't
-    // count them as a naked position. The shares have been sold back (or simulated).
-    this.arbManager.recordFill(winnerSide, -winnerShares, -winnerCostUsd);
-    this.logger.info("Bail-out: reversed winner position in ArbManager", {
-      side: winnerSide,
-      reversedShares: winnerShares.toFixed(2),
-    });
-
-    const loserSide: TradeSide = winnerSide === "Up" ? "Down" : "Up";
-    this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
-  }
-
-  /** Update BTC price for continuous edge monitoring */
+  /** Update BTC price for monitoring */
   updateBtcPrice(price: number, timeRemaining: number): void {
     if (this.state) {
       this.state.currentBtcPrice = price;
@@ -364,9 +148,9 @@ export class ArbCompletionMonitor {
   reset(): void {
     this.state = null;
     this.onCompleteCallback = null;
-    if (this.checkTimer) {
-      clearInterval(this.checkTimer);
-      this.checkTimer = null;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
   }
 
@@ -375,423 +159,233 @@ export class ArbCompletionMonitor {
   }
 
   get phase(): string {
-    return this.state?.phase ?? "idle";
+    if (!this.state) return "idle";
+    if (this.state.filled) return "done";
+    const elapsed = Date.now() - this.state.startedAt;
+    if (elapsed < PHASE2_AFTER_MS) return "profitable";
+    if (elapsed < BAILOUT_AFTER_MS) return "breakeven";
+    return "bailout";
   }
 
   get tranchesStatus(): string {
     if (!this.state) return "idle";
-    const filled = this.state.tranches.filter((t) => t.filled).length;
-    return `${filled}/${this.state.tranches.length}`;
+    return this.state.filled ? "1/1" : "0/1";
   }
 
   /**
-   * React to CLOB WS orderbook updates — check if loser price hit trailing targets.
-   * T1 is filled immediately in startSeeking, so this mostly handles T2/T3 trailing.
+   * React to WS orderbook updates — try to fill on every update.
    */
-  private onPriceUpdate(assetId: string, book: BookSnapshot): void {
+  private onPriceUpdate(assetId: string, _book: BookSnapshot): void {
     if (!this.state || !this.state.active) return;
     if (assetId !== this.state.loserTokenId) return;
-    if (this.state.phase !== "trailing") return;
+    this.checkAndFill();
+  }
 
-    const bestAsk = book.bestAsk;
-    if (bestAsk === null) return;
+  /**
+   * Core logic: check if we can fill the loser side now.
+   * Called every 100ms AND on every WS update.
+   */
+  private checkAndFill(): void {
+    if (!this.state || !this.state.active || this.state.filled || this.state.fillInFlight) return;
 
-    const askCents = bestAsk * 100;
+    const elapsed = Date.now() - this.state.startedAt;
 
-    // Track best (lowest) loser price seen — for trailing logic
-    if (askCents < this.state.bestLoserPriceSeen) {
-      this.state.bestLoserPriceSeen = askCents;
+    // Phase 3: bail out
+    if (elapsed >= BAILOUT_AFTER_MS) {
+      this.state.fillInFlight = true; // prevent re-entry
+      this.doBailOut().catch((err) => {
+        this.logger.error("Bail-out failed", { error: (err as Error).message });
+      });
+      return;
     }
 
-    // Check T1 resting order fill (legacy — T1 now fills immediately, but keep for safety)
-    if (this.state.restingOrderId && !this.state.tranches[0].filled) {
-      if (askCents <= this.state.tranches[0].maxPriceCents) {
-        this.checkRestingOrderFill().catch((err) => {
-          this.logger.warn("Resting order fill check failed", { error: (err as Error).message });
+    // Get current loser ask
+    const book = this.clobWs.getBook(this.state.loserTokenId);
+    const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
+    if (!askCents) return; // no price yet, wait for next tick
+
+    const pairCost = this.state.winnerAvgPriceCents + askCents;
+    const feeCents = pairCost * TAKER_FEE_PCT;
+
+    // Phase 1: profitable fill (pair + fees < 98¢)
+    if (elapsed < PHASE2_AFTER_MS) {
+      if (pairCost + feeCents <= PHASE1_MAX_PAIR_CENTS) {
+        this.state.fillInFlight = true;
+        this.fillLoser(askCents, "profitable").catch((err) => {
+          this.logger.error("Profitable fill failed", { error: (err as Error).message });
+          if (this.state) this.state.fillInFlight = false;
         });
       }
+      return;
     }
 
-    // === REVERSAL GUARD (volatility-adaptive) ===
-    // If T1 filled but loser is rising, stop trailing and accept what we have.
-    // Threshold scales with volatility: tighter in calm markets, wider in volatile ones.
-    const t1 = this.state.tranches[0];
-    if (t1.filled) {
-      const unfilled = this.state.tranches.filter((t) => !t.filled);
-      const reversalThreshold = this.volatilityCalc
-        ? Math.max(1, Math.min(4, 1 + this.volatilityCalc.getVolatility() * 0.02))
-        : 2;
-      if (unfilled.length > 0 && askCents > t1.fillPriceCents + reversalThreshold) {
-        this.logger.info("Reversal guard — loser rising, accepting partial hedge", {
-          t1Fill: `${t1.fillPriceCents.toFixed(1)}¢`,
-          currentAsk: `${askCents.toFixed(1)}¢`,
-          unfilledTranches: unfilled.length,
-          hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
-        });
-        // Complete with what we have (T1 hedged, T2/T3 abandoned)
-        const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+    // Phase 2: break-even fill (pair + fees ≤ 100¢)
+    if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
+      this.state.fillInFlight = true;
+      this.fillLoser(askCents, "breakeven").catch((err) => {
+        this.logger.error("Break-even fill failed", { error: (err as Error).message });
+        if (this.state) this.state.fillInFlight = false;
+      });
+    }
+    // If still too expensive in phase 2, wait — phase 3 (bail) will trigger on next tick
+  }
+
+  /**
+   * Fill 100% of loser shares at the given price.
+   */
+  private async fillLoser(askCents: number, reason: string): Promise<void> {
+    if (!this.state) return;
+
+    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+    const pairCost = this.state.winnerAvgPriceCents + askCents;
+    const profitCents = 100 - pairCost - (pairCost * TAKER_FEE_PCT);
+    const priceDecimal = askCents / 100;
+    const shares = this.state.winnerShares;
+    const costUsd = shares * priceDecimal;
+
+    this.logger.info(`HEDGE FILL (${reason}) — buying 100% loser`, {
+      side: loserSide,
+      price: `${askCents.toFixed(1)}¢`,
+      shares: shares.toFixed(2),
+      pairCost: `${pairCost.toFixed(1)}¢`,
+      profit: `${profitCents >= 0 ? "+" : ""}${profitCents.toFixed(1)}¢/pair`,
+      elapsed: `${((Date.now() - this.state.startedAt) / 1000).toFixed(1)}s`,
+    });
+
+    if (this.config.dryRun) {
+      this.logger.info("DRY_RUN — hedge fill simulated", { side: loserSide, price: `${askCents.toFixed(1)}¢` });
+      this.state.filled = true;
+      this.state.totalSharesFilled = shares;
+      this.state.totalCostUsd = costUsd;
+      this.complete(loserSide, shares, costUsd, []);
+      return;
+    }
+
+    // Cross-check with REST API to avoid stale WS data
+    const freshBook = await this.clob.getOrderbook(this.state.loserTokenId);
+    const freshAskCents = freshBook.bestAsk ? freshBook.bestAsk * 100 : null;
+
+    if (freshAskCents && Math.abs(freshAskCents - askCents) > 5) {
+      this.logger.warn("WS/REST price mismatch — using REST price", {
+        wsAsk: `${askCents.toFixed(1)}¢`,
+        restAsk: `${freshAskCents.toFixed(1)}¢`,
+        diff: `${Math.abs(freshAskCents - askCents).toFixed(1)}¢`,
+      });
+      // Re-check with fresh price
+      const freshPairCost = this.state.winnerAvgPriceCents + freshAskCents;
+      const maxPair = (Date.now() - this.state.startedAt) >= PHASE2_AFTER_MS
+        ? PHASE2_MAX_PAIR_CENTS
+        : PHASE1_MAX_PAIR_CENTS;
+      if (freshPairCost + freshPairCost * TAKER_FEE_PCT > maxPair) {
+        this.logger.info("Fresh price too expensive — aborting fill, will retry");
+        this.state.fillInFlight = false;
         return;
       }
     }
 
-    // Check each unfilled tranche (T2/T3 trailing)
-    for (let i = 0; i < this.state.tranches.length; i++) {
-      const tranche = this.state.tranches[i];
-      if (tranche.filled) continue;
-
-      // Skip T1 if fill is already in-flight or resting order active (prevent double-fill)
-      if (i === 0 && (this.state.t1FillInFlight || this.state.restingOrderId)) continue;
-
-      // Trailing logic: fill at ACTUAL price when it hits tranche target
-      if (askCents <= tranche.maxPriceCents) {
-        this.logger.info(`Tranche T${i + 1} target hit — filling`, {
-          tranche: `T${i + 1} (${(tranche.pct * 100).toFixed(0)}%)`,
-          loserAsk: `${askCents.toFixed(1)}¢`,
-          target: `≤${tranche.maxPriceCents.toFixed(1)}¢`,
-          shares: tranche.shares.toFixed(2),
-        });
-
-        this.fillTranche(i, askCents).catch((err) => {
-          this.logger.error(`Tranche T${i + 1} fill failed`, { error: (err as Error).message });
-        });
-        break; // one tranche at a time to avoid race conditions
-      }
-    }
-  }
-
-  /**
-   * Check if the resting maker bid for T1 has been filled.
-   */
-  private async checkRestingOrderFill(): Promise<void> {
-    if (!this.state || !this.state.restingOrderId) return;
-
-    const filledShares = await this.clob.getFilledShares(this.state.restingOrderId);
-    if (filledShares > 0) {
-      const t1 = this.state.tranches[0];
-      const fillPrice = t1.maxPriceCents; // filled at our resting price (maker!)
-      const costUsd = filledShares * (fillPrice / 100);
-
-      t1.filled = true;
-      t1.fillPriceCents = fillPrice;
-      t1.orderIds = [this.state.restingOrderId];
-      this.state.totalSharesFilled += filledShares;
-      this.state.totalCostUsd += costUsd;
-      this.state.allOrderIds.push(this.state.restingOrderId);
-      this.state.restingOrderId = null;
-
-      const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-      this.logger.info("T1 resting maker bid FILLED", {
-        side: loserSide,
-        price: `${fillPrice.toFixed(1)}¢ (maker)`,
-        shares: filledShares.toFixed(2),
-      });
-
-      this.checkAllTranchesDone(loserSide);
-    }
-  }
-
-  /**
-   * Cancel the resting T1 order (used before emergency fills).
-   */
-  private async cancelRestingOrder(): Promise<void> {
-    if (this.state?.restingOrderId) {
-      await this.clob.cancelOrder(this.state.restingOrderId);
-      this.state.restingOrderId = null;
-    }
-  }
-
-  /**
-   * Fill a specific DCA tranche.
-   */
-  private async fillTranche(trancheIdx: number, priceCents: number): Promise<void> {
-    if (!this.state || this.state.phase !== "trailing") return;
-
-    const tranche = this.state.tranches[trancheIdx];
-    if (tranche.filled) return;
-
-    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-    const priceDecimal = priceCents / 100;
-    const costUsd = tranche.shares * priceDecimal;
-
-    if (this.config.dryRun) {
-      this.logger.info(`DRY_RUN — tranche T${trancheIdx + 1} simulated`, {
-        side: loserSide,
-        price: `${priceCents.toFixed(1)}¢`,
-        shares: tranche.shares.toFixed(2),
-        cost: `$${costUsd.toFixed(2)}`,
-      });
-      tranche.filled = true;
-      tranche.fillPriceCents = priceCents;
-      this.state.totalSharesFilled += tranche.shares;
-      this.state.totalCostUsd += costUsd;
-      this.checkAllTranchesDone(loserSide);
-      return;
-    }
+    const fillPrice = freshAskCents ?? askCents;
+    const fillPriceDecimal = fillPrice / 100;
+    const fillCostUsd = shares * fillPriceDecimal;
 
     const result = await this.clob.placeBatchOrders([{
       tokenId: this.state.loserTokenId,
       side: Side.BUY,
-      price: priceDecimal,
-      size: tranche.shares,
+      price: fillPriceDecimal,
+      size: shares,
     }]);
 
     if (result.placed > 0) {
-      tranche.filled = true;
-      tranche.fillPriceCents = priceCents;
-      tranche.orderIds = result.orderIds;
-      this.state.totalSharesFilled += tranche.shares;
-      this.state.totalCostUsd += costUsd;
-      this.state.allOrderIds.push(...result.orderIds);
-
-      const avgLoser = this.state.totalCostUsd / this.state.totalSharesFilled * 100;
-      const pnlPerPair = 100 - this.state.winnerAvgPriceCents - avgLoser;
-
-      this.logger.info(`Tranche T${trancheIdx + 1} filled`, {
-        side: loserSide,
-        price: `${priceCents.toFixed(1)}¢`,
-        shares: tranche.shares.toFixed(2),
-        avgLoserPrice: `${avgLoser.toFixed(1)}¢`,
-        runningPnl: `${pnlPerPair >= 0 ? "+" : ""}${pnlPerPair.toFixed(1)}¢/pair`,
-        filledTranches: `${this.state.tranches.filter((t) => t.filled).length}/${this.state.tranches.length}`,
-      });
-
-      this.checkAllTranchesDone(loserSide);
+      this.state.filled = true;
+      this.state.totalSharesFilled = shares;
+      this.state.totalCostUsd = fillCostUsd;
+      this.state.allOrderIds = result.orderIds;
+      this.complete(loserSide, shares, fillCostUsd, result.orderIds);
     } else {
-      this.logger.warn(`Tranche T${trancheIdx + 1} order failed`);
+      this.logger.warn("Hedge order rejected — will retry on next tick");
+      this.state.fillInFlight = false;
     }
   }
 
   /**
-   * Check if all tranches are filled → signal completion.
+   * Bail-out: sell winner shares back. Better a small spread loss than naked.
    */
-  private checkAllTranchesDone(loserSide: TradeSide): void {
+  private async doBailOut(): Promise<void> {
     if (!this.state) return;
 
-    const allFilled = this.state.tranches.every((t) => t.filled);
-    if (allFilled) {
-      this.logger.info("All DCA tranches filled — arb complete", {
-        totalShares: this.state.totalSharesFilled.toFixed(2),
-        totalCost: `$${this.state.totalCostUsd.toFixed(2)}`,
-        avgLoserPrice: `${(this.state.totalCostUsd / this.state.totalSharesFilled * 100).toFixed(1)}¢`,
-      });
-      this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
-    }
-  }
+    const winnerSide = this.state.winnerSide;
+    const loserSide: TradeSide = winnerSide === "Up" ? "Down" : "Up";
+    const winnerShares = this.state.winnerShares;
+    const winnerCostUsd = winnerShares * this.state.winnerAvgPriceCents / 100;
 
-  /**
-   * Periodic check for timeouts, edge stop-loss, and emergency conditions.
-   */
-  private periodicCheck(): void {
-    if (!this.state || !this.state.active) return;
-
-    const elapsed = Date.now() - this.state.startedAt;
-    const unfilled = this.state.tranches.filter((t) => !t.filled);
-
-    if (unfilled.length === 0) return; // all done
-
-    // === EDGE STOP-LOSS: Monitor if our edge is evaporating ===
-    if (this.fairValueEngine && Date.now() - this.state.lastEdgeCheckAt > EDGE_RECHECK_INTERVAL_MS) {
-      this.state.lastEdgeCheckAt = Date.now();
-      this.checkEdgeStopLoss(elapsed);
-    }
-
-    // === MOMENTUM REVERSAL CHECK ===
-    // Only trigger emergency if BTC is reversing hard AND T1 is already filled.
-    // If T1 isn't filled yet, a reversal actually helps us (loser gets cheaper).
-    const t1Filled = this.state.tranches[0]?.filled ?? false;
-    if (t1Filled && this.volatilityCalc && this.state.phase === "trailing") {
-      const momentum = this.volatilityCalc.getRecentMomentum(5);
-      if (momentum !== null) {
-        const adverse =
-          (this.state.winnerSide === "Up" && momentum < -40) ||
-          (this.state.winnerSide === "Down" && momentum > 40);
-
-        if (adverse && elapsed > 5000) {
-          this.logger.warn("BTC reversing hard — emergency fill remaining tranches", {
-            momentum: `$${momentum.toFixed(0)}`,
-            elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-            unfilledTranches: unfilled.length,
-          });
-          this.emergencyFillRemaining().catch((err) => {
-            this.logger.error("Emergency fill failed", { error: (err as Error).message });
-          });
-          return;
-        }
-      }
-    }
-
-    // === TIMEOUT: Emergency fill ALL remaining tranches ===
-    if (elapsed > this.config.arbCompletionTimeoutMs && this.state.phase === "trailing") {
-      const filledCount = this.state.tranches.filter((t) => t.filled).length;
-      this.logger.warn("Arb completion timeout — emergency fill remaining", {
-        elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-        filledTranches: filledCount,
-        unfilledTranches: unfilled.length,
-        hedgedPct: `${((this.state.totalSharesFilled / this.state.winnerShares) * 100).toFixed(0)}%`,
-      });
-      // Always emergency fill remaining — don't leave 40% unhedged
-      this.emergencyFillRemaining().catch((err) => {
-        this.logger.error("Emergency fill failed", { error: (err as Error).message });
-      });
-    }
-  }
-
-  /**
-   * EDGE STOP-LOSS: If our edge has shrunk below threshold, emergency close.
-   * This is the key improvement — don't wait for full reversal.
-   */
-  private checkEdgeStopLoss(elapsed: number): void {
-    if (!this.state || !this.fairValueEngine) return;
-
-    const edge = this.fairValueEngine.calculateEdge(
-      this.state.currentBtcPrice,
-      this.state.openingPrice,
-      this.state.timeRemainingSeconds,
-      // We need market prices — use the winner price as reference
-      this.state.winnerSide === "Up" ? this.state.winnerAvgPriceCents : 100 - this.state.winnerAvgPriceCents,
-      this.state.winnerSide === "Up" ? 100 - this.state.winnerAvgPriceCents : this.state.winnerAvgPriceCents,
-    );
-
-    // The edge for our side specifically
-    const ourEdge = this.state.winnerSide === "Up" ? edge.upEdge : edge.downEdge;
-    const t1Filled = this.state.tranches[0]?.filled ?? false;
-
-    // Only trigger edge stop-loss if T1 is already filled.
-    // Before T1, the market is still adjusting — edge changes are expected.
-    if (t1Filled && ourEdge < EDGE_STOP_LOSS_CENTS && elapsed > 5000) {
-      const unfilled = this.state.tranches.filter((t) => !t.filled);
-      if (unfilled.length > 0) {
-        this.logger.warn("EDGE STOP-LOSS triggered — edge evaporated after T1", {
-          ourEdge: `${ourEdge.toFixed(1)}¢`,
-          stopLoss: `${EDGE_STOP_LOSS_CENTS}¢`,
-          elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-          unfilledTranches: unfilled.length,
-        });
-        this.emergencyFillRemaining().catch((err) => {
-          this.logger.error("Edge stop-loss emergency failed", { error: (err as Error).message });
-        });
-      }
-    }
-  }
-
-  /**
-   * Emergency fill all remaining unfilled tranches at best available price.
-   * Merges remaining shares into a single order for efficiency.
-   */
-  private async emergencyFillRemaining(): Promise<void> {
-    if (!this.state || this.state.phase === "done") return;
-    this.state.phase = "emergency";
-
-    // Cancel any resting maker order before emergency fill
-    await this.cancelRestingOrder();
-
-    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-    const unfilled = this.state.tranches.filter((t) => !t.filled);
-    const remainingShares = unfilled.reduce((sum, t) => sum + t.shares, 0);
-
-    if (remainingShares <= 0) {
-      this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
-      return;
-    }
-
-    // Get current best ask for loser
+    // Before bailing, one last check — maybe loser dropped
     const book = this.clobWs.getBook(this.state.loserTokenId);
-    let askCents: number | null = book?.bestAsk ? book.bestAsk * 100 : null;
-
-    if (!askCents) {
-      const ob = await this.clob.getOrderbook(this.state.loserTokenId);
-      askCents = ob.bestAsk ? ob.bestAsk * 100 : null;
-    }
-
-    if (!askCents) {
-      this.logger.error("No loser price — bailing out of winner position", {
-        filledShares: this.state.totalSharesFilled.toFixed(2),
-        unhedgedShares: remainingShares.toFixed(2),
-      });
-      this.telegram.alertError(`Emergency fill failed: no ${loserSide} price. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked. Bailing out.`);
-      await this.bailOut();
-      return;
-    }
-
-    const totalCost = this.state.winnerAvgPriceCents + askCents;
-    const feeCostCents = (this.state.winnerAvgPriceCents + askCents) * TAKER_FEE_PCT;
-    const pnlPerPair = 100 - totalCost - feeCostCents;
-
-    this.logger.info("EMERGENCY FILL remaining tranches", {
-      side: loserSide,
-      price: `${askCents.toFixed(1)}¢`,
-      shares: remainingShares.toFixed(2),
-      totalCost: `${totalCost.toFixed(1)}¢/pair`,
-      fees: `${feeCostCents.toFixed(1)}¢`,
-      pnlPerPair: `${pnlPerPair >= 0 ? "+" : ""}${pnlPerPair.toFixed(1)}¢ (after fees)`,
-    });
-
-    // Accept up to emergency price (1¢ loss per pair max)
-    if (askCents <= this.state.emergencyPriceCents) {
-      const priceDecimal = askCents / 100;
-      const costUsd = remainingShares * priceDecimal;
-
-      if (this.config.dryRun) {
-        this.logger.info("DRY_RUN — emergency fill simulated", { side: loserSide, price: `${askCents.toFixed(1)}¢` });
-        // Mark all unfilled tranches
-        for (const t of unfilled) {
-          t.filled = true;
-          t.fillPriceCents = askCents;
-        }
-        this.state.totalSharesFilled += remainingShares;
-        this.state.totalCostUsd += costUsd;
-        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
+    const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
+    if (askCents) {
+      const pairCost = this.state.winnerAvgPriceCents + askCents;
+      const feeCents = pairCost * TAKER_FEE_PCT;
+      // Accept anything ≤ 100¢ (break-even) before bailing
+      if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
+        this.logger.info("Last-second fill opportunity — filling instead of bailing");
+        await this.fillLoser(askCents, "last-chance");
         return;
       }
-
-      const result = await this.clob.placeBatchOrders([{
-        tokenId: this.state.loserTokenId,
-        side: Side.BUY,
-        price: priceDecimal,
-        size: remainingShares,
-      }]);
-
-      if (result.placed > 0) {
-        for (const t of unfilled) {
-          t.filled = true;
-          t.fillPriceCents = askCents;
-          t.orderIds = result.orderIds;
-        }
-        this.state.totalSharesFilled += remainingShares;
-        this.state.totalCostUsd += costUsd;
-        this.state.allOrderIds.push(...result.orderIds);
-        this.complete(loserSide, this.state.totalSharesFilled, this.state.totalCostUsd, this.state.allOrderIds);
-      } else {
-        this.logger.error("Emergency order rejected — bailing out");
-        this.telegram.alertError("Emergency fill order rejected. Bailing out of winner position.");
-        await this.bailOut();
-      }
-    } else {
-      // Price too high — bail out (sell winner back) instead of holding naked
-      this.logger.warn("Emergency price too high — bailing out of winner position", {
-        loserAsk: `${askCents.toFixed(1)}¢`,
-        maxAcceptable: `${this.state.emergencyPriceCents.toFixed(1)}¢`,
-        hedgedShares: this.state.totalSharesFilled.toFixed(2),
-        nakedShares: remainingShares.toFixed(2),
-      });
-      this.telegram.alertError(
-        `Arb partial: ${loserSide} at ${askCents.toFixed(1)}¢ too expensive. ${this.state.totalSharesFilled.toFixed(0)} hedged, ${remainingShares.toFixed(0)} naked. Bailing out.`,
-      );
-      // Bail out: sell winner shares back instead of holding naked to settlement
-      await this.bailOut();
     }
+
+    this.logger.warn("BAIL-OUT: Selling winner shares back", {
+      side: winnerSide,
+      shares: winnerShares.toFixed(2),
+      elapsed: `${((Date.now() - this.state.startedAt) / 1000).toFixed(1)}s`,
+      loserAsk: askCents ? `${askCents.toFixed(1)}¢` : "N/A",
+    });
+
+    this.telegram.alertError(
+      `Bail-out: Selling ${winnerSide} ${winnerShares.toFixed(1)} shares after 5s. Loser too expensive.`,
+    );
+
+    if (this.config.dryRun) {
+      this.logger.info("DRY_RUN — bail-out sell simulated");
+    } else {
+      try {
+        const winnerBook = this.clobWs.getBook(this.state.winnerTokenId);
+        const bestBid = winnerBook?.bestBid;
+        if (bestBid && bestBid > 0) {
+          const result = await this.clob.placeBatchOrders([{
+            tokenId: this.state.winnerTokenId,
+            side: Side.SELL,
+            price: bestBid,
+            size: winnerShares,
+          }]);
+          if (result.placed > 0) {
+            this.logger.info("Bail-out sell placed", {
+              price: `${(bestBid * 100).toFixed(1)}¢`,
+              shares: winnerShares.toFixed(2),
+            });
+          } else {
+            this.logger.error("Bail-out sell rejected — holding naked");
+          }
+        } else {
+          this.logger.error("No bid for winner side — holding naked");
+        }
+      } catch (err) {
+        this.logger.error("Bail-out sell failed", { error: (err as Error).message });
+      }
+    }
+
+    // Reverse winner position in ArbManager
+    this.arbManager.recordFill(winnerSide, -winnerShares, -winnerCostUsd);
+    this.logger.info("Bail-out: reversed winner position in ArbManager");
+
+    this.complete(loserSide, 0, 0, []);
   }
 
   private complete(side: TradeSide, shares: number, costUsd: number, orderIds: string[]): void {
     if (!this.state) return;
 
-    this.state.phase = "done";
     this.state.active = false;
 
-    if (this.checkTimer) {
-      clearInterval(this.checkTimer);
-      this.checkTimer = null;
+    if (this.pollTimer) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
 
     if (this.onCompleteCallback) {
