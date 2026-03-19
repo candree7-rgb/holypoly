@@ -59,6 +59,18 @@ export interface Config {
   hedgeEdgeThresholdCents: number;
   hedgeMaxPriceCents: number;
 
+  // Arb completion parameters
+  /** Minimum profit (cents) per share pair to complete arb */
+  minProfitCents: number;
+  /** Max round-trips (buy winner + buy loser) per window */
+  maxRoundTripsPerWindow: number;
+  /** Max unhedged exposure as % of balance */
+  maxUnhedgedPct: number;
+  /** Max total cost per window as % of balance */
+  maxWindowExposurePct: number;
+  /** Timeout (ms) to complete arb before emergency balance */
+  arbCompletionTimeoutMs: number;
+
   // Risk management (percentage-based)
   /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
   dailyLossLimitPct: number;
@@ -197,6 +209,13 @@ export const loadConfig = (): Config => {
   const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD_CENTS", 12);
   const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
 
+  // Arb completion parameters
+  const minProfitCents = parseNumber("MIN_PROFIT_CENTS", 2);
+  const maxRoundTripsPerWindow = parseNumber("MAX_ROUND_TRIPS_PER_WINDOW", 3);
+  const maxUnhedgedPct = parseNumber("MAX_UNHEDGED_PCT", 11);
+  const maxWindowExposurePct = parseNumber("MAX_WINDOW_EXPOSURE_PCT", 15);
+  const arbCompletionTimeoutMs = parseNumber("ARB_COMPLETION_TIMEOUT_MS", 15000);
+
   // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10);
   const weeklyLossLimitPct = parseNumber("WEEKLY_LOSS_LIMIT_PCT", 20);
@@ -273,6 +292,11 @@ export const loadConfig = (): Config => {
     hedgeTriggerCents,
     hedgeEdgeThresholdCents,
     hedgeMaxPriceCents,
+    minProfitCents,
+    maxRoundTripsPerWindow,
+    maxUnhedgedPct,
+    maxWindowExposurePct,
+    arbCompletionTimeoutMs,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,
