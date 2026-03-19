@@ -87,6 +87,14 @@ export class EdgeDetector {
       return noTrade(`Orderbook broken: Up ${marketUpCents}¢ + Down ${marketDownCents}¢ = ${askSum}¢ (>105¢)`);
     }
 
+    // HEDGE PROFITABILITY GATE: Only enter when askSum is low enough for hedge to fill.
+    // Normal market: askSum ≈ 100-102¢ → hedge impossible (pair cost > 100¢).
+    // During dumps/mispricing: askSum drops to 95-98¢ → hedge profitable.
+    // This is THE key filter: no discount = no trade.
+    if (askSum > this.config.maxEntryAskSumCents) {
+      return noTrade(`No hedge room: askSum ${askSum}¢ > ${this.config.maxEntryAskSumCents}¢ (need discount)`);
+    }
+
     // Calculate edge with confidence
     const edge = this.fairValueEngine.calculateEdge(
       currentBtcPrice,

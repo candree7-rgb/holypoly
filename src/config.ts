@@ -31,6 +31,8 @@ export interface Config {
   maxBuysPerSide: number;
   maxEntryPriceCents: number;
   minEntryPriceCents: number;
+  /** Max ask sum (Up ask + Down ask) to enter — must be below this for hedge to be profitable */
+  maxEntryAskSumCents: number;
   redeemDelaySeconds: number;
 
   // Edge detection parameters
@@ -189,6 +191,7 @@ export const loadConfig = (): Config => {
   const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
   const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
+  const maxEntryAskSumCents = parseNumber("MAX_ENTRY_ASK_SUM_CENTS", 98);
   const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Edge detection parameters
@@ -277,6 +280,7 @@ export const loadConfig = (): Config => {
     maxBuysPerSide,
     maxEntryPriceCents,
     minEntryPriceCents,
+    maxEntryAskSumCents,
     redeemDelaySeconds,
     edgeThresholdCents,
     edgeTier2Cents,
