@@ -148,12 +148,21 @@ export class ClobWsClient {
         } else if (msg.event_type === "price_change" && msg.price_changes) {
           // Incremental update — update best bid/ask
           for (const change of msg.price_changes) {
-            const existing = this.books.get(change.asset_id);
-            if (existing) {
-              existing.bestBid = parseFloat(change.best_bid) || existing.bestBid;
-              existing.bestAsk = parseFloat(change.best_ask) || existing.bestAsk;
-              this.notifyUpdate(change.asset_id, existing);
+            let existing = this.books.get(change.asset_id);
+            if (!existing) {
+              // No initial book snapshot yet — create minimal entry from price_change
+              existing = {
+                assetId: change.asset_id,
+                bids: [],
+                asks: [],
+                bestBid: null,
+                bestAsk: null,
+              };
+              this.books.set(change.asset_id, existing);
             }
+            existing.bestBid = parseFloat(change.best_bid) || existing.bestBid;
+            existing.bestAsk = parseFloat(change.best_ask) || existing.bestAsk;
+            this.notifyUpdate(change.asset_id, existing);
           }
         }
       } catch {
