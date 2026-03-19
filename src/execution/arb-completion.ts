@@ -371,24 +371,22 @@ export class ArbCompletionMonitor {
   }
 
   /**
-   * Bail-out: sell winner shares back. Better a small spread loss than naked.
+   * Hedge timeout: loser side didn't fill. Keep naked winner position
+   * (positive EV from edge) — don't sell back and eat the spread.
    */
   private async doBailOut(): Promise<void> {
     if (!this.state) return;
 
     const winnerSide = this.state.winnerSide;
     const loserSide: TradeSide = winnerSide === "Up" ? "Down" : "Up";
-    const winnerShares = this.state.winnerShares;
-    const winnerCostUsd = winnerShares * this.state.winnerAvgPriceCents / 100;
 
-    // Before bailing, one last check — maybe loser dropped
+    // Before giving up on hedge, one last check — maybe loser dropped
     const book = this.clobWs.getBook(this.state.loserTokenId);
     const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
     if (askCents) {
       const pairCost = this.state.winnerAvgPriceCents + askCents;
-      // Accept anything ≤ 100¢ (break-even) before bailing
       if (pairCost <= PHASE2_MAX_PAIR_CENTS) {
-        this.logger.info("Last-second fill opportunity — filling instead of bailing");
+        this.logger.info("Last-second fill opportunity — filling instead of holding naked");
         await this.fillLoser(askCents, "last-chance");
         return;
       }
@@ -396,59 +394,26 @@ export class ArbCompletionMonitor {
 
     const bestSeen = this.state.bestLoserAskSeen;
     const initialAsk = this.state.initialLoserAsk;
-    const neededForProfit = PHASE1_MAX_PAIR_CENTS - this.state.winnerAvgPriceCents;
     const neededForBreakeven = PHASE2_MAX_PAIR_CENTS - this.state.winnerAvgPriceCents;
     const elapsedSec = ((Date.now() - this.state.startedAt) / 1000).toFixed(1);
 
-    this.logger.warn("BAIL-OUT: Selling winner shares back", {
+    this.logger.info("HEDGE TIMEOUT — holding naked winner (positive EV from edge)", {
       side: winnerSide,
-      shares: winnerShares.toFixed(2),
+      shares: this.state.winnerShares.toFixed(2),
+      entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
       elapsed: `${elapsedSec}s`,
       loserAskNow: askCents ? `${askCents.toFixed(1)}¢` : "N/A",
       loserAskInitial: initialAsk ? `${initialAsk.toFixed(1)}¢` : "N/A",
       bestLoserAskSeen: `${bestSeen.toFixed(1)}¢`,
-      priceDropSeen: initialAsk ? `${(initialAsk - bestSeen).toFixed(1)}¢` : "N/A",
-      neededForProfit: `≤${neededForProfit.toFixed(1)}¢`,
       neededForBreakeven: `≤${neededForBreakeven.toFixed(1)}¢`,
-      gap: `${(bestSeen - neededForBreakeven).toFixed(1)}¢ away from break-even`,
+      gap: `${(bestSeen - neededForBreakeven).toFixed(1)}¢`,
     });
 
+    // Don't sell winner — hold for settlement. Edge = positive EV directional bet.
+    // Settlement logic handles naked positions correctly (win: +shares-cost, lose: -cost).
     this.telegram.alertError(
-      `Bail-out: ${winnerSide} ${winnerShares.toFixed(0)}sh after ${elapsedSec}s. Loser best=${bestSeen.toFixed(0)}¢, need≤${neededForBreakeven.toFixed(0)}¢, gap=${(bestSeen - neededForBreakeven).toFixed(0)}¢`,
+      `Naked hold: ${winnerSide} ${this.state.winnerShares.toFixed(0)}sh @ ${this.state.winnerAvgPriceCents.toFixed(0)}¢ — hedge timeout ${elapsedSec}s, gap=${(bestSeen - neededForBreakeven).toFixed(0)}¢`,
     );
-
-    if (this.config.dryRun) {
-      this.logger.info("DRY_RUN — bail-out sell simulated");
-    } else {
-      try {
-        const winnerBook = this.clobWs.getBook(this.state.winnerTokenId);
-        const bestBid = winnerBook?.bestBid;
-        if (bestBid && bestBid > 0) {
-          const result = await this.clob.placeBatchOrders([{
-            tokenId: this.state.winnerTokenId,
-            side: Side.SELL,
-            price: bestBid,
-            size: winnerShares,
-          }]);
-          if (result.placed > 0) {
-            this.logger.info("Bail-out sell placed", {
-              price: `${(bestBid * 100).toFixed(1)}¢`,
-              shares: winnerShares.toFixed(2),
-            });
-          } else {
-            this.logger.error("Bail-out sell rejected — holding naked");
-          }
-        } else {
-          this.logger.error("No bid for winner side — holding naked");
-        }
-      } catch (err) {
-        this.logger.error("Bail-out sell failed", { error: (err as Error).message });
-      }
-    }
-
-    // Reverse winner position in ArbManager
-    this.arbManager.recordFill(winnerSide, -winnerShares, -winnerCostUsd);
-    this.logger.info("Bail-out: reversed winner position in ArbManager");
 
     this.complete(loserSide, 0, 0, []);
   }
