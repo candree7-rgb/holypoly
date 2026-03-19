@@ -134,17 +134,7 @@ export class EdgeDetector {
       }
     }
 
-    // Skip coin-flip trades: fair value near 50% = no directional conviction.
-    // With naked positions (hedge rarely fills), we need strong directional signal.
-    // Fair 50¢ with 7¢ edge = positive EV but huge variance → bad risk/reward.
-    const fairPrimary = edge.bestSide === "Up" ? edge.fairUp : (100 - edge.fairUp);
-    if (fairPrimary < 65) {
-      return noTrade(
-        `Fair value too close to 50/50 (fair ${edge.bestSide}=${fairPrimary}¢ < 65¢) — need directional conviction`,
-      );
-    }
-
-    // Skip flat markets near 50/50 (belt + suspenders with BTC delta)
+    // Skip flat markets near 50/50
     const absDelta = Math.abs(currentBtcPrice - window.openingPrice);
     if (absDelta < this.config.minDeltaThresholdUsd && marketUpCents >= 45 && marketUpCents <= 55) {
       return noTrade(`BTC flat (delta=$${absDelta.toFixed(2)}) and market near 50/50`);
