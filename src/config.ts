@@ -214,7 +214,7 @@ export const loadConfig = (): Config => {
   const maxRoundTripsPerWindow = parseNumber("MAX_ROUND_TRIPS_PER_WINDOW", 3);
   const maxUnhedgedPct = parseNumber("MAX_UNHEDGED_PCT", 11);
   const maxWindowExposurePct = parseNumber("MAX_WINDOW_EXPOSURE_PCT", 15);
-  const arbCompletionTimeoutMs = parseNumber("ARB_COMPLETION_TIMEOUT_MS", 120000);
+  const arbCompletionTimeoutMs = parseNumber("ARB_COMPLETION_TIMEOUT_MS", 60000);
 
   // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10);
