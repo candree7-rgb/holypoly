@@ -107,12 +107,12 @@ export class ClobWsClient {
         this.sendSubscription();
       }
 
-      // Keepalive: WebSocket protocol-level ping every 30 seconds
+      // Keepalive: Polymarket requires PING every 10 seconds (docs say 10s, server disconnects otherwise)
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
-          this.ws.ping();
+          this.ws.send("PING");
         }
-      }, 30000);
+      }, 10000);
     });
 
     this.ws.on("message", (data: WebSocket.Data) => {
@@ -124,6 +124,9 @@ export class ClobWsClient {
           event_type?: string;
           asset_id?: string;
           market?: string;
+          best_bid?: string;
+          best_ask?: string;
+          spread?: string;
           bids?: Array<{ price: string; size: string }>;
           asks?: Array<{ price: string; size: string }>;
           price_changes?: Array<{
@@ -145,12 +148,30 @@ export class ClobWsClient {
           );
           this.books.set(msg.asset_id, book);
           this.notifyUpdate(msg.asset_id, book);
+
+        } else if (msg.event_type === "best_bid_ask" && msg.asset_id) {
+          // Top-of-book update (custom_feature_enabled)
+          // This is the FASTEST event — fires on every best bid/ask change
+          let existing = this.books.get(msg.asset_id);
+          if (!existing) {
+            existing = {
+              assetId: msg.asset_id,
+              bids: [],
+              asks: [],
+              bestBid: null,
+              bestAsk: null,
+            };
+            this.books.set(msg.asset_id, existing);
+          }
+          if (msg.best_bid) existing.bestBid = parseFloat(msg.best_bid) || existing.bestBid;
+          if (msg.best_ask) existing.bestAsk = parseFloat(msg.best_ask) || existing.bestAsk;
+          this.notifyUpdate(msg.asset_id, existing);
+
         } else if (msg.event_type === "price_change" && msg.price_changes) {
-          // Incremental update — update best bid/ask
+          // Price level update — includes best bid/ask
           for (const change of msg.price_changes) {
             let existing = this.books.get(change.asset_id);
             if (!existing) {
-              // No initial book snapshot yet — create minimal entry from price_change
               existing = {
                 assetId: change.asset_id,
                 bids: [],

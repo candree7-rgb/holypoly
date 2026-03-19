@@ -191,7 +191,8 @@ export class ArbCompletionMonitor {
 
   /**
    * Core logic: check if we can fill the loser side now.
-   * Called every 100ms AND on every WS update.
+   * Called on every WS update + safety timer every 2s.
+   * WS path is sync (fast), timer path uses async REST fallback.
    */
   private checkAndFill(): void {
     if (!this.state || !this.state.active || this.state.filled || this.state.fillInFlight) return;
@@ -200,52 +201,101 @@ export class ArbCompletionMonitor {
 
     // Phase 3: bail out
     if (elapsed >= BAILOUT_AFTER_MS) {
-      this.state.fillInFlight = true; // prevent re-entry
+      this.state.fillInFlight = true;
       this.doBailOut().catch((err) => {
         this.logger.error("Bail-out failed", { error: (err as Error).message });
       });
       return;
     }
 
-    // Get current loser ask
+    // Get current loser ask from WS
     const book = this.clobWs.getBook(this.state.loserTokenId);
     const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
-    if (!askCents) return; // no price yet, wait for next tick
 
-    // Track best (lowest) loser price seen
-    if (askCents < this.state.bestLoserAskSeen) {
-      this.state.bestLoserAskSeen = askCents;
+    if (!askCents) {
+      // WS has no data — fetch from REST API as fallback
+      this.state.fillInFlight = true; // prevent re-entry during async
+      this.fetchAndCheck(elapsed).catch((err) => {
+        this.logger.error("REST fallback check failed", { error: (err as Error).message });
+        if (this.state && !this.state.filled) this.state.fillInFlight = false;
+      });
+      return;
     }
 
-    const pairCost = this.state.winnerAvgPriceCents + askCents;
+    this.evaluateAndFill(askCents, elapsed);
+  }
+
+  /**
+   * Async REST fallback when WS has no book data for the loser.
+   */
+  private async fetchAndCheck(elapsed: number): Promise<void> {
+    if (!this.state || this.state.filled) return;
+
+    const ob = await this.clob.getOrderbook(this.state.loserTokenId);
+    const askCents = ob.bestAsk ? ob.bestAsk * 100 : null;
+
+    if (!askCents) {
+      this.logger.warn("No loser price from WS or REST", {
+        elapsed: `${(elapsed / 1000).toFixed(1)}s`,
+        loserTokenId: this.state.loserTokenId.slice(0, 12) + "...",
+      });
+      this.state.fillInFlight = false;
+      return;
+    }
+
+    this.logger.debug("Using REST price (WS has no data)", {
+      loserAsk: `${askCents.toFixed(1)}¢`,
+    });
+
+    this.evaluateAndFill(askCents, elapsed);
+  }
+
+  /**
+   * Evaluate loser ask price and fill if within threshold.
+   */
+  private evaluateAndFill(askCents: number, elapsed: number): void {
+    if (!this.state || this.state.filled || (this.state.fillInFlight && elapsed < BAILOUT_AFTER_MS)) {
+      // fillInFlight is set by fetchAndCheck — allow it through
+    }
+
+    // Track best (lowest) loser price seen
+    if (askCents < this.state!.bestLoserAskSeen) {
+      this.state!.bestLoserAskSeen = askCents;
+    }
+
+    const pairCost = this.state!.winnerAvgPriceCents + askCents;
     const feeCents = pairCost * TAKER_FEE_PCT;
 
     // Phase 1: profitable fill (pair + fees < 98¢)
     if (elapsed < PHASE2_AFTER_MS) {
       if (pairCost + feeCents <= PHASE1_MAX_PAIR_CENTS) {
-        this.state.fillInFlight = true;
+        this.state!.fillInFlight = true;
         this.fillLoser(askCents, "profitable").catch((err) => {
           this.logger.error("Profitable fill failed — will retry on next update", {
             error: (err as Error).message,
           });
-          // Release lock so next WS update or timer can retry
           if (this.state && !this.state.filled) this.state.fillInFlight = false;
         });
+      } else {
+        // Release lock if set by fetchAndCheck
+        if (this.state) this.state.fillInFlight = false;
       }
       return;
     }
 
     // Phase 2: break-even fill (pair + fees ≤ 100¢)
     if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
-      this.state.fillInFlight = true;
+      this.state!.fillInFlight = true;
       this.fillLoser(askCents, "breakeven").catch((err) => {
         this.logger.error("Break-even fill failed — will retry on next update", {
           error: (err as Error).message,
         });
         if (this.state && !this.state.filled) this.state.fillInFlight = false;
       });
+    } else {
+      // Release lock if set by fetchAndCheck
+      if (this.state) this.state.fillInFlight = false;
     }
-    // If still too expensive in phase 2, wait — phase 3 (bail) will trigger on next tick
   }
 
   /**
