@@ -123,32 +123,6 @@ export class TelegramNotifier {
     );
   }
 
-  async alertSkip(
-    side: string,
-    currentPriceCents: number | null,
-    nextLimitCents: number,
-    reason: string,
-  ): Promise<void> {
-    const price = currentPriceCents ? `${currentPriceCents.toFixed(1)}¢` : "N/A";
-    await this.send(
-      `⏭️ *SKIP* ${side.toUpperCase()} current @ ${price} (${reason})\n` +
-        `→ NEXT @ ${nextLimitCents}¢ limit`,
-    );
-  }
-
-  async alertSell(
-    side: string,
-    entryPrice: number,
-    sellPrice: number,
-    pnl: number,
-  ): Promise<void> {
-    const emoji = pnl >= 0 ? "🟢" : "🔴";
-    const sign = pnl >= 0 ? "+" : "";
-    await this.send(
-      `${emoji} *SOLD* ${side.toUpperCase()} ${entryPrice.toFixed(1)}¢ → ${sellPrice.toFixed(1)}¢ (${sign}$${pnl.toFixed(2)})`,
-    );
-  }
-
   async alertCircuitBreaker(reason: string): Promise<void> {
     await this.send(`🚨 *CIRCUIT BREAKER*\n${reason}`);
   }

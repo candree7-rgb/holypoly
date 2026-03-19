@@ -59,7 +59,4 @@ export interface ActivePosition {
   windowStart: number;
   windowEnd: number;
   balanceBefore: number;
-  /** Set when position is sold before settlement (counter-signal) */
-  sold?: boolean;
-  soldPnl?: number;
 }

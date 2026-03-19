@@ -153,7 +153,7 @@ export const loadConfig = (): Config => {
   // Trading parameters
   const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
   const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 7);
-  const currentMarketMaxPriceCents = parseNumber("CURRENT_MARKET_MAX_PRICE_CENTS", 58);
+  const currentMarketMaxPriceCents = parseNumber("CURRENT_MARKET_MAX_PRICE_CENTS", 70);
   const nextMarketLimitPriceCents = parseNumber("NEXT_MARKET_LIMIT_PRICE_CENTS", 52);
   const limitOrderTimeoutMs = parseNumber("LIMIT_ORDER_TIMEOUT_MS", 15000);
   const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);

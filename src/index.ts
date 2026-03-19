@@ -57,9 +57,8 @@ const main = async () => {
   logger.info("Mode", { dryRun: config.dryRun });
   logger.info("Parameters", {
     buyAmountPct: `${config.buyAmountPct}%`,
-    currentMarketMax: `${config.currentMarketMaxPriceCents}¢`,
-    nextMarketLimit: `${config.nextMarketLimitPriceCents}¢`,
-    limitTimeout: `${config.limitOrderTimeoutMs}ms`,
+    maxPriceCents: `${config.currentMarketMaxPriceCents}¢`,
+    signalWindow: "windowStart-60s to windowStart+149s",
     webhookPort: config.webhookPort,
     dailyLossLimit: `${config.dailyLossLimitPct}%`,
     weeklyLossLimit: `${config.weeklyLossLimitPct}%`,
@@ -129,89 +128,6 @@ const main = async () => {
   // === Position tracking ===
   const activePositions = new Map<string, ActivePosition>();
   let processingSignal = false;
-
-  // === Helper: sell a position (counter-signal) ===
-  const sellPosition = async (pos: ActivePosition): Promise<number> => {
-    logger.info("SELLING position (counter-signal)", {
-      side: pos.side,
-      conditionId: pos.conditionId.slice(0, 16) + "...",
-      entry: `${pos.entryPriceCents.toFixed(1)}¢`,
-      shares: pos.shares.toFixed(2),
-    });
-
-    if (config.dryRun) {
-      const book = clobWs.getBook(pos.tokenId);
-      const sellPriceDecimal = book?.bestBid ?? pos.entryPriceCents / 100;
-      const sellPriceCents = sellPriceDecimal * 100;
-      const pnl = ((sellPriceCents - pos.entryPriceCents) / 100) * pos.shares;
-
-      logger.info("DRY_RUN — would sell", {
-        sellPrice: `${sellPriceCents.toFixed(1)}¢`,
-        pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-      });
-
-      telegram.alertSell(pos.side, pos.entryPriceCents, sellPriceCents, pnl);
-      await riskManager.recordResult(pnl);
-      return pnl;
-    }
-
-    // Cancel any open (unfilled) orders first
-    for (const orderId of pos.orderIds) {
-      await clob.cancelOrder(orderId);
-    }
-
-    // Check how many shares actually filled
-    let actualShares = 0;
-    for (const orderId of pos.orderIds) {
-      const filled = await clob.getFilledShares(orderId);
-      actualShares += filled;
-    }
-
-    if (actualShares <= 0) {
-      logger.info("No filled shares to sell (order was not filled)");
-      return 0;
-    }
-
-    // Get best bid for sell price
-    const book = clobWs.getBook(pos.tokenId);
-    let bestBid = book?.bestBid;
-
-    if (!bestBid || bestBid <= 0) {
-      // REST fallback
-      const ob = await clob.getOrderbook(pos.tokenId);
-      bestBid = ob.bestBid;
-    }
-
-    if (!bestBid || bestBid <= 0) {
-      logger.warn("No bid available, cannot sell — holding to settlement");
-      return 0;
-    }
-
-    // Place sell order
-    const result = await clob.placeBatchOrders([
-      {
-        tokenId: pos.tokenId,
-        side: Side.SELL,
-        price: bestBid,
-        size: actualShares,
-      },
-    ]);
-
-    const sellPriceCents = bestBid * 100;
-    const pnl = ((sellPriceCents - pos.entryPriceCents) / 100) * actualShares;
-
-    logger.info("Position sold", {
-      placed: result.placed,
-      sellPrice: `${sellPriceCents.toFixed(1)}¢`,
-      shares: actualShares.toFixed(2),
-      pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
-    });
-
-    telegram.alertSell(pos.side, pos.entryPriceCents, sellPriceCents, pnl);
-    await riskManager.recordResult(pnl);
-
-    return pnl;
-  };
 
   // === Helper: enter a market ===
   const enterMarket = async (
@@ -351,7 +267,6 @@ const main = async () => {
 
   // === Settle a position at window end ===
   const settlePosition = async (pos: ActivePosition): Promise<void> => {
-    if (pos.sold) return;
 
     const settlementPrice = rtds.price ?? binance.price;
     if (settlementPrice === null) {
@@ -424,31 +339,58 @@ const main = async () => {
 
     try {
       const side: TradeSide = direction === "up" ? "Up" : "Down";
+      const nowMs = Date.now();
+      const nowSecs = Math.floor(nowMs / 1000);
+      const windowSize = 300;
 
-      // 1. Check existing positions
-      for (const [condId, pos] of activePositions) {
-        if (pos.sold) {
-          activePositions.delete(condId);
-          continue;
-        }
+      // 1. Determine which window this signal targets
+      //    Signal valid window: windowStart - 60s  to  windowStart + 149s
+      //    Before windowStart → NEXT (limit order)
+      //    After windowStart  → CURRENT (market order)
+      const currentWindowStart = Math.floor(nowSecs / windowSize) * windowSize;
+      const currentWindowElapsed = nowSecs - currentWindowStart;
 
-        if (pos.side === side) {
-          logger.info("Already holding position in same direction", { side });
-          return;
-        }
+      let targetWindowStart: number;
+      let marketType: "CURRENT" | "NEXT";
 
-        // Counter-signal → SELL
-        logger.info("Counter-signal detected! Selling existing position", {
-          held: pos.side,
-          newSignal: side,
+      if (currentWindowElapsed < 150) {
+        // We're within the first 149s of the current window → CURRENT
+        targetWindowStart = currentWindowStart;
+        marketType = "CURRENT";
+      } else if (currentWindowElapsed >= 240) {
+        // We're within 60s before next window (300-60=240) → NEXT
+        targetWindowStart = currentWindowStart + windowSize;
+        marketType = "NEXT";
+      } else {
+        // Between 150s and 239s — outside valid signal window
+        logger.info("Signal outside valid time window, ignoring", {
+          elapsed: `${currentWindowElapsed}s into window`,
+          validRanges: "0-149s (CURRENT) or 240-299s (NEXT)",
         });
-        const pnl = await sellPosition(pos);
-        pos.sold = true;
-        pos.soldPnl = pnl;
-        activePositions.delete(condId);
+        return;
       }
 
-      // 2. Risk check
+      logger.info("Signal received", {
+        direction,
+        side,
+        marketType,
+        targetWindow: new Date(targetWindowStart * 1000).toISOString().slice(11, 19),
+        windowElapsed: `${currentWindowElapsed}s`,
+      });
+
+      // 2. Check if we already have a position in this window
+      for (const [condId, pos] of activePositions) {
+        // Check if this position belongs to our target window
+        if (Math.floor(pos.windowStart / 1000) === targetWindowStart) {
+          logger.info("Already have position in this window, skipping", {
+            side: pos.side,
+            window: new Date(targetWindowStart * 1000).toISOString().slice(11, 19),
+          });
+          return;
+        }
+      }
+
+      // 3. Risk check
       const riskCheck = await riskManager.check();
       if (!riskCheck.allowed) {
         logger.warn("Risk check blocked", { reason: riskCheck.reason });
@@ -456,39 +398,50 @@ const main = async () => {
         return;
       }
 
-      // 3. Find current window
-      const window = await windowManager.tick();
-      if (!window) {
-        logger.warn("No active window found");
+      // 4. Find the target market
+      let targetWindow: WindowInfo | null;
+      if (marketType === "CURRENT") {
+        targetWindow = await windowManager.tick();
+        if (!targetWindow) {
+          // Try direct lookup
+          targetWindow = await discovery.findMarketByTimestamp(targetWindowStart);
+        }
+      } else {
+        targetWindow = await discovery.findMarketByTimestamp(targetWindowStart);
+      }
+
+      if (!targetWindow) {
+        logger.warn("Target market not found", {
+          marketType,
+          targetWindow: new Date(targetWindowStart * 1000).toISOString().slice(11, 19),
+        });
         return;
       }
 
-      // Subscribe CLOB WS to this window's tokens
+      // Subscribe CLOB WS to target window's tokens
       clobWs.clear();
-      clobWs.subscribe([window.upTokenId, window.downTokenId]);
+      clobWs.subscribe([targetWindow.upTokenId, targetWindow.downTokenId]);
 
       // Set opening price if not yet set
-      if (window.openingPrice === 0) {
+      if (targetWindow.openingPrice === 0) {
         const openingPrice = rtds.price ?? binance.price;
-        if (openingPrice) windowManager.setOpeningPrice(openingPrice);
+        if (openingPrice) {
+          targetWindow.openingPrice = openingPrice;
+          if (marketType === "CURRENT") windowManager.setOpeningPrice(openingPrice);
+        }
       }
 
-      // 4. Check time remaining
-      const timeRemaining = windowManager.timeRemaining();
-
-      // 5. Get current market price
-      const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
-
-      // Brief wait for CLOB WS to populate orderbook after subscribe
+      // Brief wait for CLOB WS to populate orderbook
       await sleep(500);
 
-      let book = clobWs.getBook(tokenId);
+      // 5. Get best ask price
+      const tokenId = side === "Up" ? targetWindow.upTokenId : targetWindow.downTokenId;
+      const book = clobWs.getBook(tokenId);
       let bestAskCents: number | null = null;
 
       if (book?.bestAsk) {
         bestAskCents = book.bestAsk * 100;
       } else {
-        // REST fallback
         const ob = await clob.getOrderbook(tokenId);
         bestAskCents = ob.bestAsk ? ob.bestAsk * 100 : null;
       }
@@ -496,120 +449,31 @@ const main = async () => {
       logger.info("Signal evaluation", {
         direction,
         side,
-        window: `${new Date(window.startTime).toISOString().slice(11, 19)} - ${new Date(window.endTime).toISOString().slice(11, 19)}`,
-        timeRemaining: `${timeRemaining.toFixed(0)}s`,
+        marketType,
+        window: `${new Date(targetWindow.startTime).toISOString().slice(11, 19)} - ${new Date(targetWindow.endTime).toISOString().slice(11, 19)}`,
         bestAsk: bestAskCents ? `${bestAskCents.toFixed(1)}¢` : "N/A",
-        threshold: `${config.currentMarketMaxPriceCents}¢`,
+        maxPrice: `${config.currentMarketMaxPriceCents}¢`,
         btcPrice: binance.price?.toFixed(2) ?? "N/A",
       });
 
-      // 6. Decision: current market or next market?
-      if (
-        timeRemaining > 30 &&
-        bestAskCents &&
-        bestAskCents <= config.currentMarketMaxPriceCents
-      ) {
-        // === ENTER CURRENT MARKET ===
-        logger.info("Entering CURRENT market (price within threshold)");
-        await enterMarket(window, side, riskCheck.buyAmountUsd, undefined, "CURRENT");
-      } else {
-        // === ENTER NEXT MARKET (early entry) ===
-        const skipReason = timeRemaining <= 30
-          ? `${timeRemaining.toFixed(0)}s left`
-          : `${bestAskCents?.toFixed(1)}¢ > ${config.currentMarketMaxPriceCents}¢`;
-        telegram.alertSkip(side, bestAskCents, config.nextMarketLimitPriceCents, skipReason);
-
-        const now = Math.floor(Date.now() / 1000);
-        const windowSize = 300;
-        const nextWindowStart =
-          (Math.floor(now / windowSize) + 1) * windowSize;
-
-        logger.info("Targeting NEXT market", {
-          reason:
-            timeRemaining <= 30
-              ? "window ending soon"
-              : `price ${bestAskCents?.toFixed(1)}¢ > ${config.currentMarketMaxPriceCents}¢`,
-          nextWindow: new Date(nextWindowStart * 1000)
-            .toISOString()
-            .slice(11, 19),
-          limitPrice: `${config.nextMarketLimitPriceCents}¢`,
+      // 6. Price check — both CURRENT and NEXT use same max price
+      if (!bestAskCents || bestAskCents > config.currentMarketMaxPriceCents) {
+        logger.info("Price too high, skipping", {
+          bestAsk: bestAskCents ? `${bestAskCents.toFixed(1)}¢` : "N/A",
+          max: `${config.currentMarketMaxPriceCents}¢`,
         });
+        return;
+      }
 
-        // Try to find the next market
-        const nextWindow =
-          await discovery.findMarketByTimestamp(nextWindowStart);
-        if (!nextWindow) {
-          logger.warn(
-            "Next market not yet available — may not be created yet",
-          );
-          return;
-        }
-
-        // Subscribe to next market tokens
-        clobWs.clear();
-        clobWs.subscribe([nextWindow.upTokenId, nextWindow.downTokenId]);
-
-        // Set opening price
-        if (nextWindow.openingPrice === 0) {
-          const price = rtds.price ?? binance.price;
-          if (price) nextWindow.openingPrice = price;
-        }
-
-        // Place limit order at nextMarketLimitPriceCents
-        const pos = await enterMarket(
-          nextWindow,
-          side,
-          riskCheck.buyAmountUsd,
-          config.nextMarketLimitPriceCents,
-          "NEXT",
-        );
-
-        // After timeout, check if filled → convert to market order if not
-        if (pos && !config.dryRun) {
-          setTimeout(async () => {
-            try {
-              const currentPos = activePositions.get(nextWindow.conditionId);
-              if (!currentPos || currentPos.sold) return;
-
-              // Check fill status
-              let totalFilled = 0;
-              for (const orderId of currentPos.orderIds) {
-                const filled = await clob.getFilledShares(orderId);
-                totalFilled += filled;
-              }
-
-              if (totalFilled <= 0) {
-                logger.info(
-                  "Limit order not filled after timeout, converting to market order",
-                );
-
-                // Cancel limit order
-                for (const orderId of currentPos.orderIds) {
-                  await clob.cancelOrder(orderId);
-                }
-                activePositions.delete(nextWindow.conditionId);
-
-                // Re-enter at market price
-                const riskCheck2 = await riskManager.check();
-                if (riskCheck2.allowed) {
-                  await enterMarket(
-                    nextWindow,
-                    side,
-                    riskCheck2.buyAmountUsd,
-                  );
-                }
-              } else {
-                logger.info("Limit order filled", {
-                  shares: totalFilled.toFixed(2),
-                });
-              }
-            } catch (err) {
-              logger.error("Limit order timeout handler error", {
-                error: (err as Error).message,
-              });
-            }
-          }, config.limitOrderTimeoutMs);
-        }
+      // 7. Enter market
+      if (marketType === "CURRENT") {
+        // Market order at best ask
+        logger.info("Entering CURRENT market (market order)");
+        await enterMarket(targetWindow, side, riskCheck.buyAmountUsd, undefined, "CURRENT");
+      } else {
+        // NEXT market — limit order at best ask price
+        logger.info("Entering NEXT market (limit order at best ask)");
+        await enterMarket(targetWindow, side, riskCheck.buyAmountUsd, bestAskCents, "NEXT");
       }
     } catch (err) {
       logger.error("Signal handler error", { error: (err as Error).message });
@@ -660,11 +524,6 @@ const main = async () => {
 
         // Check for positions that need settlement (window ended)
         for (const [condId, pos] of activePositions) {
-          if (pos.sold) {
-            activePositions.delete(condId);
-            continue;
-          }
-
           if (now >= pos.windowEnd) {
             logger.info("Window ended, settling position", {
               conditionId: condId.slice(0, 16) + "...",
