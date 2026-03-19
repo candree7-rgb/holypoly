@@ -1,6 +1,7 @@
 import { normalCdf } from "../utils.js";
 import type { VolatilityCalculator, VolatilityRegime } from "./volatility.js";
 import { lookupFairUp, type LookupResult } from "./lookup-table.js";
+import type { WindowMemory } from "./window-memory.js";
 
 /**
  * Improved Fair Value Engine for 5-minute BTC Up/Down markets.
@@ -30,7 +31,14 @@ export interface EdgeResult {
 }
 
 export class FairValueEngine {
+  private windowMemory: WindowMemory | null = null;
+
   constructor(private volatilityCalc: VolatilityCalculator) {}
+
+  /** Attach window memory for cross-window continuation bias */
+  setWindowMemory(memory: WindowMemory): void {
+    this.windowMemory = memory;
+  }
 
   /**
    * Calculate fair value with confidence and regime awareness.
@@ -70,6 +78,18 @@ export class FairValueEngine {
           ? Math.min(98, fairUp + nudge)
           : Math.max(2, fairUp - nudge);
         fairUp = Math.round(fairUp);
+      }
+
+      // Cross-window continuation bias: if last N windows all went same direction,
+      // nudge fair value toward continuation (market underestimates streaks)
+      if (this.windowMemory) {
+        const bias = this.windowMemory.getContinuationBias(5);
+        if (bias.biasCents > 0 && bias.side) {
+          fairUp = bias.side === "Up"
+            ? Math.min(98, fairUp + bias.biasCents)
+            : Math.max(2, fairUp - bias.biasCents);
+          fairUp = Math.round(fairUp);
+        }
       }
 
       // Confidence reduction for extreme regimes (lookup table is averaged)

@@ -284,28 +284,51 @@ export class EdgeDetector {
     const fairPrimary = primarySide === "Up" ? fairUp : 100 - fairUp;
 
     // Primary side: buy at ask levels up to fairValue + 5¢
+    // SPREAD-AWARE: Cap each order to available depth at that level
     const primaryMaxPrice = (fairPrimary + 5) / 100;
     const primaryLevels = primaryBook.asks
       .filter((a) => a.price <= primaryMaxPrice)
       .slice(0, numPrimary);
 
     for (const level of primaryLevels) {
+      // Cap order amount to what's available at this level (avoid slippage)
+      const availableUsd = level.size * level.price;
+      const cappedAmount = Math.min(buyAmountUsd, availableUsd * 0.8); // take max 80% of level
+
+      if (cappedAmount < buyAmountUsd * 0.3) {
+        this.logger.debug("Skipping thin ask level", {
+          price: `${(level.price * 100).toFixed(1)}¢`,
+          available: `$${availableUsd.toFixed(2)}`,
+          wanted: `$${buyAmountUsd.toFixed(2)}`,
+        });
+        continue; // skip if less than 30% of our wanted size available
+      }
+
       orders.push({
         side: primarySide,
         tokenId: primaryTokenId,
         price: level.price * 100,
-        amount: buyAmountUsd,
+        amount: cappedAmount,
       });
     }
 
-    // Fallback: place at best ask if no levels match
+    // Fallback: place at best ask if no levels match (thin book warning)
     if (orders.length === 0 && primaryBook.bestAsk !== null) {
       if (primaryBook.bestAsk <= primaryMaxPrice) {
+        const bestAskSize = primaryBook.asks[0]?.size ?? 0;
+        const availableUsd = bestAskSize * primaryBook.bestAsk;
+        const cappedAmount = Math.min(buyAmountUsd, Math.max(availableUsd * 0.8, buyAmountUsd * 0.3));
+
+        this.logger.debug("Using fallback best ask (thin book)", {
+          available: `$${availableUsd.toFixed(2)}`,
+          capped: `$${cappedAmount.toFixed(2)}`,
+        });
+
         orders.push({
           side: primarySide,
           tokenId: primaryTokenId,
           price: primaryBook.bestAsk * 100,
-          amount: buyAmountUsd,
+          amount: cappedAmount,
         });
       }
     }

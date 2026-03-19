@@ -62,6 +62,8 @@ interface MonitorState {
   totalCostUsd: number;
   /** All order IDs across tranches */
   allOrderIds: string[];
+  /** Resting maker order ID for T1 (cancelled on emergency) */
+  restingOrderId: string | null;
   /** Last edge check timestamp */
   lastEdgeCheckAt: number;
   /** Current BTC price for edge monitoring */
@@ -152,6 +154,7 @@ export class ArbCompletionMonitor {
       totalSharesFilled: 0,
       totalCostUsd: 0,
       allOrderIds: [],
+      restingOrderId: null,
       lastEdgeCheckAt: Date.now(),
       currentBtcPrice: params.currentBtcPrice,
       openingPrice: params.window.openingPrice,
@@ -171,6 +174,44 @@ export class ArbCompletionMonitor {
     });
 
     this.checkTimer = setInterval(() => this.periodicCheck(), 500);
+
+    // MAKER OPTIMIZATION: Immediately place resting bid for T1 at target price.
+    // This sits on the book BEFORE the loser reprices, so when sellers come in
+    // we get filled as MAKER (lower fees + rebate) instead of TAKER.
+    this.placeRestingBidForT1().catch((err) => {
+      this.logger.warn("Resting bid placement failed, will fill reactively", {
+        error: (err as Error).message,
+      });
+    });
+  }
+
+  /**
+   * Place a resting limit bid for Tranche 1 immediately.
+   * This makes us a MAKER when the loser side reprices down.
+   */
+  private async placeRestingBidForT1(): Promise<void> {
+    if (!this.state || this.config.dryRun) return;
+
+    const t1 = this.state.tranches[0];
+    if (t1.filled) return;
+
+    const priceDecimal = t1.maxPriceCents / 100;
+
+    const result = await this.clob.placeBatchOrders([{
+      tokenId: this.state.loserTokenId,
+      side: Side.BUY,
+      price: priceDecimal,
+      size: t1.shares,
+    }]); // GTC by default — rests on book
+
+    if (result.placed > 0 && result.orderIds.length > 0) {
+      this.state.restingOrderId = result.orderIds[0];
+      this.logger.info("Resting maker bid placed for T1", {
+        price: `${t1.maxPriceCents.toFixed(1)}¢`,
+        shares: t1.shares.toFixed(2),
+        orderId: result.orderIds[0].slice(0, 12) + "...",
+      });
+    }
   }
 
   /** Update BTC price for continuous edge monitoring */
@@ -222,10 +263,23 @@ export class ArbCompletionMonitor {
       this.state.bestLoserPriceSeen = askCents;
     }
 
+    // Check T1 resting order fill (maker optimization)
+    if (this.state.restingOrderId && !this.state.tranches[0].filled) {
+      // If ask has dropped to our resting bid level, check if we got filled as maker
+      if (askCents <= this.state.tranches[0].maxPriceCents) {
+        this.checkRestingOrderFill().catch((err) => {
+          this.logger.warn("Resting order fill check failed", { error: (err as Error).message });
+        });
+      }
+    }
+
     // Check each unfilled tranche
     for (let i = 0; i < this.state.tranches.length; i++) {
       const tranche = this.state.tranches[i];
       if (tranche.filled) continue;
+
+      // Skip T1 if resting order is active — it will fill as maker
+      if (i === 0 && this.state.restingOrderId) continue;
 
       // Trailing logic: buy at the ACTUAL price (which may be much better than target)
       // but only trigger when price <= tranche's max price
@@ -243,6 +297,47 @@ export class ArbCompletionMonitor {
         });
         break; // one tranche at a time to avoid race conditions
       }
+    }
+  }
+
+  /**
+   * Check if the resting maker bid for T1 has been filled.
+   */
+  private async checkRestingOrderFill(): Promise<void> {
+    if (!this.state || !this.state.restingOrderId) return;
+
+    const filledShares = await this.clob.getFilledShares(this.state.restingOrderId);
+    if (filledShares > 0) {
+      const t1 = this.state.tranches[0];
+      const fillPrice = t1.maxPriceCents; // filled at our resting price (maker!)
+      const costUsd = filledShares * (fillPrice / 100);
+
+      t1.filled = true;
+      t1.fillPriceCents = fillPrice;
+      t1.orderIds = [this.state.restingOrderId];
+      this.state.totalSharesFilled += filledShares;
+      this.state.totalCostUsd += costUsd;
+      this.state.allOrderIds.push(this.state.restingOrderId);
+      this.state.restingOrderId = null;
+
+      const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+      this.logger.info("T1 resting maker bid FILLED", {
+        side: loserSide,
+        price: `${fillPrice.toFixed(1)}¢ (maker)`,
+        shares: filledShares.toFixed(2),
+      });
+
+      this.checkAllTranchesDone(loserSide);
+    }
+  }
+
+  /**
+   * Cancel the resting T1 order (used before emergency fills).
+   */
+  private async cancelRestingOrder(): Promise<void> {
+    if (this.state?.restingOrderId) {
+      await this.clob.cancelOrder(this.state.restingOrderId);
+      this.state.restingOrderId = null;
     }
   }
 
@@ -420,6 +515,9 @@ export class ArbCompletionMonitor {
   private async emergencyFillRemaining(): Promise<void> {
     if (!this.state || this.state.phase === "done") return;
     this.state.phase = "emergency";
+
+    // Cancel any resting maker order before emergency fill
+    await this.cancelRestingOrder();
 
     const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
     const unfilled = this.state.tranches.filter((t) => !t.filled);

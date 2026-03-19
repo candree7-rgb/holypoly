@@ -14,6 +14,7 @@ import { RedeemService } from "./data/redeem.js";
 import { VolatilityCalculator } from "./signal/volatility.js";
 import { FairValueEngine } from "./signal/fair-value.js";
 import { EdgeDetector } from "./signal/edge-detector.js";
+import { WindowMemory } from "./signal/window-memory.js";
 import { ArbManager } from "./execution/arb-manager.js";
 import { ArbCompletionMonitor } from "./execution/arb-completion.js";
 import { WindowManager } from "./execution/window-manager.js";
@@ -97,7 +98,9 @@ const main = async () => {
 
   // Signal engine
   const volatilityCalc = new VolatilityCalculator(config.volatilityLookbackSeconds);
+  const windowMemory = new WindowMemory(logger);
   const fairValueEngine = new FairValueEngine(volatilityCalc);
+  fairValueEngine.setWindowMemory(windowMemory);
   const edgeDetector = new EdgeDetector(fairValueEngine, clob, config, logger, volatilityCalc);
 
   // Risk manager
@@ -241,6 +244,9 @@ const main = async () => {
 
     await riskManager.recordResult(totalPnl);
     await db.updateWindowSettlement(window.conditionId, totalPnl, winner);
+
+    // Record outcome for cross-window continuation bias
+    windowMemory.recordOutcome(winner, settlementPrice - window.openingPrice);
 
     const dailyStats = await riskManager.getDailyStats();
     telegram.alertSettlement(
