@@ -34,6 +34,12 @@ export interface OrderbookSnapshot {
   bids: OrderbookLevel[];
   bestAsk: number | null;
   bestBid: number | null;
+  /** Total bid depth (USDC) across all levels */
+  bidDepthUsd: number;
+  /** Total ask depth (USDC) across all levels */
+  askDepthUsd: number;
+  /** Bid/Ask imbalance ratio: >1 = more buy pressure, <1 = more sell pressure */
+  depthImbalance: number;
 }
 
 export class ClobService {
@@ -143,11 +149,18 @@ export class ClobService {
       size: parseFloat(b.size),
     })).sort((a: OrderbookLevel, b: OrderbookLevel) => b.price - a.price);
 
+    const bidDepthUsd = bids.reduce((sum, b) => sum + b.price * b.size, 0);
+    const askDepthUsd = asks.reduce((sum, a) => sum + a.price * a.size, 0);
+    const depthImbalance = askDepthUsd > 0 ? bidDepthUsd / askDepthUsd : bidDepthUsd > 0 ? 10 : 1;
+
     return {
       asks,
       bids,
       bestAsk: asks.length > 0 ? asks[0].price : null,
       bestBid: bids.length > 0 ? bids[0].price : null,
+      bidDepthUsd,
+      askDepthUsd,
+      depthImbalance,
     };
   }
 
@@ -211,15 +224,58 @@ export class ClobService {
   }
 
   /**
+   * Place a FOK (Fill or Kill) market order — fills immediately or not at all.
+   * Use for winner entry to prevent stale fills after edge evaporates.
+   */
+  async placeMarketOrderFOK(params: {
+    tokenId: string;
+    side: Side;
+    amount: number; // USD amount for BUY, shares for SELL
+    worstPrice?: number; // max price willing to pay (price protection)
+  }): Promise<{ filled: boolean; orderIds: string[] }> {
+    const meta = await this.getMarketMeta(params.tokenId);
+
+    try {
+      const resp = await this.client.createAndPostMarketOrder(
+        {
+          tokenID: params.tokenId,
+          side: params.side,
+          amount: params.amount,
+          ...(params.worstPrice ? { price: this.roundToTick(params.worstPrice, meta.tickSize, params.side) } : {}),
+        },
+        { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        OrderType.FOK,
+      );
+
+      const orderIds: string[] = [];
+      if (resp?.orderID) orderIds.push(resp.orderID);
+      const filled = !resp?.error && orderIds.length > 0;
+
+      this.logger.info("FOK order result", {
+        tokenId: params.tokenId.slice(0, 12) + "...",
+        side: params.side,
+        amount: params.amount,
+        filled,
+      });
+
+      return { filled, orderIds };
+    } catch (err) {
+      this.logger.warn("FOK order failed", { error: (err as Error).message });
+      return { filled: false, orderIds: [] };
+    }
+  }
+
+  /**
    * Place multiple limit orders in a single API call via POST /orders.
    * Signs all orders first, then posts them as one batch.
+   * @param orderType - GTC (default) for resting orders, FOK for immediate fill
    */
   async placeBatchOrders(orders: Array<{
     tokenId: string;
     side: Side;
     price: number;
     size: number;
-  }>): Promise<{ placed: number; failed: number; orderIds: string[] }> {
+  }>, orderType: OrderType = OrderType.GTC): Promise<{ placed: number; failed: number; orderIds: string[] }> {
     if (orders.length === 0) return { placed: 0, failed: 0, orderIds: [] };
 
     // Get meta for tick size rounding (cache hit after first call)
@@ -248,7 +304,7 @@ export class ClobService {
           { tokenID: order.tokenId, price, side: order.side, size: order.size },
           { tickSize: meta.tickSize, negRisk: meta.negRisk },
         );
-        signedArgs.push({ order: signed, orderType: OrderType.GTC });
+        signedArgs.push({ order: signed, orderType });
       } catch (err) {
         this.logger.warn("Order signing failed", {
           tokenId: order.tokenId,

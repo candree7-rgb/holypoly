@@ -142,6 +142,7 @@ const main = async () => {
     logger,
     telegram,
     volatilityCalc,
+    fairValueEngine,
   );
 
   // Auto-redeem service
@@ -351,8 +352,9 @@ const main = async () => {
           continue;
         }
 
-        // If arb completion monitor is active, let it do its thing
+        // If arb completion monitor is active, feed it updated BTC price
         if (arbCompletion.isActive) {
+          arbCompletion.updateBtcPrice(btcPrice, timeRemaining);
           await sleep(500); // faster polling during arb completion
           continue;
         }
@@ -395,39 +397,45 @@ const main = async () => {
           continue;
         }
 
-        logger.info("EDGE DETECTED — Entering winner side", {
+        logger.info("EDGE DETECTED — Entering winner side (FOK)", {
           side: decision.primarySide,
           edge: `${decision.bestEdge.toFixed(1)}¢`,
           fairUp: decision.fairUp,
           confidence: `${(decision.confidence * 100).toFixed(0)}%`,
+          depthConfirm: `${decision.depthConfirmation.toFixed(1)}x`,
           regime: decision.regime,
           orders: primaryOrders.length,
         });
 
-        // Place winner orders
+        // Place winner orders using FOK (Fill or Kill) — prevents stale fills
+        // FOK ensures we either fill NOW (while edge exists) or not at all
         let orderIds: string[] = [];
         let totalCost = 0;
         let totalShares = 0;
 
         if (!config.dryRun) {
-          const batchOrders = primaryOrders.map((o) => ({
-            tokenId: o.tokenId,
+          // Use FOK market order for immediate fill with price protection
+          const worstPrice = Math.max(...primaryOrders.map((o) => o.price)) / 100;
+          const totalAmount = primaryOrders.reduce((s, o) => s + o.amount, 0);
+
+          const fokResult = await clob.placeMarketOrderFOK({
+            tokenId: primaryOrders[0].tokenId,
             side: Side.BUY,
-            price: o.price / 100,
-            size: o.amount / (o.price / 100),
-          }));
+            amount: totalAmount,
+            worstPrice: worstPrice + 0.02, // 2¢ slippage tolerance
+          });
 
-          const result = await clob.placeBatchOrders(batchOrders);
-          orderIds = result.orderIds;
-          windowOrderIds.push(...orderIds);
-
-          if (result.placed === 0) {
-            logger.warn("Winner orders failed to place");
+          if (!fokResult.filled) {
+            // FOK failed — edge may have evaporated, which is GOOD (we avoided a bad fill)
+            logger.info("FOK not filled — edge may have been arbed away, skipping");
             await sleep(config.scanIntervalMs);
             continue;
           }
 
-          // Calculate actual cost
+          orderIds = fokResult.orderIds;
+          windowOrderIds.push(...orderIds);
+
+          // Calculate cost from orders
           for (const o of primaryOrders) {
             const shares = o.amount / (o.price / 100);
             totalShares += shares;
@@ -439,7 +447,7 @@ const main = async () => {
             totalShares += shares;
             totalCost += o.amount;
           }
-          logger.info("DRY_RUN — winner entry simulated", {
+          logger.info("DRY_RUN — winner entry simulated (FOK)", {
             side: decision.primarySide,
             orders: primaryOrders.map((o) => `${o.price.toFixed(1)}¢ × $${o.amount.toFixed(2)}`),
           });
@@ -476,6 +484,8 @@ const main = async () => {
           winnerShares: totalShares,
           loserTokenId,
           window,
+          currentBtcPrice: btcPrice,
+          timeRemainingSeconds: timeRemaining,
           onComplete: (side, shares, costUsd, loserOrderIds) => {
             arbManager.recordFill(side, shares, costUsd);
             windowOrderIds.push(...loserOrderIds);

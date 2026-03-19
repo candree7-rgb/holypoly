@@ -15,6 +15,8 @@ export interface TradeDecision {
   confidence: number;
   regime: VolatilityRegime;
   reason: string;
+  /** Orderbook depth imbalance signal (>1 = depth confirms our side) */
+  depthConfirmation: number;
 }
 
 /**
@@ -52,6 +54,7 @@ export class EdgeDetector {
       confidence: 0,
       regime: "normal",
       reason,
+      depthConfirmation: 1,
     });
 
     // Skip if too late (need time for order fills + settlement buffer)
@@ -140,11 +143,35 @@ export class EdgeDetector {
       return noTrade(`Primary ${edge.bestSide} too expensive (${primaryAskCents}¢ > ${this.config.maxEntryPriceCents}¢)`);
     }
 
-    // Scale position by edge strength AND confidence
-    const numPrimary = this.scalePrimaryOrders(edge.bestEdge, edge.confidence);
+    // === ORDERBOOK DEPTH CONFIRMATION ===
+    // If buying Up: we want primary (Up) ask side thin (easy to buy) + loser (Down) bid depth high
+    // Imbalance > 1 on primary = more buy pressure = confirms our direction
+    const primaryBook = edge.bestSide === "Up" ? upBook : downBook;
+    const depthConfirmation = primaryBook.depthImbalance;
+
+    // Boost confidence when depth confirms, reduce when depth contradicts
+    let depthAdjustedConfidence = edge.confidence;
+    if (depthConfirmation > 2.0) {
+      // Strong depth confirmation — boost confidence by up to 15%
+      depthAdjustedConfidence = Math.min(1, edge.confidence * 1.15);
+    } else if (depthConfirmation < 0.5) {
+      // Depth contradicts our side — reduce confidence by 20%
+      depthAdjustedConfidence = edge.confidence * 0.8;
+    }
+
+    this.logger.debug("Depth analysis", {
+      side: edge.bestSide,
+      bidDepth: `$${primaryBook.bidDepthUsd.toFixed(2)}`,
+      askDepth: `$${primaryBook.askDepthUsd.toFixed(2)}`,
+      imbalance: depthConfirmation.toFixed(2),
+      confidenceAdj: `${(edge.confidence * 100).toFixed(0)}% → ${(depthAdjustedConfidence * 100).toFixed(0)}%`,
+    });
+
+    // Scale position by edge strength AND depth-adjusted confidence
+    const numPrimary = this.scalePrimaryOrders(edge.bestEdge, depthAdjustedConfidence);
 
     // Scale buy amount by confidence (reduce exposure when data is thin)
-    const confidenceScaledAmount = buyAmountUsd * Math.max(0.5, edge.confidence);
+    const confidenceScaledAmount = buyAmountUsd * Math.max(0.5, depthAdjustedConfidence);
 
     // Hedge decision
     const shouldHedge = this.shouldHedge(edge.bestEdge, edge.regime);
@@ -171,9 +198,10 @@ export class EdgeDetector {
       primarySide: edge.bestSide,
       fairUp: edge.fairUp,
       bestEdge: edge.bestEdge,
-      confidence: edge.confidence,
+      confidence: depthAdjustedConfidence,
       regime: edge.regime,
-      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, conf=${(edge.confidence * 100).toFixed(0)}%, ${numPrimary}P${shouldHedge ? "+½H" : ""}, ${edge.regime} vol)`,
+      depthConfirmation,
+      reason: `Edge: ${edge.bestEdge.toFixed(1)}¢ on ${edge.bestSide} (fair=${edge.fairUp}¢, conf=${(depthAdjustedConfidence * 100).toFixed(0)}%, depth=${depthConfirmation.toFixed(1)}x, ${numPrimary}P${shouldHedge ? "+½H" : ""}, ${edge.regime} vol)`,
     };
   }
 
