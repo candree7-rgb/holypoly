@@ -214,8 +214,11 @@ export class ArbCompletionMonitor {
       if (pairCost + feeCents <= PHASE1_MAX_PAIR_CENTS) {
         this.state.fillInFlight = true;
         this.fillLoser(askCents, "profitable").catch((err) => {
-          this.logger.error("Profitable fill failed", { error: (err as Error).message });
-          if (this.state) this.state.fillInFlight = false;
+          this.logger.error("Profitable fill failed — will retry on next update", {
+            error: (err as Error).message,
+          });
+          // Release lock so next WS update or timer can retry
+          if (this.state && !this.state.filled) this.state.fillInFlight = false;
         });
       }
       return;
@@ -225,8 +228,10 @@ export class ArbCompletionMonitor {
     if (pairCost + feeCents <= PHASE2_MAX_PAIR_CENTS) {
       this.state.fillInFlight = true;
       this.fillLoser(askCents, "breakeven").catch((err) => {
-        this.logger.error("Break-even fill failed", { error: (err as Error).message });
-        if (this.state) this.state.fillInFlight = false;
+        this.logger.error("Break-even fill failed — will retry on next update", {
+          error: (err as Error).message,
+        });
+        if (this.state && !this.state.filled) this.state.fillInFlight = false;
       });
     }
     // If still too expensive in phase 2, wait — phase 3 (bail) will trigger on next tick

@@ -520,11 +520,26 @@ const main = async () => {
           orderIds = fokResult.orderIds;
           windowOrderIds.push(...orderIds);
 
-          // Calculate cost from orders
-          for (const o of primaryOrders) {
-            const shares = o.amount / (o.price / 100);
-            totalShares += shares;
-            totalCost += o.amount;
+          // Get ACTUAL fill prices from API (not order prices — FOK may fill at different price)
+          const fills = await clob.getOrderFills(orderIds, window.conditionId);
+          if (fills.length > 0) {
+            for (const f of fills) {
+              totalShares += f.sizeMatched;
+              totalCost += f.costFilled;
+            }
+            logger.info("FOK actual fills", {
+              fills: fills.map((f) => `${(f.price * 100).toFixed(1)}¢ × ${f.sizeMatched.toFixed(2)}`),
+              totalShares: totalShares.toFixed(2),
+              totalCost: `$${totalCost.toFixed(2)}`,
+            });
+          } else {
+            // Fallback to order prices if fill query fails
+            logger.warn("Could not get actual fill prices, using order prices as estimate");
+            for (const o of primaryOrders) {
+              const shares = o.amount / (o.price / 100);
+              totalShares += shares;
+              totalCost += o.amount;
+            }
           }
         } else {
           for (const o of primaryOrders) {
@@ -542,7 +557,8 @@ const main = async () => {
         arbManager.recordFill(decision.primarySide, totalShares, totalCost);
         arbManager.setEntryTime();
 
-        const avgEntry = primaryOrders.reduce((s, o) => s + o.price, 0) / primaryOrders.length;
+        // Weighted average entry price in cents (from actual cost & shares, not order prices)
+        const avgEntry = totalShares > 0 ? (totalCost / totalShares) * 100 : 0;
 
         // Record to database
         await db.recordWindow({

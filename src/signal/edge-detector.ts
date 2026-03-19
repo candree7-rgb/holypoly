@@ -247,7 +247,7 @@ export class EdgeDetector {
       base *= decay;
     }
 
-    return Math.max(3, base); // absolute floor: 3¢
+    return Math.max(5, base); // absolute floor: 5¢ (need margin for ~2% fees + slippage)
   }
 
   /**
