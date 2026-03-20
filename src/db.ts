@@ -117,6 +117,10 @@ export class Database {
       [date]
     );
     const row = result.rows[0];
+    if (!row) {
+      // Race condition or DB issue — return safe defaults
+      return { startingBalance: currentBalance, totalPnl: 0, windowsTraded: 0, wins: 0, losses: 0 };
+    }
     return {
       startingBalance: parseFloat(row.starting_balance),
       totalPnl: parseFloat(row.total_pnl),
@@ -151,6 +155,9 @@ export class Database {
       [week]
     );
     const row = result.rows[0];
+    if (!row) {
+      return { startingBalance: currentBalance, totalPnl: 0 };
+    }
     return {
       startingBalance: parseFloat(row.starting_balance),
       totalPnl: parseFloat(row.total_pnl),
