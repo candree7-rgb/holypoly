@@ -70,6 +70,9 @@ export class ArbCompletionMonitor {
   private binanceUnsubscribe: (() => void) | null = null;
   /** Generation counter — prevents stale async operations from modifying state after reset */
   private generation = 0;
+  /** Debounce timestamps for noisy log messages (prevents log spam from high-frequency ticks) */
+  private lastReversalLogAt = 0;
+  private lastFlippedLogAt = 0;
 
   constructor(
     private clobWs: ClobWsClient,
@@ -165,6 +168,8 @@ export class ArbCompletionMonitor {
 
   reset(): void {
     this.generation++; // Invalidate any in-flight async operations
+    this.lastReversalLogAt = 0;
+    this.lastFlippedLogAt = 0;
     if (this.binanceUnsubscribe) {
       this.binanceUnsubscribe();
       this.binanceUnsubscribe = null;
@@ -256,11 +261,16 @@ export class ArbCompletionMonitor {
         });
       } else {
         // Can't hedge — sell back only if we'd lose more than entry cost
-        this.logger.warn("DELTA FLIPPED — no cheap loser, holding naked (low entry cost)", {
-          entryDelta: `$${entryDelta.toFixed(2)}`,
-          currentDelta: `$${currentDelta.toFixed(2)}`,
-          entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
-        });
+        // Debounce: only log once every 5 seconds
+        const now = Date.now();
+        if (now - this.lastFlippedLogAt >= 5000) {
+          this.lastFlippedLogAt = now;
+          this.logger.warn("DELTA FLIPPED — no cheap loser, holding naked (low entry cost)", {
+            entryDelta: `$${entryDelta.toFixed(2)}`,
+            currentDelta: `$${currentDelta.toFixed(2)}`,
+            entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+          });
+        }
         // At 2¢ entry, max loss is 2¢/share — don't panic sell at 0.1¢
       }
       return;
@@ -311,11 +321,16 @@ export class ArbCompletionMonitor {
               if (this.state) this.state.fillInFlight = false;
             });
           } else {
-            this.logger.info("REVERSAL — delta dropped but still +EV, holding naked", {
-              dropPct: `${dropPct.toFixed(0)}%`,
-              winnerFairValue: `${winnerFairValue}¢`,
-              entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
-            });
+            // Debounce: only log once every 5 seconds (prevents spam from Binance tick handler)
+            const now = Date.now();
+            if (now - this.lastReversalLogAt >= 5000) {
+              this.lastReversalLogAt = now;
+              this.logger.info("REVERSAL — delta dropped but still +EV, holding naked", {
+                dropPct: `${dropPct.toFixed(0)}%`,
+                winnerFairValue: `${winnerFairValue}¢`,
+                entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+              });
+            }
           }
         }
       }

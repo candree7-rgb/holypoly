@@ -245,6 +245,172 @@ export class MarketDiscovery {
   }
 
   /**
+   * Query Polymarket for the actual resolution of a settled market.
+   * Returns the winning side ("Up" or "Down") or null if not yet resolved.
+   *
+   * This is THE authoritative source — Polymarket's own settlement data,
+   * not our calculation from external oracles.
+   */
+  async getMarketResolution(conditionId: string): Promise<{ winner: "Up" | "Down"; priceToBeat?: number } | null> {
+    // Try Gamma API first — it has resolution data for settled markets
+    try {
+      const gammaUrl = `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}&limit=1`;
+      const resp = await fetch(gammaUrl, {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-bot" },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as Array<{
+          conditionId: string;
+          outcomes: string;
+          outcomePrices: string;
+          clobTokenIds: string;
+          closed: boolean;
+          resolutionSource?: string;
+          priceToBeat?: string;
+          endPrice?: string;
+          startPrice?: string;
+        }>;
+        if (data.length > 0) {
+          const m = data[0];
+          // After resolution, winning outcome price → 1.0, losing → 0.0
+          const outcomes = JSON.parse(m.outcomes || "[]") as string[];
+          const prices = JSON.parse(m.outcomePrices || "[]") as string[];
+
+          // Check if market is resolved (one price is 1.0 or very close)
+          for (let i = 0; i < outcomes.length; i++) {
+            const price = parseFloat(prices[i] || "0");
+            if (price >= 0.95) {
+              const winner = (outcomes[i] === "Up" || outcomes[i] === "Down")
+                ? outcomes[i] as "Up" | "Down"
+                : null;
+              if (winner) {
+                const priceToBeat = m.priceToBeat ? parseFloat(m.priceToBeat) : undefined;
+                this.logger.info("Polymarket resolution found", {
+                  conditionId: conditionId.slice(0, 16) + "...",
+                  winner,
+                  winnerPrice: price,
+                  priceToBeat,
+                });
+                return { winner, priceToBeat };
+              }
+            }
+          }
+
+          // Market may be closed but prices not yet 1/0 — check if closed
+          if (m.closed) {
+            // If closed, look at which outcome has higher price
+            let bestIdx = 0;
+            let bestPrice = 0;
+            for (let i = 0; i < prices.length; i++) {
+              const p = parseFloat(prices[i] || "0");
+              if (p > bestPrice) {
+                bestPrice = p;
+                bestIdx = i;
+              }
+            }
+            if (bestPrice > 0.5) {
+              const winner = (outcomes[bestIdx] === "Up" || outcomes[bestIdx] === "Down")
+                ? outcomes[bestIdx] as "Up" | "Down"
+                : null;
+              if (winner) {
+                const priceToBeat = m.priceToBeat ? parseFloat(m.priceToBeat) : undefined;
+                this.logger.info("Polymarket resolution (closed market)", {
+                  conditionId: conditionId.slice(0, 16) + "...",
+                  winner,
+                  bestPrice,
+                  priceToBeat,
+                });
+                return { winner, priceToBeat };
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.debug("Failed to query Gamma for resolution", {
+        error: (err as Error).message,
+      });
+    }
+
+    // Fallback: try CLOB market endpoint
+    try {
+      const clobUrl = `${this.clobHost}/markets/${conditionId}`;
+      const resp = await fetch(clobUrl, {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-bot" },
+      });
+      if (resp.ok) {
+        const market = (await resp.json()) as {
+          condition_id: string;
+          tokens: Array<{ token_id: string; outcome: string; price: number; winner: boolean }>;
+          closed: boolean;
+        };
+        if (market.tokens) {
+          const winnerToken = market.tokens.find((t) => t.winner);
+          if (winnerToken && (winnerToken.outcome === "Up" || winnerToken.outcome === "Down")) {
+            this.logger.info("CLOB resolution found", {
+              conditionId: conditionId.slice(0, 16) + "...",
+              winner: winnerToken.outcome,
+            });
+            return { winner: winnerToken.outcome as "Up" | "Down" };
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.debug("Failed to query CLOB for resolution", {
+        error: (err as Error).message,
+      });
+    }
+
+    return null;
+  }
+
+  /**
+   * Get the "Price to Beat" (opening BTC price) for a specific market from Polymarket.
+   * This is the reference price that determines Up vs Down settlement.
+   */
+  async getPriceToBeat(conditionId: string): Promise<number | null> {
+    try {
+      const gammaUrl = `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}&limit=1`;
+      const resp = await fetch(gammaUrl, {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-bot" },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as Array<{
+          priceToBeat?: string;
+          startPrice?: string;
+          question?: string;
+        }>;
+        if (data.length > 0) {
+          const m = data[0];
+          // Try priceToBeat field first
+          if (m.priceToBeat) {
+            const price = parseFloat(m.priceToBeat);
+            if (price > 0) return price;
+          }
+          // Try startPrice field
+          if (m.startPrice) {
+            const price = parseFloat(m.startPrice);
+            if (price > 0) return price;
+          }
+          // Try parsing from question text (e.g., "Will BTC be above $87,654.32?")
+          if (m.question) {
+            const match = m.question.match(/\$?([\d,]+\.?\d*)/);
+            if (match) {
+              const price = parseFloat(match[1].replace(/,/g, ""));
+              if (price > 1000) return price; // sanity check for BTC price range
+            }
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.debug("Failed to query Price to Beat", {
+        error: (err as Error).message,
+      });
+    }
+    return null;
+  }
+
+  /**
    * Clear cached market (call when window ends).
    */
   clearCurrent(): void {

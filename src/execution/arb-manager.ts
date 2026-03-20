@@ -1,5 +1,6 @@
 import type { Logger } from "../logger.js";
 import type { TradeSide } from "../types.js";
+import { polymarketFee } from "../utils.js";
 
 /**
  * ArbManager: Tracks per-window position state for the hybrid strategy.
@@ -205,8 +206,10 @@ export class ArbManager {
     const downProportion = this.downShares > 0 ? balanced / this.downShares : 0;
     const balancedCost = this.upCostUsd * upProportion + this.downCostUsd * downProportion;
 
-    // Deduct 2% taker fee on both sides
-    const fees = balancedCost * 0.02;
+    // Use actual Polymarket fee formula instead of hardcoded 2%
+    const avgUpPrice = this.upShares > 0 ? this.upCostUsd / this.upShares : 0;
+    const avgDownPrice = this.downShares > 0 ? this.downCostUsd / this.downShares : 0;
+    const fees = polymarketFee(balanced, avgUpPrice) + polymarketFee(balanced, avgDownPrice);
 
     // Balanced pairs pay $1.00 per share at settlement
     return balanced - balancedCost - fees;

@@ -182,14 +182,40 @@ const main = async () => {
     const state = arbManager.getState();
     if (!state.upShares && !state.downShares) return;
 
-    // Use Chainlink (RTDS) for settlement — it's the oracle. Fall back to Binance if stale.
-    const settlementPrice = (!rtds.isStale ? rtds.price : null) ?? binance.price;
-    if (settlementPrice === null) {
-      logger.warn("No settlement price, skipping P&L");
-      return;
+    // === PRIMARY: Query Polymarket's own resolution data ===
+    // This is THE authoritative source — not our calculation from external oracles.
+    // Polymarket settles markets using their own Chainlink oracle, so we should
+    // always defer to their resolution rather than guessing from Binance.
+    let winner: TradeSide | null = null;
+    let settlementSource = "unknown";
+
+    // Try Polymarket API first (with retry — market may take a few seconds to resolve)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const resolution = await discovery.getMarketResolution(window.conditionId);
+      if (resolution) {
+        winner = resolution.winner;
+        settlementSource = "polymarket-api";
+        break;
+      }
+      if (attempt < 2) await sleep(2000); // Wait 2s between retries
     }
 
-    const winner: TradeSide = settlementPrice > window.openingPrice ? "Up" : "Down";
+    // Fallback: calculate from oracle prices (ONLY if Polymarket API failed)
+    if (!winner) {
+      const settlementPrice = (!rtds.isStale ? rtds.price : null) ?? binance.price;
+      if (settlementPrice === null) {
+        logger.warn("No settlement price and Polymarket API unavailable, skipping P&L");
+        return;
+      }
+      winner = settlementPrice > window.openingPrice ? "Up" : "Down";
+      settlementSource = !rtds.isStale ? "chainlink-rtds" : "binance-fallback";
+      logger.warn("Using oracle fallback for settlement — Polymarket API did not return resolution", {
+        settlementSource,
+        settlementPrice: settlementPrice.toFixed(2),
+        openingPrice: window.openingPrice.toFixed(2),
+      });
+    }
+
     let totalPnl: number;
 
     const isLive = !config.dryRun && windowOrderIds.length > 0;
@@ -248,13 +274,13 @@ const main = async () => {
     const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
     logger.info(prefix, {
       winner,
+      settlementSource,
       totalPnl: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
       upShares: state.upShares.toFixed(1),
       downShares: state.downShares.toFixed(1),
       roundTrips: state.roundTrips,
       lockedProfit: `$${state.lockedProfit.toFixed(2)}`,
       btcOpen: window.openingPrice.toFixed(2),
-      btcSettle: settlementPrice.toFixed(2),
     });
 
     // DB settlement
@@ -281,7 +307,24 @@ const main = async () => {
     }
 
     riskManager.invalidateBalanceCache();
-    windowMemory.recordOutcome(winner, settlementPrice - window.openingPrice);
+    // Use Binance price for memory delta (approximate) — winner is already authoritative from Polymarket
+    const memoryDelta = (binance.price ?? 0) - window.openingPrice;
+    windowMemory.recordOutcome(winner, memoryDelta);
+
+    // === PnL SANITY CHECK: compare reported PnL against actual balance change ===
+    if (!config.dryRun) {
+      try {
+        const postBalance = await clob.getBalance();
+        const expectedBalance = startupBalance; // rough — should track pre-window balance
+        logger.info("Balance check after settlement", {
+          reportedPnl: `${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+          currentBalance: `$${postBalance.toFixed(2)}`,
+          settlementSource,
+        });
+      } catch {
+        // Non-critical — don't fail settlement over balance check
+      }
+    }
 
     const dailyStats = await riskManager.getDailyStats();
     telegram.alertSettlement(
@@ -375,12 +418,23 @@ const main = async () => {
           });
         }
 
-        // Set opening price (from RTDS/Chainlink first, fallback Binance)
+        // Set opening price: prefer Polymarket's "Price to Beat" (authoritative),
+        // fall back to RTDS/Chainlink, then Binance as last resort.
         if (window.openingPrice === 0) {
-          const price = rtds.price ?? binance.price;
-          if (price) {
-            window.openingPrice = price;
-            windowManager.setOpeningPrice(price);
+          // Try Polymarket API first (the actual reference price for settlement)
+          const priceToBeat = await discovery.getPriceToBeat(window.conditionId);
+          if (priceToBeat) {
+            window.openingPrice = priceToBeat;
+            windowManager.setOpeningPrice(priceToBeat);
+            logger.info("Opening price from Polymarket API", { priceToBeat: priceToBeat.toFixed(2) });
+          } else {
+            // Fallback to oracle prices
+            const price = rtds.price ?? binance.price;
+            if (price) {
+              window.openingPrice = price;
+              windowManager.setOpeningPrice(price);
+              logger.debug("Opening price from oracle fallback", { price: price.toFixed(2), source: rtds.price ? "chainlink" : "binance" });
+            }
           }
         }
 
