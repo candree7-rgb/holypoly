@@ -27,7 +27,7 @@ import { lookupFairUp } from "../signal/lookup-table.js";
  * EV(naked @ 96%) = +6.0¢/share vs EV(hedge @ 5¢) = +5.0¢/share
  */
 
-export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack?: boolean) => void;
+export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack?: boolean, maker?: boolean) => void;
 
 /** How often to run safety checks (ms). Binance ticks are event-driven — this is the fallback. */
 const SAFETY_CHECK_INTERVAL_MS = 500;
@@ -543,12 +543,13 @@ export class ArbCompletionMonitor {
       return;
     }
 
-    // Use FOK to ensure immediate fill
-    const result = await this.clob.placeMarketOrderFOK({
+    // Try limit order first (maker = 0% fee), fallback to FOK after 1s
+    const result = await this.clob.placeLimitThenFOK({
       tokenId: this.state.loserTokenId,
       side: Side.BUY,
-      amount: costUsd,
-      worstPrice: priceDecimal + 0.02, // 2¢ slippage tolerance
+      price: priceDecimal + 0.01, // 1¢ above best ask to ensure priority
+      size: shares,
+      timeoutMs: 1000, // shorter timeout for hedge — speed matters
     });
 
     // Guard: state may have been reset while we awaited
@@ -559,9 +560,9 @@ export class ArbCompletionMonitor {
       this.state.totalSharesFilled = shares;
       this.state.totalCostUsd = costUsd;
       this.state.allOrderIds = result.orderIds;
-      this.complete(loserSide, shares, costUsd, result.orderIds);
+      this.complete(loserSide, shares, costUsd, result.orderIds, result.maker);
     } else {
-      this.logger.warn("Loser FOK failed — staying naked (still good EV)");
+      this.logger.warn("Loser limit+FOK failed — staying naked (still good EV)");
       this.state.fillInFlight = false;
     }
   }
@@ -666,11 +667,11 @@ export class ArbCompletionMonitor {
     this.completeInternal(loserSide, 0, 0, [], true);
   }
 
-  private complete(side: TradeSide, shares: number, costUsd: number, orderIds: string[]): void {
-    this.completeInternal(side, shares, costUsd, orderIds, false);
+  private complete(side: TradeSide, shares: number, costUsd: number, orderIds: string[], maker?: boolean): void {
+    this.completeInternal(side, shares, costUsd, orderIds, false, maker);
   }
 
-  private completeInternal(side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack: boolean): void {
+  private completeInternal(side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack: boolean, maker?: boolean): void {
     if (!this.state) return;
 
     this.state.active = false;
@@ -686,7 +687,7 @@ export class ArbCompletionMonitor {
     }
 
     if (this.onCompleteCallback) {
-      this.onCompleteCallback(side, shares, costUsd, orderIds, soldBack);
+      this.onCompleteCallback(side, shares, costUsd, orderIds, soldBack, maker);
     }
   }
 }

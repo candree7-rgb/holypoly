@@ -172,6 +172,8 @@ const main = async () => {
 
   // Track all order IDs per window for settlement
   let windowOrderIds: string[] = [];
+  /** Order IDs that were filled as maker (0% fee on Polymarket crypto) */
+  let makerOrderIds: Set<string> = new Set();
   let currentWindowInfo: WindowInfo | null = null;
 
   /**
@@ -223,12 +225,16 @@ const main = async () => {
       const fills = await clob.getOrderFills(windowOrderIds, window.conditionId);
       totalPnl = 0;
       let totalFees = 0;
+      let makerFills = 0;
       for (const fill of fills) {
         if (fill.sizeMatched <= 0) continue;
         const fillSide: TradeSide =
           fill.tokenId === window.upTokenId ? "Up" : "Down";
         const won = fillSide === winner;
-        const fee = polymarketFee(fill.sizeMatched, fill.price);
+        // Maker orders have 0% fee on Polymarket crypto markets
+        const isMaker = makerOrderIds.has(fill.orderID);
+        const fee = isMaker ? 0 : polymarketFee(fill.sizeMatched, fill.price);
+        if (isMaker) makerFills++;
         totalFees += fee;
         totalPnl += won
           ? (fill.sizeMatched - fill.costFilled - fee)
@@ -238,7 +244,12 @@ const main = async () => {
         logger.info("No fills this window, skipping settlement");
         return;
       }
-      logger.debug("Fee impact", { totalFees: `$${totalFees.toFixed(4)}` });
+      logger.debug("Fee impact", {
+        totalFees: `$${totalFees.toFixed(4)}`,
+        makerFills,
+        takerFills: fills.length - makerFills,
+        feeSaved: makerFills > 0 ? "yes (0% maker)" : "no",
+      });
     } else {
       // Dry run: calculate from arb state with correct fee formula
       totalPnl = 0;
@@ -403,6 +414,7 @@ const main = async () => {
           currentWindowId = window.conditionId;
           currentWindowInfo = window;
           windowOrderIds = [];
+          makerOrderIds = new Set();
           entriesThisWindow = 0;
           arbManager.reset(window.conditionId);
           arbCompletion.reset();
@@ -518,8 +530,8 @@ const main = async () => {
           continue;
         }
 
-        // === BUY WINNER SIDE (FOK) ===
-        logger.info("EDGE DETECTED — buying winner (FOK)", {
+        // === BUY WINNER SIDE (Limit → FOK fallback) ===
+        logger.info("EDGE DETECTED — buying winner", {
           side: decision.primarySide,
           edge: `${decision.bestEdge.toFixed(1)}¢`,
           fairUp: decision.fairUp,
@@ -528,29 +540,39 @@ const main = async () => {
           regime: decision.regime,
           timeLeft: `${timeRemaining.toFixed(0)}s`,
           amount: `$${decision.buyAmountUsd.toFixed(2)}`,
+          strategy: "limit-maker → FOK-fallback",
         });
 
         let orderIds: string[] = [];
         let totalCost = 0;
         let totalShares = 0;
-        const worstPrice = (decision.winnerAskCents + 1) / 100; // 1¢ slippage tolerance
+        let entryWasMaker = false;
+        const entryPrice = decision.winnerAskCents / 100;
+        const estimatedShares = decision.buyAmountUsd / entryPrice;
 
         if (!config.dryRun) {
-          const fokResult = await clob.placeMarketOrderFOK({
+          // Try limit order first (maker = 0% fee), fallback to FOK (taker) after 1.5s
+          const result = await clob.placeLimitThenFOK({
             tokenId: decision.winnerTokenId,
             side: Side.BUY,
-            amount: decision.buyAmountUsd,
-            worstPrice,
+            price: entryPrice,
+            size: estimatedShares,
+            timeoutMs: 1500,
           });
 
-          if (!fokResult.filled) {
-            logger.info("FOK not filled — edge evaporated, skipping");
+          if (!result.filled) {
+            logger.info("Order not filled — edge evaporated, skipping");
             await sleep(config.scanIntervalMs);
             continue;
           }
 
-          orderIds = fokResult.orderIds;
+          entryWasMaker = result.maker;
+          orderIds = result.orderIds;
           windowOrderIds.push(...orderIds);
+          // Track maker orders for 0% fee at settlement
+          if (entryWasMaker) {
+            for (const id of orderIds) makerOrderIds.add(id);
+          }
 
           // Get actual fill prices
           const fills = await clob.getOrderFills(orderIds, window.conditionId);
@@ -611,7 +633,7 @@ const main = async () => {
           window,
           currentBtcPrice: btcPrice,
           timeRemainingSeconds: timeRemaining,
-          onComplete: (side, shares, costUsd, loserOrderIds, soldBack) => {
+          onComplete: (side, shares, costUsd, loserOrderIds, soldBack, loserMaker) => {
             if (soldBack) {
               // Winner was sold back — clear it from arbManager
               arbManager.recordSellBack(decision.primarySide, totalShares);
@@ -623,6 +645,10 @@ const main = async () => {
             } else {
               arbManager.recordFill(side, shares, costUsd);
               windowOrderIds.push(...loserOrderIds);
+              // Track maker fills for 0% fee at settlement
+              if (loserMaker) {
+                for (const id of loserOrderIds) makerOrderIds.add(id);
+              }
 
               const state = arbManager.getState();
               if (shares > 0) {

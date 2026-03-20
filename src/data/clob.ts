@@ -224,8 +224,123 @@ export class ClobService {
   }
 
   /**
+   * Place a limit order (GTC, maker = 0% fee) and wait for fill.
+   * If not filled within timeoutMs, cancel and fallback to FOK (taker).
+   * Returns whether the fill was maker (0% fee) or taker.
+   */
+  async placeLimitThenFOK(params: {
+    tokenId: string;
+    side: Side;
+    price: number;
+    size: number;
+    timeoutMs?: number;
+  }): Promise<{ filled: boolean; orderIds: string[]; maker: boolean }> {
+    const timeoutMs = params.timeoutMs ?? 1500;
+    const meta = await this.getMarketMeta(params.tokenId);
+    const price = this.roundToTick(params.price, meta.tickSize, params.side);
+
+    if (params.size < meta.minOrderSize) {
+      this.logger.warn("Order size below minimum", {
+        tokenId: params.tokenId,
+        size: params.size,
+        min: meta.minOrderSize,
+      });
+      return { filled: false, orderIds: [], maker: false };
+    }
+
+    // Step 1: Place limit order (maker = 0% fee on Polymarket crypto markets)
+    let orderId: string | null = null;
+    try {
+      const resp = await this.client.createAndPostOrder(
+        {
+          tokenID: params.tokenId,
+          price,
+          side: params.side,
+          size: params.size,
+        },
+        { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        OrderType.GTC,
+      );
+      if (resp?.error) throw new Error(resp.error);
+      orderId = resp?.orderID ?? null;
+    } catch (err) {
+      this.logger.warn("Limit order placement failed, trying FOK", {
+        error: (err as Error).message,
+      });
+    }
+
+    if (!orderId) {
+      // Limit order failed — fallback to FOK immediately
+      const fokResult = await this.placeMarketOrderFOK({
+        tokenId: params.tokenId,
+        side: params.side,
+        amount: params.size * price,
+        worstPrice: price + 0.01,
+      });
+      return { ...fokResult, maker: false };
+    }
+
+    // Step 2: Poll for fill within timeout
+    const pollInterval = 300;
+    const maxPolls = Math.ceil(timeoutMs / pollInterval);
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise((r) => setTimeout(r, pollInterval));
+      try {
+        const filled = await this.getFilledShares(orderId);
+        if (filled >= params.size * 0.95) {
+          this.logger.info("Limit order filled (maker, 0% fee)", {
+            tokenId: params.tokenId.slice(0, 12) + "...",
+            price,
+            size: params.size,
+            filled,
+          });
+          return { filled: true, orderIds: [orderId], maker: true };
+        }
+      } catch {
+        // poll error, continue
+      }
+    }
+
+    // Step 3: Not filled — cancel limit order and fallback to FOK
+    this.logger.info("Limit order not filled, cancelling → FOK fallback", {
+      tokenId: params.tokenId.slice(0, 12) + "...",
+      timeoutMs,
+    });
+    await this.cancelOrder(orderId);
+
+    // Check if partially filled before FOK
+    let partialShares = 0;
+    try {
+      partialShares = await this.getFilledShares(orderId);
+    } catch {
+      // ignore
+    }
+
+    const remainingSize = params.size - partialShares;
+    if (remainingSize < meta.minOrderSize) {
+      // Mostly filled as maker — good enough
+      return { filled: partialShares > 0, orderIds: [orderId], maker: true };
+    }
+
+    // FOK for remaining unfilled portion
+    const fokResult = await this.placeMarketOrderFOK({
+      tokenId: params.tokenId,
+      side: params.side,
+      amount: remainingSize * price,
+      worstPrice: price + 0.01,
+    });
+
+    const allOrderIds = [orderId, ...fokResult.orderIds];
+    return {
+      filled: fokResult.filled || partialShares > 0,
+      orderIds: allOrderIds,
+      maker: false, // mixed or taker
+    };
+  }
+
+  /**
    * Place a FOK (Fill or Kill) market order — fills immediately or not at all.
-   * Use for winner entry to prevent stale fills after edge evaporates.
+   * Use as fallback when limit order doesn't fill, or for emergency exits.
    */
   async placeMarketOrderFOK(params: {
     tokenId: string;
