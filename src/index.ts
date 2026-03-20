@@ -418,23 +418,23 @@ const main = async () => {
           });
         }
 
-        // Set opening price: prefer Polymarket's "Price to Beat" (authoritative),
-        // fall back to RTDS/Chainlink, then Binance as last resort.
+        // Set opening price: ONLY from Polymarket's "Price to Beat" (authoritative).
+        // If Polymarket API doesn't provide it, we skip trading this window entirely.
+        // Using Binance/Chainlink as opening price caused wrong edge detection and losses.
         if (window.openingPrice === 0) {
-          // Try Polymarket API first (the actual reference price for settlement)
           const priceToBeat = await discovery.getPriceToBeat(window.conditionId);
           if (priceToBeat) {
             window.openingPrice = priceToBeat;
             windowManager.setOpeningPrice(priceToBeat);
             logger.info("Opening price from Polymarket API", { priceToBeat: priceToBeat.toFixed(2) });
           } else {
-            // Fallback to oracle prices
-            const price = rtds.price ?? binance.price;
-            if (price) {
-              window.openingPrice = price;
-              windowManager.setOpeningPrice(price);
-              logger.debug("Opening price from oracle fallback", { price: price.toFixed(2), source: rtds.price ? "chainlink" : "binance" });
-            }
+            // No authoritative opening price — log warning but do NOT trade
+            // (edge calculation would be based on wrong reference price)
+            logger.warn("No Price to Beat from Polymarket API — skipping trading this window", {
+              conditionId: window.conditionId.slice(0, 16) + "...",
+              binancePrice: binance.price?.toFixed(2) ?? "N/A",
+            });
+            // Don't set opening price → edge detector will reject with "No opening price yet"
           }
         }
 
