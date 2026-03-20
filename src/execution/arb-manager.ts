@@ -63,6 +63,24 @@ export class ArbManager {
     this.lastEntryTime = 0;
   }
 
+  /** Record a sell-back: we sold our winner position, remove it from state */
+  recordSellBack(side: TradeSide, shares: number): void {
+    if (side === "Up") {
+      const pricePer = this.upShares > 0 ? this.upCostUsd / this.upShares : 0;
+      this.upShares = Math.max(0, this.upShares - shares);
+      this.upCostUsd = this.upShares * pricePer;
+    } else {
+      const pricePer = this.downShares > 0 ? this.downCostUsd / this.downShares : 0;
+      this.downShares = Math.max(0, this.downShares - shares);
+      this.downCostUsd = this.downShares * pricePer;
+    }
+    this.logger.info("Sell-back recorded", {
+      side,
+      shares: shares.toFixed(2),
+      remaining: `Up=${this.upShares.toFixed(1)} Down=${this.downShares.toFixed(1)}`,
+    });
+  }
+
   /** Record a fill on one side */
   recordFill(side: TradeSide, shares: number, costUsd: number): void {
     if (side === "Up") {

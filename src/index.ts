@@ -20,8 +20,8 @@ import { ArbCompletionMonitor } from "./execution/arb-completion.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
-import { sleep, nowSec } from "./utils.js";
-import type { GridOrder, TradeSide, WindowInfo } from "./types.js";
+import { sleep, nowSec, polymarketFee } from "./utils.js";
+import type { TradeSide, WindowInfo } from "./types.js";
 
 const REDEEM_COOLDOWN_SEC = 600;
 const REDEEM_POLL_INTERVAL_MS = 30000;
@@ -50,32 +50,29 @@ const main = async () => {
   const db = new Database(config.databaseUrl, logger);
   await db.init();
 
-  // Telegram notifications
+  // Telegram
   const telegram = new TelegramNotifier(
     config.telegramBotToken,
     config.telegramChatId,
     logger,
   );
 
-  logger.info("=== HolyPoly Bot Starting (Edge → Wait → Arb Strategy) ===");
+  logger.info("=== HolyPoly Convergence Arb Bot Starting ===");
   logger.info("Mode", { dryRun: config.dryRun });
-  logger.info("Edge parameters", {
+  logger.info("Strategy", {
+    approach: "Naked-first + Binance reversal detection",
+    entryWindow: `${config.minEntryTimeRemaining}-${config.maxEntryTimeRemaining}s remaining`,
+    minDelta: `${config.minNormalizedDelta}σ`,
     edgeThreshold: `${config.edgeThresholdCents}¢`,
-    edgeTiers: `${config.edgeTier2Cents}/${config.edgeTier3Cents}/${config.edgeTier4Cents}¢`,
-    entryDelay: `${config.entryDelaySeconds}s`,
-    scanInterval: `${config.scanIntervalMs}ms`,
-  });
-  logger.info("Arb completion parameters", {
-    minProfit: `${config.minProfitCents}¢/pair`,
-    maxRoundTrips: config.maxRoundTripsPerWindow,
-    arbTimeout: `${(config.arbCompletionTimeoutMs / 1000).toFixed(0)}s`,
-    strategy: "wait for market adjustment, then fill loser side via DCA",
+    spikeFilter: `ratio > ${config.spikeRatioThreshold}`,
+    nakedSafe: `fairValue >= ${config.nakedSafetyThreshold}¢`,
+    reversalTrigger: `delta drop >= ${config.reversalDeltaDropPct}%`,
+    opportunisticLoser: `≤${config.opportunisticLoserMaxCents}¢`,
   });
   logger.info("Risk", {
     buyAmountPct: `${config.buyAmountPct}%`,
+    maxUnhedgedPct: `${config.maxUnhedgedPct}%`,
     dailyLossLimit: `${config.dailyLossLimitPct}%`,
-    weeklyLossLimit: `${config.weeklyLossLimitPct}%`,
-    maxWindowExposure: `${config.maxWindowExposurePct}%`,
   });
 
   // CLOB service
@@ -124,19 +121,19 @@ const main = async () => {
   const clobWs = new ClobWsClient(logger);
   clobWs.start();
 
-  // Arb manager (tracks position state per window)
+  // Arb manager
   const arbManager = new ArbManager(
     {
-      maxRoundTripsPerWindow: config.maxRoundTripsPerWindow,
+      maxRoundTripsPerWindow: config.maxBuysPerWindow,
       maxUnhedgedPct: config.maxUnhedgedPct,
       maxWindowExposurePct: config.maxWindowExposurePct,
-      minProfitCents: config.minProfitCents,
-      emergencyBalanceAfterMs: config.arbCompletionTimeoutMs,
+      minProfitCents: 1, // convergence: any profit is good
+      emergencyBalanceAfterMs: 60000,
     },
     logger,
   );
 
-  // Arb completion monitor (proactively seeks loser side)
+  // Arb completion monitor — now with Binance + RTDS for reversal detection
   const arbCompletion = new ArbCompletionMonitor(
     clobWs,
     clob,
@@ -146,6 +143,8 @@ const main = async () => {
     telegram,
     volatilityCalc,
     fairValueEngine,
+    binance,
+    rtds,
   );
 
   // Auto-redeem service
@@ -165,7 +164,7 @@ const main = async () => {
       )
     : null;
 
-  // Send startup alert
+  // Startup alert
   const startupBalance = await clob.getBalance();
   telegram.alertStartup(config.dryRun, startupBalance, config.buyAmountPct);
 
@@ -175,12 +174,14 @@ const main = async () => {
 
   /**
    * Settle the window: calculate P&L from all positions.
+   * Uses correct Polymarket crypto fee formula (NOT flat 2%).
    */
   const settleWindow = async (window: WindowInfo) => {
     const state = arbManager.getState();
     if (!state.upShares && !state.downShares) return;
 
-    const settlementPrice = rtds.price ?? binance.price;
+    // Use Chainlink (RTDS) for settlement — it's the oracle. Fall back to Binance if stale.
+    const settlementPrice = (!rtds.isStale ? rtds.price : null) ?? binance.price;
     if (settlementPrice === null) {
       logger.warn("No settlement price, skipping P&L");
       return;
@@ -188,9 +189,6 @@ const main = async () => {
 
     const winner: TradeSide = settlementPrice > window.openingPrice ? "Up" : "Down";
     let totalPnl: number;
-
-    // Polymarket taker fee: 2% per fill
-    const TAKER_FEE_PCT = 0.02;
 
     const isLive = !config.dryRun && windowOrderIds.length > 0;
     if (isLive) {
@@ -202,7 +200,7 @@ const main = async () => {
         const fillSide: TradeSide =
           fill.tokenId === window.upTokenId ? "Up" : "Down";
         const won = fillSide === winner;
-        const fee = fill.costFilled * TAKER_FEE_PCT;
+        const fee = polymarketFee(fill.sizeMatched, fill.price);
         totalFees += fee;
         totalPnl += won
           ? (fill.sizeMatched - fill.costFilled - fee)
@@ -214,18 +212,18 @@ const main = async () => {
       }
       logger.debug("Fee impact", { totalFees: `$${totalFees.toFixed(4)}` });
     } else {
-      // Dry run: calculate from arb state (with fee deduction)
+      // Dry run: calculate from arb state with correct fee formula
       totalPnl = 0;
-      const totalCost = state.upCostUsd + state.downCostUsd;
-      const totalFees = totalCost * TAKER_FEE_PCT;
       const balanced = Math.min(state.upShares, state.downShares);
       if (balanced > 0) {
-        // Balanced pairs: guaranteed $1.00 payout minus cost and fees
         const upProp = state.upShares > 0 ? balanced / state.upShares : 0;
         const downProp = state.downShares > 0 ? balanced / state.downShares : 0;
         const balancedCost = state.upCostUsd * upProp + state.downCostUsd * downProp;
-        const balancedFees = balancedCost * TAKER_FEE_PCT;
-        totalPnl += balanced - balancedCost - balancedFees;
+        const avgUpPrice = state.upShares > 0 ? state.upCostUsd / state.upShares : 0;
+        const avgDownPrice = state.downShares > 0 ? state.downCostUsd / state.downShares : 0;
+        const upFee = polymarketFee(balanced, avgUpPrice);
+        const downFee = polymarketFee(balanced, avgDownPrice);
+        totalPnl += balanced - balancedCost - upFee - downFee;
       }
       // Unhedged portion
       const unhedged = Math.abs(state.upShares - state.downShares);
@@ -235,12 +233,14 @@ const main = async () => {
         const unhedgedCost = unhedgedSide === "Up"
           ? state.upCostUsd * (unhedged / state.upShares)
           : state.downCostUsd * (unhedged / state.downShares);
-        const unhedgedFees = unhedgedCost * TAKER_FEE_PCT;
+        const avgPrice = unhedgedSide === "Up"
+          ? state.upCostUsd / state.upShares
+          : state.downCostUsd / state.downShares;
+        const fee = polymarketFee(unhedged, avgPrice);
         totalPnl += unhedgedWon
-          ? (unhedged - unhedgedCost - unhedgedFees)
-          : -(unhedgedCost + unhedgedFees);
+          ? (unhedged - unhedgedCost - fee)
+          : -(unhedgedCost + fee);
       }
-      logger.debug("Fee impact (dry run)", { totalFees: `$${totalFees.toFixed(4)}` });
     }
 
     const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
@@ -255,7 +255,7 @@ const main = async () => {
       btcSettle: settlementPrice.toFixed(2),
     });
 
-    // Atomic settlement: all DB writes in one transaction
+    // DB settlement
     const won = totalPnl >= 0;
     const today = new Date();
     const dailyDate = `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, "0")}-${String(today.getUTCDate()).padStart(2, "0")}`;
@@ -273,16 +273,12 @@ const main = async () => {
         won,
       });
     } catch {
-      // Fallback to non-atomic if transaction fails
       logger.warn("Atomic settlement failed, using fallback");
       await riskManager.recordResult(totalPnl);
       await db.updateWindowSettlement(window.conditionId, totalPnl, winner);
     }
 
-    // Invalidate balance cache after settlement
     riskManager.invalidateBalanceCache();
-
-    // Record outcome for cross-window continuation bias
     windowMemory.recordOutcome(winner, settlementPrice - window.openingPrice);
 
     const dailyStats = await riskManager.getDailyStats();
@@ -302,17 +298,14 @@ const main = async () => {
 
   const checkCircuitBreaker = (): boolean => {
     const now = Date.now();
-    if (now < circuitBreakerUntil) return true; // still paused
+    if (now < circuitBreakerUntil) return true;
 
-    // Only pause on truly extreme flash crashes (>$500 5-min move)
-    // High volatility ($100-300) is GOOD — it creates the mispricings we profit from.
     const vol = volatilityCalc.getVolatility();
     if (vol > 500) {
-      const pauseMs = 60000; // 1 minute pause (shorter — we want back in fast)
+      const pauseMs = 60000;
       circuitBreakerUntil = now + pauseMs;
-      logger.warn("CIRCUIT BREAKER — extreme flash crash, brief pause", {
+      logger.warn("CIRCUIT BREAKER — extreme flash crash", {
         volatility: `$${vol.toFixed(1)}`,
-        threshold: "$500",
         pauseSeconds: 60,
       });
       telegram.alertCircuitBreaker(`Flash crash: $${vol.toFixed(0)} vol. Pausing 1 min.`);
@@ -321,10 +314,11 @@ const main = async () => {
     return false;
   };
 
-  // === MAIN HYBRID LOOP ===
-  const hybridLoop = async () => {
+  // === MAIN CONVERGENCE ARB LOOP ===
+  const mainLoop = async () => {
     let lastStatusLog = 0;
     let currentWindowId: string | null = null;
+    let entriesThisWindow = 0;
 
     while (true) {
       try {
@@ -333,17 +327,14 @@ const main = async () => {
         // Status log every 5 minutes
         if (now - lastStatusLog >= 300000) {
           await riskManager.logStatus();
-          const state = arbManager.getState();
           logger.info("Status", {
             binance: binance.connected,
             btcPrice: binance.price?.toFixed(2) ?? "N/A",
             chainlink: rtds.connected,
+            chainlinkStale: rtds.isStale,
             clobWs: clobWs.connected,
             volatility: `$${volatilityCalc.getVolatility().toFixed(1)}`,
             regime: volatilityCalc.getRegime(),
-            arbState: state.roundTrips > 0 || state.upShares > 0
-              ? `${state.roundTrips}RT, Up=${state.upShares.toFixed(0)} Down=${state.downShares.toFixed(0)}`
-              : "idle",
           });
           lastStatusLog = now;
         }
@@ -367,10 +358,11 @@ const main = async () => {
           currentWindowId = window.conditionId;
           currentWindowInfo = window;
           windowOrderIds = [];
+          entriesThisWindow = 0;
           arbManager.reset(window.conditionId);
           arbCompletion.reset();
 
-          // Subscribe CLOB WS to new window
+          // Subscribe CLOB WS to new window tokens
           clobWs.clear();
           clobWs.subscribe([window.upTokenId, window.downTokenId]);
 
@@ -381,7 +373,7 @@ const main = async () => {
           });
         }
 
-        // Set opening price
+        // Set opening price (from RTDS/Chainlink first, fallback Binance)
         if (window.openingPrice === 0) {
           const price = rtds.price ?? binance.price;
           if (price) {
@@ -390,66 +382,60 @@ const main = async () => {
           }
         }
 
-        // Wait for entry delay
-        const windowElapsedSec = (now - window.startTime) / 1000;
-        if (windowElapsedSec < config.entryDelaySeconds) {
-          await sleep(config.scanIntervalMs);
-          continue;
-        }
-
+        // Calculate time remaining
         const timeRemaining = (window.endTime - now) / 1000;
 
-        // Don't start new entries with < 30s remaining
-        if (timeRemaining < 30) {
-          // But check if we need forced settlement
-          if (now >= window.endTime && currentWindowInfo) {
-            arbCompletion.reset();
-            await settleWindow(currentWindowInfo);
-            currentWindowId = null;
-            currentWindowInfo = null;
-          }
+        // Handle window end
+        if (now >= window.endTime && currentWindowInfo) {
+          arbCompletion.reset();
+          await settleWindow(currentWindowInfo);
+          currentWindowId = null;
+          currentWindowInfo = null;
           await sleep(config.scanIntervalMs);
           continue;
         }
 
-        // Need Binance price
+        // Need opening price and Binance price for everything
+        if (window.openingPrice === 0) {
+          await sleep(config.scanIntervalMs);
+          continue;
+        }
+
         const btcPrice = binance.price;
         if (!btcPrice) {
           await sleep(config.scanIntervalMs);
           continue;
         }
 
-        // Circuit breaker: pause on extreme volatility
+        // Circuit breaker
         if (checkCircuitBreaker()) {
           await sleep(config.scanIntervalMs);
           continue;
         }
 
-        // If arb completion monitor is active, feed it updated BTC price
+        // If arb completion is monitoring a position, feed it updates
         if (arbCompletion.isActive) {
           arbCompletion.updateBtcPrice(btcPrice, timeRemaining);
-          await sleep(500); // faster polling during arb completion
+          await sleep(config.scanIntervalMs);
+          continue;
+        }
+
+        // Max entries per window
+        if (entriesThisWindow >= config.maxBuysPerWindow) {
+          await sleep(config.scanIntervalMs);
           continue;
         }
 
         // Check if ArbManager allows new entry
         const balance = await riskManager.getBalance();
 
-        // Check unhedged exposure limit
         if (arbManager.isOverExposed(balance)) {
-          const state = arbManager.getState();
-          logger.warn("Over-exposed — blocking new trades", {
-            unhedgedShares: state.unhedgedShares.toFixed(1),
-            unhedgedSide: state.unhedgedSide,
-            maxUnhedgedPct: `${config.maxUnhedgedPct}%`,
-          });
           await sleep(config.scanIntervalMs);
           continue;
         }
 
         const arbCheck = arbManager.canEnterNewTrade(balance);
         if (!arbCheck.allowed) {
-          logger.debug("Arb manager blocked", { reason: arbCheck.reason });
           await sleep(config.scanIntervalMs);
           continue;
         }
@@ -462,7 +448,7 @@ const main = async () => {
           continue;
         }
 
-        // *** CORE: Evaluate edge ***
+        // *** CORE: Evaluate edge for convergence entry ***
         const decision = await edgeDetector.evaluate(
           window,
           btcPrice,
@@ -476,44 +462,33 @@ const main = async () => {
           continue;
         }
 
-        // === STEP 1: BUY WINNER SIDE ===
-        const primaryOrders = decision.orders.filter((o) => o.side === decision.primarySide);
-        if (primaryOrders.length === 0) {
-          await sleep(config.scanIntervalMs);
-          continue;
-        }
-
-        logger.info("EDGE DETECTED — Entering winner side (FOK)", {
+        // === BUY WINNER SIDE (FOK) ===
+        logger.info("EDGE DETECTED — buying winner (FOK)", {
           side: decision.primarySide,
           edge: `${decision.bestEdge.toFixed(1)}¢`,
           fairUp: decision.fairUp,
+          delta: `${decision.normalizedDelta.toFixed(2)}σ`,
           confidence: `${(decision.confidence * 100).toFixed(0)}%`,
-          depthConfirm: `${decision.depthConfirmation.toFixed(1)}x`,
           regime: decision.regime,
-          orders: primaryOrders.length,
+          timeLeft: `${timeRemaining.toFixed(0)}s`,
+          amount: `$${decision.buyAmountUsd.toFixed(2)}`,
         });
 
-        // Place winner orders using FOK (Fill or Kill) — prevents stale fills
-        // FOK ensures we either fill NOW (while edge exists) or not at all
         let orderIds: string[] = [];
         let totalCost = 0;
         let totalShares = 0;
+        const worstPrice = (decision.winnerAskCents + 1) / 100; // 1¢ slippage tolerance
 
         if (!config.dryRun) {
-          // Use FOK market order for immediate fill with price protection
-          const worstPrice = Math.max(...primaryOrders.map((o) => o.price)) / 100;
-          const totalAmount = primaryOrders.reduce((s, o) => s + o.amount, 0);
-
           const fokResult = await clob.placeMarketOrderFOK({
-            tokenId: primaryOrders[0].tokenId,
+            tokenId: decision.winnerTokenId,
             side: Side.BUY,
-            amount: totalAmount,
-            worstPrice: worstPrice + 0.02, // 2¢ slippage tolerance
+            amount: decision.buyAmountUsd,
+            worstPrice,
           });
 
           if (!fokResult.filled) {
-            // FOK failed — edge may have evaporated, which is GOOD (we avoided a bad fill)
-            logger.info("FOK not filled — edge may have been arbed away, skipping");
+            logger.info("FOK not filled — edge evaporated, skipping");
             await sleep(config.scanIntervalMs);
             continue;
           }
@@ -521,44 +496,34 @@ const main = async () => {
           orderIds = fokResult.orderIds;
           windowOrderIds.push(...orderIds);
 
-          // Get ACTUAL fill prices from API (not order prices — FOK may fill at different price)
+          // Get actual fill prices
           const fills = await clob.getOrderFills(orderIds, window.conditionId);
           if (fills.length > 0) {
             for (const f of fills) {
               totalShares += f.sizeMatched;
               totalCost += f.costFilled;
             }
-            logger.info("FOK actual fills", {
-              fills: fills.map((f) => `${(f.price * 100).toFixed(1)}¢ × ${f.sizeMatched.toFixed(2)}`),
-              totalShares: totalShares.toFixed(2),
-              totalCost: `$${totalCost.toFixed(2)}`,
-            });
           } else {
-            // Fallback to order prices if fill query fails
-            logger.warn("Could not get actual fill prices, using order prices as estimate");
-            for (const o of primaryOrders) {
-              const shares = o.amount / (o.price / 100);
-              totalShares += shares;
-              totalCost += o.amount;
-            }
+            // Fallback to estimated prices
+            totalShares = decision.buyAmountUsd / (decision.winnerAskCents / 100);
+            totalCost = decision.buyAmountUsd;
           }
         } else {
-          for (const o of primaryOrders) {
-            const shares = o.amount / (o.price / 100);
-            totalShares += shares;
-            totalCost += o.amount;
-          }
-          logger.info("DRY_RUN — winner entry simulated (FOK)", {
+          totalShares = decision.buyAmountUsd / (decision.winnerAskCents / 100);
+          totalCost = decision.buyAmountUsd;
+          logger.info("DRY_RUN — winner entry simulated", {
             side: decision.primarySide,
-            orders: primaryOrders.map((o) => `${o.price.toFixed(1)}¢ × $${o.amount.toFixed(2)}`),
+            price: `${decision.winnerAskCents}¢`,
+            shares: totalShares.toFixed(2),
+            cost: `$${totalCost.toFixed(2)}`,
           });
         }
 
-        // Record fill in arb manager
+        // Record fill
         arbManager.recordFill(decision.primarySide, totalShares, totalCost);
         arbManager.setEntryTime();
+        entriesThisWindow++;
 
-        // Weighted average entry price in cents (from actual cost & shares, not order prices)
         const avgEntry = totalShares > 0 ? (totalCost / totalShares) * 100 : 0;
 
         // Record to database
@@ -567,63 +532,75 @@ const main = async () => {
           conditionId: window.conditionId,
           traded: true,
           primarySide: decision.primarySide,
-          orders: primaryOrders,
-          fillCount: primaryOrders.length,
+          orders: [{
+            side: decision.primarySide,
+            tokenId: decision.winnerTokenId,
+            price: avgEntry,
+            amount: totalCost,
+          }],
+          fillCount: 1,
           pnl: null,
           winner: null,
           balanceBefore: balance,
           balanceAfter: null,
         });
 
-        // === STEP 2: START ARB COMPLETION — seek loser side ===
-        const winnerTokenId = decision.primarySide === "Up"
-          ? window.upTokenId
-          : window.downTokenId;
-        const loserTokenId = decision.primarySide === "Up"
-          ? window.downTokenId
-          : window.upTokenId;
-
+        // === START CONVERGENCE MONITORING ===
         arbCompletion.startSeeking({
           winnerSide: decision.primarySide,
           winnerAvgPriceCents: avgEntry,
           winnerShares: totalShares,
-          winnerTokenId,
-          loserTokenId,
+          winnerTokenId: decision.winnerTokenId,
+          loserTokenId: decision.loserTokenId,
           window,
           currentBtcPrice: btcPrice,
           timeRemainingSeconds: timeRemaining,
-          onComplete: (side, shares, costUsd, loserOrderIds) => {
-            arbManager.recordFill(side, shares, costUsd);
-            windowOrderIds.push(...loserOrderIds);
+          onComplete: (side, shares, costUsd, loserOrderIds, soldBack) => {
+            if (soldBack) {
+              // Winner was sold back — clear it from arbManager
+              arbManager.recordSellBack(decision.primarySide, totalShares);
+              windowOrderIds.push(...loserOrderIds);
+              logger.info("Arb completion — SELL-BACK executed", {
+                soldSide: decision.primarySide,
+                shares: totalShares.toFixed(2),
+              });
+            } else {
+              arbManager.recordFill(side, shares, costUsd);
+              windowOrderIds.push(...loserOrderIds);
 
-            const state = arbManager.getState();
-            const avgLoserCents = shares > 0 ? (costUsd / shares) * 100 : 0;
-            const totalPairCostCents = shares > 0 ? avgEntry + avgLoserCents : 0;
-            logger.info("Arb completion filled", {
-              side,
-              shares: shares.toFixed(2),
-              cost: `$${costUsd.toFixed(2)}`,
-              totalPairCost: shares > 0 ? `${totalPairCostCents.toFixed(1)}¢` : "N/A (no fills)",
-              lockedProfit: `$${state.lockedProfit.toFixed(2)}`,
-              roundTrips: state.roundTrips,
-            });
+              const state = arbManager.getState();
+              if (shares > 0) {
+                const avgLoserCents = (costUsd / shares) * 100;
+                logger.info("Arb completion — loser filled (hedged)", {
+                  side,
+                  shares: shares.toFixed(2),
+                  cost: `$${costUsd.toFixed(2)}`,
+                  pairCost: `${(avgEntry + avgLoserCents).toFixed(1)}¢`,
+                  lockedProfit: `$${state.lockedProfit.toFixed(2)}`,
+                });
+              } else {
+                logger.info("Arb completion — naked hold to settlement", {
+                  upShares: state.upShares.toFixed(1),
+                  downShares: state.downShares.toFixed(1),
+                });
+              }
+            }
 
             telegram.alertEdgeEntry(
-              `${decision.primarySide}+${side} ARB`,
+              `${decision.primarySide} CONVERGENCE`,
               decision.bestEdge,
               decision.fairUp,
               decision.regime,
               decision.confidence,
               totalCost + costUsd,
-              primaryOrders.length + 1,
+              shares > 0 ? 2 : 1,
             );
           },
         });
 
-        // Brief wait before next scan (let arb completion work)
         await sleep(1000);
       } catch (err) {
-        logger.error("Hybrid loop error", { error: (err as Error).message });
+        logger.error("Main loop error", { error: (err as Error).message });
         telegram.alertError((err as Error).message);
       }
 
@@ -674,7 +651,7 @@ const main = async () => {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  await Promise.all([hybridLoop(), redeemLoop()]);
+  await Promise.all([mainLoop(), redeemLoop()]);
 };
 
 main().catch((err) => {

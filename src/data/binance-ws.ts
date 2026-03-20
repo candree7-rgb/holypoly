@@ -37,6 +37,11 @@ export class BinanceWsClient {
     this.onTickCallbacks.push(cb);
   }
 
+  offTick(cb: (tick: BinanceTick) => void): void {
+    const idx = this.onTickCallbacks.indexOf(cb);
+    if (idx >= 0) this.onTickCallbacks.splice(idx, 1);
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
