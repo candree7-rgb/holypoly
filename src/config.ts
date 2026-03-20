@@ -68,6 +68,11 @@ export interface Config {
   /** Max spread (cents) for emergency sell-back: sell at bestBid */
   emergencySellMaxSpreadCents: number;
 
+  /** Max acceptable loss per share (cents) when hedging defensively.
+   *  maxLoserPrice = (100 - entryPrice) + maxAcceptableLossCents
+   *  E.g. entry 85¢, maxLoss 25¢ → buy loser up to 40¢ → loss capped at 25¢/sh */
+  maxAcceptableLossCents: number;
+
   // Opportunistic loser fill
   /** Buy loser if it drops to <= this price (cents). Ultra-cheap = free hedge */
   opportunisticLoserMaxCents: number;
@@ -214,6 +219,7 @@ export const loadConfig = (): Config => {
   const nakedSafetyThreshold = parseNumber("NAKED_SAFETY_THRESHOLD", 95);
   const reversalDeltaDropPct = parseNumber("REVERSAL_DELTA_DROP_PCT", 30);
   const emergencySellMaxSpreadCents = parseNumber("EMERGENCY_SELL_MAX_SPREAD_CENTS", 3);
+  const maxAcceptableLossCents = parseNumber("MAX_ACCEPTABLE_LOSS_CENTS", 25);
 
   // Opportunistic loser fill
   const opportunisticLoserMaxCents = parseNumber("OPPORTUNISTIC_LOSER_MAX_CENTS", 3);
@@ -294,6 +300,7 @@ export const loadConfig = (): Config => {
     nakedSafetyThreshold,
     reversalDeltaDropPct,
     emergencySellMaxSpreadCents,
+    maxAcceptableLossCents,
     opportunisticLoserMaxCents,
     maxUnhedgedPct,
     maxWindowExposurePct,
