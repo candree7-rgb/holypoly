@@ -24,6 +24,8 @@ interface ClobMarket {
   neg_risk: boolean;
   minimum_order_size: number;
   minimum_tick_size: number;
+  /** BTC "price to beat" extracted from Gamma API or question text */
+  price_to_beat?: number;
   tokens: Array<{
     token_id: string;
     outcome: string;
@@ -93,7 +95,7 @@ export class MarketDiscovery {
           conditionId: market.condition_id,
           upTokenId: upToken.token_id,
           downTokenId: downToken.token_id,
-          openingPrice: 0, // Set from Chainlink at window start
+          openingPrice: market.price_to_beat ?? 0, // From Gamma API if available
           startTime: startMs,
           endTime: endMs,
           negRisk: market.neg_risk,
@@ -141,6 +143,9 @@ export class MarketDiscovery {
           active: boolean;
           closed: boolean;
           negRisk: boolean;
+          question?: string;
+          priceToBeat?: string;
+          startPrice?: string;
         }>;
         if (data.length > 0) {
           const m = data[0];
@@ -156,10 +161,37 @@ export class MarketDiscovery {
             ? new Date(m.endDate).getTime()
             : startMs + windowSizeSec * 1000;
 
+          // Extract price to beat from Gamma API response
+          let priceToBeat: number | undefined;
+          if (m.priceToBeat) {
+            const p = parseFloat(m.priceToBeat);
+            if (p > 1000) priceToBeat = p;
+          }
+          if (!priceToBeat && m.startPrice) {
+            const p = parseFloat(m.startPrice);
+            if (p > 1000) priceToBeat = p;
+          }
+          if (!priceToBeat && m.question) {
+            const match = m.question.match(/\$?([\d,]+\.?\d*)/);
+            if (match) {
+              const p = parseFloat(match[1].replace(/,/g, ""));
+              if (p > 1000) priceToBeat = p;
+            }
+          }
+
+          if (priceToBeat) {
+            this.logger.info("Price to Beat from Gamma discovery", {
+              slug,
+              priceToBeat: priceToBeat.toFixed(2),
+              source: m.priceToBeat ? "priceToBeat" : m.startPrice ? "startPrice" : "question",
+            });
+          }
+
           return {
             condition_id: m.conditionId,
-            question: "",
+            question: m.question || "",
             market_slug: slug,
+            price_to_beat: priceToBeat,
             end_date_iso: m.endDate || m.endDateIso,
             start_time_ms: startMs,
             end_time_ms: endMs,

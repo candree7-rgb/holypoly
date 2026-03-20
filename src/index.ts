@@ -430,23 +430,34 @@ const main = async () => {
           });
         }
 
-        // Set opening price: ONLY from Polymarket's "Price to Beat" (authoritative).
-        // If Polymarket API doesn't provide it, we skip trading this window entirely.
-        // Using Binance/Chainlink as opening price caused wrong edge detection and losses.
+        // Set opening price for the window.
+        // Polymarket settles these markets using Chainlink BTC/USD at window start.
+        // The Gamma API does NOT provide a "priceToBeat" field for active markets —
+        // it only exists after settlement. So we use:
+        // 1. Gamma API price_to_beat (if somehow available — e.g. from market discovery)
+        // 2. Binance BTCUSDT price at window start (best real-time proxy for Chainlink)
+        //
+        // Chainlink aggregates from major exchanges including Binance, so Binance
+        // price at window start is typically within $1-5 of the Chainlink settlement price.
         if (window.openingPrice === 0) {
+          // First try: Gamma API may have returned priceToBeat during discovery
           const priceToBeat = await discovery.getPriceToBeat(window.conditionId);
           if (priceToBeat) {
             window.openingPrice = priceToBeat;
             windowManager.setOpeningPrice(priceToBeat);
             logger.info("Opening price from Polymarket API", { priceToBeat: priceToBeat.toFixed(2) });
-          } else {
-            // No authoritative opening price — log warning but do NOT trade
-            // (edge calculation would be based on wrong reference price)
-            logger.warn("No Price to Beat from Polymarket API — skipping trading this window", {
-              conditionId: window.conditionId.slice(0, 16) + "...",
-              binancePrice: binance.price?.toFixed(2) ?? "N/A",
+          } else if (binance.price && binance.price > 1000) {
+            // Fallback: Binance price at first scan of window ≈ Chainlink opening price
+            window.openingPrice = binance.price;
+            windowManager.setOpeningPrice(binance.price);
+            logger.info("Opening price from Binance (Chainlink proxy)", {
+              binancePrice: binance.price.toFixed(2),
+              note: "Polymarket settles via Chainlink which aggregates from Binance",
             });
-            // Don't set opening price → edge detector will reject with "No opening price yet"
+          } else {
+            logger.warn("No price source available — skipping window", {
+              conditionId: window.conditionId.slice(0, 16) + "...",
+            });
           }
         }
 
