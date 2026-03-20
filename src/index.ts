@@ -65,7 +65,9 @@ const main = async () => {
     minDelta: `${config.minNormalizedDelta}σ`,
     edgeThreshold: `${config.edgeThresholdCents}¢`,
     spikeFilter: `ratio > ${config.spikeRatioThreshold}`,
+    minFairValue: `${config.minFairValueCents}¢`,
     nakedSafe: `fairValue >= ${config.nakedSafetyThreshold}¢`,
+    exitPriority: "hedge > hold(+EV) > sell-back(−EV only)",
     reversalTrigger: `delta drop >= ${config.reversalDeltaDropPct}%`,
     opportunisticLoser: `≤${config.opportunisticLoserMaxCents}¢`,
   });

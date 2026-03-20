@@ -178,6 +178,12 @@ export class EdgeDetector {
       return noTrade(`Edge too small (${edge.bestEdge.toFixed(1)}¢ < ${this.config.edgeThresholdCents}¢)`);
     }
 
+    // 8b. Minimum fair value check — reject low-confidence entries
+    const winnerFairValue = primarySide === "Up" ? edge.fairUp : 100 - edge.fairUp;
+    if (winnerFairValue < this.config.minFairValueCents) {
+      return noTrade(`Fair value too low (${winnerFairValue}¢ < ${this.config.minFairValueCents}¢) — not convergence`);
+    }
+
     // 9. Depth check: don't enter if orderbook is too thin
     const depthCappedAmount = Math.min(buyAmountUsd, winnerBook.askDepthUsd * 0.4);
     if (depthCappedAmount < 5 || depthCappedAmount < buyAmountUsd * 0.3) {

@@ -234,18 +234,35 @@ export class ArbCompletionMonitor {
     const absDeltaNow = Math.abs(currentDelta);
     const absDeltaEntry = Math.abs(entryDelta);
 
-    // Direction check: did delta flip sign? (worst case)
+    // Direction check: did delta flip sign? (worst case — try hedge first)
     const flipped = (entryDelta > 0 && currentDelta <= 0) || (entryDelta < 0 && currentDelta >= 0);
     if (flipped) {
-      this.logger.warn("DELTA FLIPPED — emergency sell-back", {
-        entryDelta: `$${entryDelta.toFixed(2)}`,
-        currentDelta: `$${currentDelta.toFixed(2)}`,
-      });
-      this.state.fillInFlight = true;
-      this.emergencySellBack("delta-flipped").catch((err) => {
-        this.logger.error("Emergency sell-back failed", { error: (err as Error).message });
-        if (this.state) this.state.fillInFlight = false;
-      });
+      // When delta flips, the LOSER becomes cheap — perfect time to hedge!
+      const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+      const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+      const maxLoserPrice = 100 - this.state.winnerAvgPriceCents - 1;
+
+      if (loserAskCents && loserAskCents <= maxLoserPrice) {
+        this.logger.info("DELTA FLIPPED — hedging with loser (now cheap!)", {
+          entryDelta: `$${entryDelta.toFixed(2)}`,
+          currentDelta: `$${currentDelta.toFixed(2)}`,
+          loserAsk: `${loserAskCents.toFixed(1)}¢`,
+          pairCost: `${(this.state.winnerAvgPriceCents + loserAskCents).toFixed(1)}¢`,
+        });
+        this.state.fillInFlight = true;
+        this.fillLoser(loserAskCents).catch((err) => {
+          this.logger.error("Delta-flipped hedge failed", { error: (err as Error).message });
+          if (this.state && !this.state.filled) this.state.fillInFlight = false;
+        });
+      } else {
+        // Can't hedge — sell back only if we'd lose more than entry cost
+        this.logger.warn("DELTA FLIPPED — no cheap loser, holding naked (low entry cost)", {
+          entryDelta: `$${entryDelta.toFixed(2)}`,
+          currentDelta: `$${currentDelta.toFixed(2)}`,
+          entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+        });
+        // At 2¢ entry, max loss is 2¢/share — don't panic sell at 0.1¢
+      }
       return;
     }
 
@@ -263,18 +280,43 @@ export class ArbCompletionMonitor {
         const winnerFairValue = this.state.winnerSide === "Up" ? lookup.fairUp : 100 - lookup.fairUp;
 
         if (winnerFairValue < this.config.nakedSafetyThreshold) {
-          this.logger.warn("REVERSAL DETECTED — delta dropped, selling back", {
-            entryDelta: `$${entryDelta.toFixed(2)}`,
-            currentDelta: `$${currentDelta.toFixed(2)}`,
-            dropPct: `${dropPct.toFixed(0)}%`,
-            winnerFairValue: `${winnerFairValue}¢`,
-            threshold: `${this.config.nakedSafetyThreshold}¢`,
-          });
-          this.state.fillInFlight = true;
-          this.emergencySellBack("delta-drop").catch((err) => {
-            this.logger.error("Emergency sell-back failed", { error: (err as Error).message });
-            if (this.state) this.state.fillInFlight = false;
-          });
+          // Try hedge first (buy loser)
+          const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+          const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+          const maxLoserPrice = 100 - this.state.winnerAvgPriceCents - 1;
+
+          if (loserAskCents && loserAskCents <= maxLoserPrice) {
+            this.logger.info("REVERSAL — hedging with loser (preferred over sell-back)", {
+              dropPct: `${dropPct.toFixed(0)}%`,
+              loserAsk: `${loserAskCents.toFixed(1)}¢`,
+              pairCost: `${(this.state.winnerAvgPriceCents + loserAskCents).toFixed(1)}¢`,
+            });
+            this.state.fillInFlight = true;
+            this.fillLoser(loserAskCents).catch((err) => {
+              this.logger.error("Reversal hedge failed", { error: (err as Error).message });
+              if (this.state && !this.state.filled) this.state.fillInFlight = false;
+            });
+          } else if (winnerFairValue < this.state.winnerAvgPriceCents) {
+            // No hedge available AND EV is negative — sell back
+            this.logger.warn("REVERSAL — EV negative, selling back", {
+              entryDelta: `$${entryDelta.toFixed(2)}`,
+              currentDelta: `$${currentDelta.toFixed(2)}`,
+              dropPct: `${dropPct.toFixed(0)}%`,
+              winnerFairValue: `${winnerFairValue}¢`,
+              entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+            });
+            this.state.fillInFlight = true;
+            this.emergencySellBack("delta-drop").catch((err) => {
+              this.logger.error("Emergency sell-back failed", { error: (err as Error).message });
+              if (this.state) this.state.fillInFlight = false;
+            });
+          } else {
+            this.logger.info("REVERSAL — delta dropped but still +EV, holding naked", {
+              dropPct: `${dropPct.toFixed(0)}%`,
+              winnerFairValue: `${winnerFairValue}¢`,
+              entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+            });
+          }
         }
       }
     }
@@ -323,30 +365,88 @@ export class ArbCompletionMonitor {
       const isAgainst = (this.state.winnerSide === "Up" && velocity < -20) ||
                         (this.state.winnerSide === "Down" && velocity > 20);
       if (isAgainst && winnerFairValue < 80) {
-        this.logger.warn("FLASH CRASH — fast adverse velocity, selling back", {
-          velocity: `$${velocity.toFixed(1)}/s`,
-          winnerFairValue: `${winnerFairValue}¢`,
-        });
-        this.state.fillInFlight = true;
-        this.emergencySellBack("flash-crash").catch((err) => {
-          this.logger.error("Flash crash sell-back failed", { error: (err as Error).message });
-          if (this.state) this.state.fillInFlight = false;
-        });
+        // Flash crash = loser is now cheap — perfect hedge opportunity!
+        const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+        const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+        const maxLoserPrice = 100 - this.state.winnerAvgPriceCents - 1;
+
+        if (loserAskCents && loserAskCents <= maxLoserPrice) {
+          this.logger.info("FLASH CRASH — hedging with loser (now cheap!)", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            loserAsk: `${loserAskCents.toFixed(1)}¢`,
+            pairCost: `${(this.state.winnerAvgPriceCents + loserAskCents).toFixed(1)}¢`,
+          });
+          this.state.fillInFlight = true;
+          this.fillLoser(loserAskCents).catch((err) => {
+            this.logger.error("Flash crash hedge failed", { error: (err as Error).message });
+            if (this.state && !this.state.filled) this.state.fillInFlight = false;
+          });
+        } else if (winnerFairValue < this.state.winnerAvgPriceCents) {
+          this.logger.warn("FLASH CRASH — EV negative, selling back", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            winnerFairValue: `${winnerFairValue}¢`,
+            entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+          });
+          this.state.fillInFlight = true;
+          this.emergencySellBack("flash-crash").catch((err) => {
+            this.logger.error("Flash crash sell-back failed", { error: (err as Error).message });
+            if (this.state) this.state.fillInFlight = false;
+          });
+        } else {
+          this.logger.info("FLASH CRASH — still +EV, holding naked", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            winnerFairValue: `${winnerFairValue}¢`,
+            entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+          });
+        }
         return;
       }
     }
 
-    // If close to settlement and position is unsafe, exit
+    // If close to settlement and position looks risky, try to HEDGE first (buy loser).
+    // Only sell-back if EV is actually negative (fairValue < entryPrice) — at 2¢ entry, holding is almost always +EV.
     if (this.state.timeRemainingSeconds < 15 && winnerFairValue < this.config.nakedSafetyThreshold) {
-      this.logger.warn("LATE WINDOW — unsafe naked, selling back", {
+      // Try emergency hedge (buy loser at any reasonable price) before considering sell-back
+      const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+      const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+      const maxLoserPrice = 100 - this.state.winnerAvgPriceCents - 1; // Must still be profitable pair
+
+      if (loserAskCents && loserAskCents <= maxLoserPrice) {
+        this.logger.info("LATE WINDOW — hedging with loser (preferred over sell-back)", {
+          timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+          loserAsk: `${loserAskCents.toFixed(1)}¢`,
+          pairCost: `${(this.state.winnerAvgPriceCents + loserAskCents).toFixed(1)}¢`,
+          profit: `+${(100 - this.state.winnerAvgPriceCents - loserAskCents).toFixed(1)}¢/pair`,
+        });
+        this.state.fillInFlight = true;
+        this.fillLoser(loserAskCents).catch((err) => {
+          this.logger.error("Late hedge failed", { error: (err as Error).message });
+          if (this.state && !this.state.filled) this.state.fillInFlight = false;
+        });
+        return;
+      }
+
+      // No hedge available — only sell-back if EV is negative (fairValue < entryPrice)
+      if (winnerFairValue < this.state.winnerAvgPriceCents) {
+        this.logger.warn("LATE WINDOW — EV negative, selling back", {
+          timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+          winnerFairValue: `${winnerFairValue}¢`,
+          entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+        });
+        this.state.fillInFlight = true;
+        this.emergencySellBack("late-unsafe").catch((err) => {
+          this.logger.error("Late sell-back failed", { error: (err as Error).message });
+          if (this.state) this.state.fillInFlight = false;
+        });
+        return;
+      }
+
+      // FairValue > entryPrice → still +EV, HOLD naked (don't sell back!)
+      this.logger.info("LATE WINDOW — holding naked (+EV)", {
         timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
         winnerFairValue: `${winnerFairValue}¢`,
-        delta: `${normalizedDelta.toFixed(2)}σ`,
-      });
-      this.state.fillInFlight = true;
-      this.emergencySellBack("late-unsafe").catch((err) => {
-        this.logger.error("Late sell-back failed", { error: (err as Error).message });
-        if (this.state) this.state.fillInFlight = false;
+        entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+        ev: `+${(winnerFairValue - this.state.winnerAvgPriceCents).toFixed(1)}¢/share`,
       });
       return;
     }
@@ -365,23 +465,28 @@ export class ArbCompletionMonitor {
   }
 
   /**
-   * Try to buy loser at ultra-cheap price (≤3¢).
-   * This is opportunistic — if it fills, great (locked profit).
-   * If not, we stay naked (higher EV anyway at 96%+ win rate).
+   * Try to buy loser at ultra-cheap price (≤3¢) or at any profitable price if urgent.
+   * This is the PRIMARY exit strategy — hedge beats sell-back at any entry price.
    */
-  private tryOpportunisticLoserFill(): void {
+  private tryOpportunisticLoserFill(urgent = false): void {
     if (!this.state || this.state.filled || this.state.soldBack || this.state.fillInFlight) return;
 
     const book = this.clobWs.getBook(this.state.loserTokenId);
     const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
 
-    if (!askCents || askCents > this.config.opportunisticLoserMaxCents) return;
+    if (!askCents) return;
 
-    // Ultra-cheap loser available! Buy it for near-free hedge.
+    // When urgent (late window), accept any loser price that creates a profitable pair
+    const maxLoserCents = urgent
+      ? 100 - this.state.winnerAvgPriceCents - 1 // any price that locks in ≥1¢ profit per pair
+      : this.config.opportunisticLoserMaxCents;
+
+    if (askCents > maxLoserCents) return;
+
     const pairCost = this.state.winnerAvgPriceCents + askCents;
-    const profitCents = 100 - pairCost; // fees are negligible at these prices
+    const profitCents = 100 - pairCost;
 
-    this.logger.info("OPPORTUNISTIC LOSER — ultra-cheap fill available!", {
+    this.logger.info(urgent ? "LATE HEDGE — buying loser to lock in profit" : "OPPORTUNISTIC LOSER — ultra-cheap fill available!", {
       loserAsk: `${askCents.toFixed(1)}¢`,
       pairCost: `${pairCost.toFixed(1)}¢`,
       profit: `+${profitCents.toFixed(1)}¢/pair`,
@@ -389,7 +494,7 @@ export class ArbCompletionMonitor {
 
     this.state.fillInFlight = true;
     this.fillLoser(askCents).catch((err) => {
-      this.logger.error("Opportunistic fill failed", { error: (err as Error).message });
+      this.logger.error("Hedge fill failed", { error: (err as Error).message });
       if (this.state && !this.state.filled) this.state.fillInFlight = false;
     });
   }

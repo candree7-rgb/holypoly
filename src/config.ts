@@ -56,6 +56,10 @@ export interface Config {
   /** How often (ms) to scan for edge opportunities */
   scanIntervalMs: number;
 
+  // Entry quality
+  /** Minimum fair value (cents) for winner side to enter — rejects low-confidence entries */
+  minFairValueCents: number;
+
   // Naked position safety
   /** Fair value threshold: if winner fairValue >= this, naked hold is safe */
   nakedSafetyThreshold: number;
@@ -203,6 +207,9 @@ export const loadConfig = (): Config => {
   const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 120);
   const scanIntervalMs = parseNumber("SCAN_INTERVAL_MS", 500);
 
+  // Entry quality
+  const minFairValueCents = parseNumber("MIN_FAIR_VALUE_CENTS", 80);
+
   // Naked position safety
   const nakedSafetyThreshold = parseNumber("NAKED_SAFETY_THRESHOLD", 95);
   const reversalDeltaDropPct = parseNumber("REVERSAL_DELTA_DROP_PCT", 30);
@@ -283,6 +290,7 @@ export const loadConfig = (): Config => {
     momentumLookbackSeconds,
     volatilityLookbackSeconds,
     scanIntervalMs,
+    minFairValueCents,
     nakedSafetyThreshold,
     reversalDeltaDropPct,
     emergencySellMaxSpreadCents,
