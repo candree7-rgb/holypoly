@@ -70,13 +70,15 @@ export class TelegramNotifier {
     if (!this.enabled) return false;
     if (alertType && !this.shouldSend(alertType)) return false;
 
+    const prefixed = `🍷 ${message}`;
+
     try {
       let resp = await fetch(this.apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: this.chatId,
-          text: message,
+          text: prefixed,
           parse_mode: "Markdown",
         }),
       });
@@ -91,7 +93,7 @@ export class TelegramNotifier {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: this.chatId,
-            text: message,
+            text: prefixed,
           }),
         });
         if (!resp.ok) {
