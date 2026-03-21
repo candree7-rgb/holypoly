@@ -42,7 +42,8 @@ export class ClobWsClient {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.connect();
+    // Don't connect yet — wait until subscribe() is called with tokens.
+    // Polymarket closes connections that don't send a subscription immediately.
   }
 
   stop(): void {
@@ -68,7 +69,11 @@ export class ClobWsClient {
   subscribe(tokenIds: string[]): void {
     this.subscribedTokens = tokenIds;
     if (this.ws?.readyState === WebSocket.OPEN) {
+      // Already connected — just send new subscription
       this.sendSubscription();
+    } else if (this.running && tokenIds.length > 0 && !this.ws) {
+      // Not connected yet — connect now (subscription will be sent on open)
+      this.connect();
     }
   }
 
@@ -78,6 +83,21 @@ export class ClobWsClient {
   clear(): void {
     this.subscribedTokens = [];
     this.books.clear();
+    // Disconnect — no point keeping WS open without subscriptions
+    // (server will kick us anyway for not having a subscription)
+    if (this.ws) {
+      if (this.pingTimer) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
+      if (this.reconnectTimer) {
+        clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
   }
 
   private sendSubscription(): void {
@@ -239,6 +259,12 @@ export class ClobWsClient {
 
   private scheduleReconnect(): void {
     if (!this.running) return;
+    // Only reconnect if we have tokens to subscribe to
+    if (this.subscribedTokens.length === 0) {
+      this.logger.debug("CLOB WS not reconnecting — no subscriptions");
+      this.ws = null;
+      return;
+    }
     this.reconnectTimer = setTimeout(() => {
       this.connect();
     }, this.reconnectDelay);
