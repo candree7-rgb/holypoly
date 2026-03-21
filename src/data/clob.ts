@@ -167,9 +167,11 @@ export class ClobService {
   private roundToTick(price: number, tickSize: TickSize, side: Side): number {
     const tick = Number(tickSize);
     if (!Number.isFinite(tick) || tick <= 0) return price;
-    const factor = 1 / tick;
-    const raw = price * factor;
-    const rounded = side === Side.BUY ? Math.floor(raw) : Math.ceil(raw);
+    // Use integer math to avoid floating-point precision issues
+    const factor = Math.round(1 / tick);
+    const raw = Math.round(price * factor * 1e8) / 1e8; // avoid fp drift
+    // Round toward fill: BUY rounds UP (willing to pay more), SELL rounds DOWN (willing to accept less)
+    const rounded = side === Side.BUY ? Math.ceil(raw) : Math.floor(raw);
     const result = rounded / factor;
     const decimals = tickSize.includes("0.0001")
       ? 4

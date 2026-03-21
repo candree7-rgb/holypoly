@@ -47,6 +47,7 @@ interface WindowTracker {
   windowKey: string;
   copies: number;
   totalUsd: number;
+  createdAt: number;
 }
 
 /**
@@ -95,6 +96,8 @@ export class CopyExecutor {
   private fillTimeoutMs = 60_000;
   /** Fill check interval (ms) */
   private fillCheckIntervalMs = 3_000;
+  /** Guard against overlapping checkPendingOrders runs */
+  private isCheckingPending = false;
 
   // Callbacks
   private onFilledCb: ((event: FillEvent) => void) | null = null;
@@ -178,19 +181,33 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
     }
 
-    // Determine price
+    // Determine price — use correct side of book
     let priceCents: number;
     if (needsOrderbook) {
-      if (obResult && obResult.bestAsk !== null) {
-        priceCents = Math.round(obResult.bestAsk * 100);
-        this.logger.info("Orderbook price resolved", {
-          tokenId: trade.tokenId.slice(0, 12) + "...",
-          bestAsk: `${priceCents}¢`,
-          bestBid: obResult.bestBid !== null ? `${Math.round(obResult.bestBid * 100)}¢` : "null",
-        });
+      if (obResult) {
+        // For maker strategy: BUY → use bestBid (sit on bid = maker, 0% fee)
+        //                     SELL → use bestAsk (sit on ask = maker, 0% fee)
+        // This matches the leader's likely entry price while keeping maker status
+        const isBuy = trade.side === "BUY";
+        const bookPrice = isBuy ? obResult.bestBid : obResult.bestAsk;
+        if (bookPrice !== null) {
+          priceCents = Math.round(bookPrice * 100);
+          this.logger.info("Orderbook price resolved", {
+            tokenId: trade.tokenId.slice(0, 12) + "...",
+            side: trade.side,
+            price: `${priceCents}¢`,
+            bestAsk: obResult.bestAsk !== null ? `${Math.round(obResult.bestAsk * 100)}¢` : "null",
+            bestBid: obResult.bestBid !== null ? `${Math.round(obResult.bestBid * 100)}¢` : "null",
+          });
+        } else {
+          // No liquidity on our side of the book — skip trade
+          this.totalSkipped++;
+          return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_liquidity" };
+        }
       } else {
-        priceCents = 51;
-        if (obResult) this.logger.warn("Orderbook empty, using 51¢ fallback", { tokenId: trade.tokenId.slice(0, 12) + "..." });
+        // Orderbook lookup failed entirely — skip trade (don't guess a price)
+        this.totalSkipped++;
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "orderbook_failed" };
       }
       trade.priceCents = priceCents;
     } else {
@@ -211,8 +228,11 @@ export class CopyExecutor {
       copyUsd = this.config.minTradeUsd;
     }
 
-    // Exposure check
-    const totalExposure = Array.from(this.windowTrackers.values()).reduce((s, w) => s + w.totalUsd, 0);
+    // Exposure check (only count trackers from last 5 minutes)
+    const expiryCutoff = Date.now() - 5 * 60_000;
+    const totalExposure = Array.from(this.windowTrackers.values())
+      .filter((w) => w.createdAt > expiryCutoff)
+      .reduce((s, w) => s + w.totalUsd, 0);
     const maxExposure = this.balance * (this.config.maxExposurePct / 100);
     if (totalExposure + copyUsd > maxExposure) {
       this.totalSkipped++;
@@ -334,6 +354,8 @@ export class CopyExecutor {
    */
   private async checkPendingOrders(): Promise<void> {
     if (this.pendingOrders.size === 0) return;
+    if (this.isCheckingPending) return; // Prevent overlapping runs
+    this.isCheckingPending = true;
     const now = Date.now();
 
     for (const [key, order] of this.pendingOrders) {
@@ -403,44 +425,66 @@ export class CopyExecutor {
           continue;
         }
 
-        // TIMEOUT: cancel unfilled orders after fillTimeoutMs
+        // TIMEOUT: always cancel remaining unfilled portion after fillTimeoutMs
         if (now - order.placedAt >= this.fillTimeoutMs) {
           this.pendingOrders.delete(key);
 
-          const cancelled = filled < order.size * 0.1; // Only cancel if barely filled
-          if (cancelled) {
-            await this.clob.cancelOrder(order.orderId);
-          }
+          // Always cancel to free locked collateral (cancel on filled order is a safe no-op)
+          await this.clob.cancelOrder(order.orderId);
 
-          this.logger.warn("Order UNFILLED — timed out", {
+          // Re-check fill after cancel to get accurate final state
+          let finalFilled = filled;
+          try {
+            finalFilled = await this.clob.getFilledShares(order.orderId);
+          } catch { /* use stale value */ }
+
+          const unfilled = order.size - finalFilled;
+
+          this.logger.warn("Order timed out — cancelled remaining", {
             orderId: order.orderId.slice(0, 12) + "...",
-            filled: filled.toFixed(1),
+            filled: finalFilled.toFixed(1),
+            unfilled: unfilled.toFixed(1),
             requested: order.size.toFixed(1),
             elapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
-            cancelled,
           });
 
-          if (this.onUnfilledCb) {
-            this.onUnfilledCb({
-              orderId: order.orderId,
-              trade: order.trade,
-              requestedShares: order.size,
-              filledShares: filled,
-              price: order.price,
-              placedAt: order.placedAt,
-              cancelled,
-            });
+          // Refund balance for unfilled portion
+          if (unfilled > 0) {
+            this.balance += unfilled * order.price;
           }
 
-          // Refund balance for unfilled portion
-          if (cancelled) {
-            this.balance += (order.size - filled) * order.price;
+          // Emit filled if partially filled, unfilled otherwise
+          if (finalFilled >= order.size * 0.95) {
+            if (this.onFilledCb) {
+              this.onFilledCb({
+                orderId: order.orderId,
+                trade: order.trade,
+                filledShares: finalFilled,
+                price: order.price,
+                usd: finalFilled * order.price,
+                placedAt: order.placedAt,
+                filledAt: now,
+              });
+            }
+          } else {
+            if (this.onUnfilledCb) {
+              this.onUnfilledCb({
+                orderId: order.orderId,
+                trade: order.trade,
+                requestedShares: order.size,
+                filledShares: finalFilled,
+                price: order.price,
+                placedAt: order.placedAt,
+                cancelled: true,
+              });
+            }
           }
         }
       } catch (err) {
         this.logger.warn("Fill check failed", { error: (err as Error).message, orderId: order.orderId.slice(0, 12) + "..." });
       }
     }
+    this.isCheckingPending = false;
   }
 
   /**
@@ -572,14 +616,17 @@ export class CopyExecutor {
   }
 
   private getWindowTracker(key: string): WindowTracker {
+    // Prune expired trackers (>5 min old)
+    const now = Date.now();
+    const expiryCutoff = now - 5 * 60_000;
+    for (const [k, v] of this.windowTrackers) {
+      if (v.createdAt < expiryCutoff) this.windowTrackers.delete(k);
+    }
+
     let t = this.windowTrackers.get(key);
     if (!t) {
-      t = { windowKey: key, copies: 0, totalUsd: 0 };
+      t = { windowKey: key, copies: 0, totalUsd: 0, createdAt: now };
       this.windowTrackers.set(key, t);
-      if (this.windowTrackers.size > 50) {
-        const keys = Array.from(this.windowTrackers.keys());
-        for (let i = 0; i < keys.length - 25; i++) this.windowTrackers.delete(keys[i]);
-      }
     }
     return t;
   }

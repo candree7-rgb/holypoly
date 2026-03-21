@@ -323,6 +323,23 @@ async function notifyResult(
       ].join("\n"),
       "copy_skipped",
     );
+  } else if (result.reason === "no_liquidity") {
+    await telegram.send(
+      [
+        `*Copy Trade Failed*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Action: ${result.trade.side}`,
+        `Error: No liquidity on ${result.trade.side === "BUY" ? "ask" : "bid"} side of the orderbook.`,
+      ].join("\n"),
+    );
+  } else if (result.reason === "orderbook_failed") {
+    await telegram.send(
+      [
+        `*Copy Trade Failed*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Error: Orderbook lookup failed — trade skipped for safety.`,
+      ].join("\n"),
+    );
   }
   // Silently skip cooldown, sell_filtered, market_filtered, window_limit
 }

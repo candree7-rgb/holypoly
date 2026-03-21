@@ -284,8 +284,8 @@ export class TargetTracker {
         latency: "~2s (block time)",
       });
 
-      // Store pending event for API dedup
-      this.pendingChainEvents.set(tokenIdDecimal, {
+      // Store pending event for API dedup (use eventId as key to avoid collision on repeated buys)
+      this.pendingChainEvents.set(eventId, {
         tokenId: tokenIdDecimal,
         shares,
         timestamp: Date.now(),
@@ -483,14 +483,18 @@ export class TargetTracker {
         if (this.seenIds.has(trade.id)) continue;
 
         // Also check if we have a pending chain event for this token
-        // (chain events use decimal token IDs, API may use different format)
-        const chainPending = this.pendingChainEvents.get(trade.tokenId)
-          || Array.from(this.pendingChainEvents.values()).find(
-            (p) => Math.abs(p.shares - trade.shares) < 0.01 && Date.now() - p.timestamp < 60000,
-          );
-        if (chainPending) {
+        // Search by tokenId match OR fuzzy shares+time match
+        let chainPendingKey: string | null = null;
+        for (const [k, p] of this.pendingChainEvents) {
+          if (p.tokenId === trade.tokenId
+            || (Math.abs(p.shares - trade.shares) < 0.1 && Date.now() - p.timestamp < 60000)) {
+            chainPendingKey = k;
+            break;
+          }
+        }
+        if (chainPendingKey) {
           // Already emitted via chain — skip API duplicate
-          this.pendingChainEvents.delete(trade.tokenId);
+          this.pendingChainEvents.delete(chainPendingKey);
           this.seenIds.add(trade.id);
           continue;
         }
@@ -518,10 +522,15 @@ export class TargetTracker {
         }
       }
 
-      // Prune
+      // Prune seenIds
       if (this.seenIds.size > 5000) {
         const arr = Array.from(this.seenIds);
         this.seenIds = new Set(arr.slice(-2500));
+      }
+      // Prune marketCache (keep max 200 entries)
+      if (this.marketCache.size > 200) {
+        const keys = Array.from(this.marketCache.keys());
+        for (let i = 0; i < keys.length - 100; i++) this.marketCache.delete(keys[i]);
       }
       // Clean old pending chain events (>60s)
       const now = Date.now();
