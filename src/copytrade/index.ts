@@ -270,6 +270,14 @@ async function notifyResult(
     const priceDiffStr = priceDiff ? ` (${Number(priceDiff) >= 0 ? "+" : ""}${priceDiff}¢)` : "";
     const dryTag = result.reason === "dry_run" ? " [DRY]" : "";
 
+    const statusLine = result.reason === "maker_fill"
+      ? `Filled (maker, 0% fee) · ${result.latencyMs}ms`
+      : result.reason === "taker_fill"
+        ? `Filled (taker) · ${result.latencyMs}ms`
+        : result.reason === "dry_run"
+          ? `DRY RUN · ${result.latencyMs}ms`
+          : `Pending · ${result.latencyMs}ms`;
+
     await telegram.send(
       [
         `*Copy Trade ${result.trade.side}${dryTag}*`,
@@ -279,10 +287,7 @@ async function notifyResult(
         `Leader: ${leaderUsd} · ${leaderShares} sh @ ${leaderPrice}¢`,
         `Ours:   ${ourUsd} · ${ourShares} sh @ ${ourPrice}¢${priceDiffStr}`,
         ``,
-        result.reason === "maker_fill" ? `Maker fill (0% fee) · ${result.latencyMs}ms`
-          : result.reason === "taker_fill" ? `Taker fill · ${result.latencyMs}ms`
-          : result.reason === "dry_run" ? `DRY RUN · ${result.latencyMs}ms`
-          : `Limit placed · ${result.latencyMs}ms · ${result.trade.source}`,
+        statusLine,
       ].join("\n"),
       "copy_placed",
     );
@@ -351,16 +356,17 @@ async function notifyFilled(
   telegram: TelegramNotifier,
   _logger: Logger,
 ): Promise<void> {
+  // This only fires for async fills (from checkPendingOrders)
+  // Immediate fills (maker/taker) are handled by notifyResult
   const priceCents = (event.price * 100).toFixed(1);
   const elapsed = ((event.filledAt - event.placedAt) / 1000).toFixed(1);
   await telegram.send(
     [
-      `*Copy Trade Filled*`,
+      `*Copy Trade Filled (async)*`,
       `Market: ${event.trade.title.slice(0, 60) || "?"}`,
       `Outcome: ${event.trade.outcome || "?"}`,
       `${event.filledShares.toFixed(1)} shares @ ${priceCents}¢ ($${event.usd.toFixed(2)})`,
-      `Maker fee: 0%`,
-      `Filled in ${elapsed}s`,
+      `Maker (0% fee) · filled in ${elapsed}s`,
     ].join("\n"),
   );
 }

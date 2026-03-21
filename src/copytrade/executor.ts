@@ -343,20 +343,9 @@ export class CopyExecutor {
         totalCopied: this.totalCopied,
       });
 
-      // If filled immediately (maker or taker FOK), emit fill event directly
-      if (result.filled) {
-        if (this.onFilledCb) {
-          this.onFilledCb({
-            orderId,
-            trade,
-            filledShares: shares,
-            price,
-            usd: copyUsd,
-            placedAt: Date.now() - latency,
-            filledAt: Date.now(),
-          });
-        }
-      } else if (orderId) {
+      // Only track in pendingOrders if NOT already filled
+      // (filled orders get notified via notifyResult, not onFilledCb)
+      if (!result.filled && orderId) {
         // GTC still pending (maker attempt, FOK not triggered yet within placeLimitThenFOK)
         this.pendingOrders.set(orderId, {
           orderId,
