@@ -427,29 +427,43 @@ export class TargetTracker {
     this.stats.totalPolls++;
 
     try {
-      const url = new URL(`${this.dataApiHost}/activity`);
-      url.searchParams.set("user", this.targetAddress);
-      url.searchParams.set("type", "TRADE");
-      url.searchParams.set("start", String(this.lastPollTimestamp));
-      url.searchParams.set("sortBy", "TIMESTAMP");
-      url.searchParams.set("sortDirection", "ASC");
+      // Try /activity first, then /trades as fallback (Polymarket has both endpoints)
+      let data: ActivityResponse[] = [];
 
-      const resp = await fetch(url.toString(), {
-        headers: {
-          Accept: "application/json",
-          "User-Agent": "holypoly-copytrade",
-        },
-        keepalive: true,
-      });
+      for (const endpoint of ["/activity", "/trades"]) {
+        const url = new URL(`${this.dataApiHost}${endpoint}`);
+        url.searchParams.set("user", this.targetAddress);
+        if (endpoint === "/activity") {
+          url.searchParams.set("type", "TRADE");
+          url.searchParams.set("sortBy", "TIMESTAMP");
+          url.searchParams.set("sortDirection", "ASC");
+        }
+        url.searchParams.set("start", String(this.lastPollTimestamp));
+        url.searchParams.set("limit", "100");
 
-      if (!resp.ok) {
-        this.stats.consecutiveErrors++;
-        return;
+        const resp = await fetch(url.toString(), {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "holypoly-copytrade",
+          },
+          signal: AbortSignal.timeout(5000),
+        });
+
+        if (!resp.ok) continue;
+
+        const body = await resp.json();
+        const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
+        if (Array.isArray(items) && items.length > 0) {
+          data = items as ActivityResponse[];
+          break;
+        }
       }
 
+      if (data.length === 0) {
+        this.stats.consecutiveErrors = 0;
+        return;
+      }
       this.stats.consecutiveErrors = 0;
-      const data = (await resp.json()) as ActivityResponse[];
-      if (!Array.isArray(data) || data.length === 0) return;
 
       for (const item of data) {
         const trade = this.parseActivity(item);
@@ -522,7 +536,7 @@ export class TargetTracker {
 
       const type = (item.type || "TRADE").toUpperCase();
       const conditionId = item.conditionId || item.condition_id || "";
-      const tokenId = item.assetId || item.asset_id || item.proxyTokenId || "";
+      const tokenId = item.assetId || item.asset_id || item.asset || item.proxyTokenId || "";
       const outcome = item.outcome || item.outcomeName || "";
       const priceCents = Math.round((parseFloat(item.price || "0") || 0) * 100);
       const shares = parseFloat(item.size || item.tokens || "0") || 0;
@@ -551,6 +565,7 @@ interface ActivityResponse {
   condition_id?: string;
   assetId?: string;
   asset_id?: string;
+  asset?: string; // /trades endpoint uses "asset" for token ID
   proxyTokenId?: string;
   outcome?: string;
   outcomeName?: string;
@@ -562,5 +577,7 @@ interface ActivityResponse {
   title?: string;
   question?: string;
   marketTitle?: string;
+  slug?: string;
+  transactionHash?: string;
   timestamp?: number | string;
 }

@@ -139,12 +139,24 @@ export class CopyExecutor {
         const ob = await this.clob.getOrderbook(trade.tokenId);
         if (ob.bestAsk !== null) {
           priceCents = Math.round(ob.bestAsk * 100);
+          this.logger.info("Orderbook price resolved", {
+            tokenId: trade.tokenId.slice(0, 12) + "...",
+            bestAsk: `${priceCents}¢`,
+            bestBid: ob.bestBid !== null ? `${Math.round(ob.bestBid * 100)}¢` : "null",
+          });
         } else {
-          priceCents = 51; // Default for 5-min crypto markets
+          priceCents = 51;
+          this.logger.warn("Orderbook empty, using 51¢ fallback", { tokenId: trade.tokenId.slice(0, 12) + "..." });
         }
-      } catch {
+      } catch (err) {
         priceCents = 51;
+        this.logger.warn("Orderbook lookup failed, using 51¢ fallback", {
+          tokenId: trade.tokenId.slice(0, 12) + "...",
+          error: (err as Error).message,
+        });
       }
+      // Update trade object so notifications show resolved price
+      trade.priceCents = priceCents;
     } else {
       priceCents = trade.priceCents;
     }
