@@ -182,28 +182,24 @@ export class SignalExecutor {
         return null;
       }
 
-      // Not yet time for the target window? Wait.
-      if (nowSec < signal.targetWindowStartSec - 5) {
-        return null; // main loop will sleep
-      }
-
-      // Try to find the target market
+      // Try to find the target market immediately — CLOB is open well before
+      // the 5-min window starts. Placing GTC early = better queue position.
       const window = await this.discovery.findMarketByTimestamp(
         signal.targetWindowStartSec,
         signal.asset,
       );
 
       if (!window) {
-        // Market not available yet — keep polling
+        // Market not on CLOB yet — keep polling (markets appear ~30min before start)
         if (nowSec < signal.targetWindowStartSec + 30) {
-          this.logger.debug("Waiting for target market", {
+          this.logger.debug("Waiting for target market on CLOB", {
             targetStart: signal.targetWindowStartSec,
-            secsSinceTarget: nowSec - signal.targetWindowStartSec,
+            secsUntilTarget: signal.targetWindowStartSec - nowSec,
           });
           return null;
         }
-        // Gave up after 30s
-        this.logger.warn("Target market not found after 30s, aborting signal");
+        // Gave up after window start + 30s
+        this.logger.warn("Target market not found after 30s past start, aborting signal");
         this.pendingSignal = null;
         return null;
       }
@@ -247,9 +243,11 @@ export class SignalExecutor {
       // Check fills
       await this.updateFills();
 
-      // FOK fallback: if not enough filled and past the threshold
+      // GTC fallback: if nothing filled and we're past threshold into the window
+      // Only triggers after the window has actually started (windowElapsedSec > 0)
       if (
         !exec.fallbackSent &&
+        windowElapsedSec > 0 &&
         windowElapsedSec >= this.config.fallbackAfterSec &&
         exec.totalShares < 1 // minimum viable position
       ) {
@@ -418,11 +416,9 @@ export class SignalExecutor {
   private async finalize(): Promise<SignalResult> {
     const exec = this.activeExecution!;
 
-    // Cancel any remaining GTC orders
-    if (!exec.fallbackSent) {
-      for (const orderId of exec.orderIds) {
-        await this.clob.cancelOrder(orderId);
-      }
+    // Cancel any remaining unfilled GTC orders
+    for (const orderId of exec.orderIds) {
+      await this.clob.cancelOrder(orderId);
     }
 
     // Final fill update
