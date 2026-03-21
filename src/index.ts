@@ -18,8 +18,10 @@ import { WindowMemory } from "./signal/window-memory.js";
 import { ArbManager } from "./execution/arb-manager.js";
 import { ArbCompletionMonitor } from "./execution/arb-completion.js";
 import { WindowManager } from "./execution/window-manager.js";
+import { SignalExecutor } from "./execution/signal-executor.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
+import { createWebhookServer } from "./webhook.js";
 import { sleep, nowSec } from "./utils.js";
 import type { GridOrder, TradeSide, WindowInfo } from "./types.js";
 
@@ -189,8 +191,8 @@ const main = async () => {
     const winner: TradeSide = settlementPrice > window.openingPrice ? "Up" : "Down";
     let totalPnl: number;
 
-    // Polymarket taker fee: 2% per fill
-    const TAKER_FEE_PCT = 0.02;
+    // Polymarket taker fee (from config, default 2%)
+    const TAKER_FEE_PCT = config.takerFeeRate;
 
     const isLive = !config.dryRun && windowOrderIds.length > 0;
     if (isLive) {
@@ -631,6 +633,190 @@ const main = async () => {
     }
   };
 
+  // === WEBHOOK SIGNAL STRATEGY LOOP ===
+  const webhookSignalLoop = async () => {
+    // Signal executor
+    const signalExecutor = new SignalExecutor(
+      clob,
+      discovery,
+      {
+        ladderPricesCents: config.signalLadderPrices,
+        ladderWeights: config.signalLadderWeights,
+        fokFallbackAfterSec: config.signalFokFallbackSec,
+        fokMaxPriceCents: config.signalFokMaxPriceCents,
+        buyAmountPct: config.buyAmountPct,
+        fillPollIntervalMs: 5000,
+        makerFeeRate: config.makerFeeRate,
+        takerFeeRate: config.takerFeeRate,
+      },
+      logger,
+      telegram,
+    );
+
+    // Start webhook server and wire signal handler
+    const webhook = createWebhookServer(config.webhookPort, logger, config.webhookSecret);
+    webhook.onSignal((signal) => {
+      const direction: TradeSide = signal.direction === "up" ? "Up" : "Down";
+      signalExecutor.queueSignal(direction, signal.asset);
+    });
+    webhook.start();
+
+    logger.info("=== Webhook Signal Strategy Active ===", {
+      port: config.webhookPort,
+      ladder: config.signalLadderPrices.join("/") + "¢",
+      fokFallback: `${config.signalFokFallbackSec}s @ max ${config.signalFokMaxPriceCents}¢`,
+      makerFee: `${config.makerFeeRate * 100}%`,
+      takerFee: `${config.takerFeeRate * 100}%`,
+    });
+
+    // Track active positions for settlement
+    let activeResult: {
+      direction: TradeSide;
+      shares: number;
+      costUsd: number;
+      orderIds: string[];
+      conditionId: string;
+      window: WindowInfo;
+      makerFills: number;
+      takerFills: number;
+    } | null = null;
+
+    while (true) {
+      try {
+        const balance = await riskManager.getBalance();
+
+        // Risk check
+        const riskCheck = await riskManager.check();
+        if (!riskCheck.allowed && signalExecutor.hasPendingSignal) {
+          logger.warn("Risk blocked — skipping signal", { reason: riskCheck.reason });
+          signalExecutor.reset();
+          await sleep(config.scanIntervalMs);
+          continue;
+        }
+
+        // Tick the signal executor
+        const result = await signalExecutor.tick(balance);
+
+        if (result) {
+          // Execution complete — store for settlement
+          if (result.success) {
+            // Find the window info for settlement
+            const windowStartSec = Math.floor(result.windowStart / 1000);
+            const window = await discovery.findMarketByTimestamp(windowStartSec, result.asset as "btc" | "eth");
+
+            if (window) {
+              activeResult = {
+                direction: result.direction,
+                shares: result.totalShares,
+                costUsd: result.totalCostUsd,
+                orderIds: result.orderIds,
+                conditionId: result.conditionId,
+                window,
+                makerFills: result.makerFills,
+                takerFills: result.takerFills,
+              };
+
+              // Record to database
+              await db.recordWindow({
+                windowStart: result.windowStart,
+                conditionId: result.conditionId,
+                traded: true,
+                primarySide: result.direction,
+                orders: [{
+                  side: result.direction,
+                  tokenId: result.direction === "Up" ? window.upTokenId : window.downTokenId,
+                  price: result.avgPriceCents,
+                  amount: result.totalCostUsd,
+                }],
+                fillCount: result.makerFills + result.takerFills,
+                pnl: null,
+                winner: null,
+                balanceBefore: balance,
+                balanceAfter: null,
+              });
+            }
+          }
+        }
+
+        // Check if active position's window has ended → settle
+        if (activeResult) {
+          const now = Date.now();
+          if (now >= activeResult.window.endTime + 5000) {
+            // Settlement
+            const settlementPrice = rtds.price ?? binance.price;
+            if (settlementPrice && activeResult.window.openingPrice > 0) {
+              const winner: TradeSide = settlementPrice >= activeResult.window.openingPrice ? "Up" : "Down";
+              const won = activeResult.direction === winner;
+
+              // Calculate fees: maker fills = 0%, taker fills = takerFeeRate
+              const makerPortion = activeResult.makerFills / Math.max(1, activeResult.makerFills + activeResult.takerFills);
+              const makerCost = activeResult.costUsd * makerPortion;
+              const takerCost = activeResult.costUsd - makerCost;
+              const totalFees = makerCost * config.makerFeeRate + takerCost * config.takerFeeRate;
+
+              const pnl = won
+                ? (activeResult.shares - activeResult.costUsd - totalFees)
+                : -(activeResult.costUsd + totalFees);
+
+              const prefix = config.dryRun ? "DRY_RUN SETTLEMENT" : "SETTLEMENT";
+              logger.info(prefix, {
+                winner,
+                direction: activeResult.direction,
+                won,
+                pnl: `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`,
+                shares: activeResult.shares.toFixed(1),
+                cost: `$${activeResult.costUsd.toFixed(2)}`,
+                fees: `$${totalFees.toFixed(4)}`,
+                makerPct: `${(makerPortion * 100).toFixed(0)}%`,
+              });
+
+              // Record in DB
+              const today = new Date();
+              const dailyDate = `${today.getUTCFullYear()}-${String(today.getUTCMonth() + 1).padStart(2, "0")}-${String(today.getUTCDate()).padStart(2, "0")}`;
+              const weekStart = new Date(today);
+              weekStart.setUTCDate(today.getUTCDate() - today.getUTCDay());
+              const weeklyWeek = `${weekStart.getUTCFullYear()}-W${String(weekStart.getUTCMonth() + 1).padStart(2, "0")}${String(weekStart.getUTCDate()).padStart(2, "0")}`;
+
+              try {
+                await db.settleWindowAtomic({
+                  conditionId: activeResult.conditionId,
+                  pnl,
+                  winner,
+                  dailyDate,
+                  weeklyWeek,
+                  won,
+                });
+              } catch {
+                await riskManager.recordResult(pnl);
+                await db.updateWindowSettlement(activeResult.conditionId, pnl, winner);
+              }
+
+              riskManager.invalidateBalanceCache();
+
+              const dailyStats = await riskManager.getDailyStats();
+              telegram.alertSettlement(
+                winner,
+                pnl,
+                won ? 1 : 0,
+                1,
+                dailyStats.totalPnl,
+                dailyStats.wins,
+                dailyStats.losses,
+              );
+
+              activeResult = null;
+            }
+          }
+        }
+      } catch (err) {
+        logger.error("Webhook signal loop error", { error: (err as Error).message });
+        telegram.alertError((err as Error).message);
+      }
+
+      await sleep(config.scanIntervalMs);
+    }
+  };
+
   // === REDEEM LOOP ===
   const redeemLoop = async () => {
     if (!redeemService) return;
@@ -674,7 +860,12 @@ const main = async () => {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  await Promise.all([hybridLoop(), redeemLoop()]);
+  const strategyLoop = config.strategyMode === "webhook"
+    ? webhookSignalLoop
+    : hybridLoop;
+
+  logger.info("Strategy mode", { mode: config.strategyMode });
+  await Promise.all([strategyLoop(), redeemLoop()]);
 };
 
 main().catch((err) => {

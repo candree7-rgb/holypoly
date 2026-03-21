@@ -98,6 +98,24 @@ export interface Config {
   telegramBotToken?: string;
   telegramChatId?: string;
 
+  // Strategy mode
+  /** "edge" = original edge-detection strategy, "webhook" = TradingView webhook signals */
+  strategyMode: "edge" | "webhook";
+
+  // Signal strategy parameters (webhook mode)
+  /** GTC limit ladder prices in cents (comma-separated) */
+  signalLadderPrices: number[];
+  /** GTC limit ladder weights (comma-separated, must sum to ~1) */
+  signalLadderWeights: number[];
+  /** Seconds into target window before FOK fallback */
+  signalFokFallbackSec: number;
+  /** Max price (cents) for FOK fallback */
+  signalFokMaxPriceCents: number;
+  /** Maker fee rate (0 on Polymarket) */
+  makerFeeRate: number;
+  /** Taker fee rate (0.02 on Polymarket crypto) */
+  takerFeeRate: number;
+
   // Operation
   dryRun: boolean;
   debug: boolean;
@@ -259,6 +277,20 @@ export const loadConfig = (): Config => {
   const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
   const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
 
+  // Strategy mode
+  const strategyModeRaw = getEnv("STRATEGY_MODE") ?? "edge";
+  const strategyMode = strategyModeRaw === "webhook" ? "webhook" : "edge" as const;
+
+  // Signal strategy parameters (webhook mode)
+  const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
+  const signalLadderPrices = signalLadderPricesRaw.split(",").map((s) => Number(s.trim()));
+  const signalLadderWeightsRaw = getEnv("SIGNAL_LADDER_WEIGHTS") ?? "0.25,0.40,0.35";
+  const signalLadderWeights = signalLadderWeightsRaw.split(",").map((s) => Number(s.trim()));
+  const signalFokFallbackSec = parseNumber("SIGNAL_FOK_FALLBACK_SEC", 240);
+  const signalFokMaxPriceCents = parseNumber("SIGNAL_FOK_MAX_PRICE_CENTS", 52);
+  const makerFeeRate = parseNumber("MAKER_FEE_RATE", 0);
+  const takerFeeRate = parseNumber("TAKER_FEE_RATE", 0.02);
+
   const dryRun = parseBoolean("DRY_RUN", true);
   const debug = parseBoolean("DEBUG", false);
   const stateFile = getEnv("STATE_FILE") ?? "./data/state.json";
@@ -315,6 +347,13 @@ export const loadConfig = (): Config => {
     rpcUrl,
     telegramBotToken,
     telegramChatId,
+    strategyMode,
+    signalLadderPrices,
+    signalLadderWeights,
+    signalFokFallbackSec,
+    signalFokMaxPriceCents,
+    makerFeeRate,
+    takerFeeRate,
     dryRun,
     debug,
     stateFile,

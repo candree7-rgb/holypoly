@@ -43,12 +43,14 @@ export class MarketDiscovery {
   }
 
   /**
-   * Find the currently active 5-minute BTC Up/Down market.
+   * Find the currently active 5-minute Up/Down market.
    *
    * Strategy: Calculate the current and next window timestamps,
    * construct the slug, and fetch directly from CLOB.
+   *
+   * @param asset - "btc" or "eth" (default: "btc")
    */
-  async findActive5MinBtcMarket(): Promise<WindowInfo | null> {
+  async findActive5MinBtcMarket(asset: "btc" | "eth" = "btc"): Promise<WindowInfo | null> {
     const now = Math.floor(Date.now() / 1000);
     const windowSize = 300; // 5 minutes
 
@@ -62,7 +64,7 @@ export class MarketDiscovery {
     ];
 
     for (const windowStart of candidates) {
-      const slug = `btc-updown-5m-${windowStart}`;
+      const slug = `${asset}-updown-5m-${windowStart}`;
 
       // Skip if we already have this market
       if (slug === this.currentSlug && this.currentMarket) {
@@ -99,7 +101,7 @@ export class MarketDiscovery {
           negRisk: market.neg_risk,
         };
 
-        this.logger.info("Found 5-min BTC market", {
+        this.logger.info(`Found 5-min ${asset.toUpperCase()} market`, {
           slug,
           conditionId: market.condition_id.slice(0, 16) + "...",
           window: `${new Date(startMs).toISOString()} - ${new Date(endMs).toISOString()}`,
@@ -204,11 +206,13 @@ export class MarketDiscovery {
   }
 
   /**
-   * Find a specific 5-minute BTC market by window start timestamp.
+   * Find a specific 5-minute market by window start timestamp.
    * Used for early entry into next market windows.
+   *
+   * @param asset - "btc" or "eth" (default: "btc")
    */
-  async findMarketByTimestamp(windowStartSec: number): Promise<WindowInfo | null> {
-    const slug = `btc-updown-5m-${windowStartSec}`;
+  async findMarketByTimestamp(windowStartSec: number, asset: "btc" | "eth" = "btc"): Promise<WindowInfo | null> {
+    const slug = `${asset}-updown-5m-${windowStartSec}`;
     const windowSize = 300;
 
     try {
