@@ -3,15 +3,9 @@
 /**
  * HolyPoly CopyTrader — Ultra-fast Polymarket copy trading bot.
  *
- * Monitors a target trader's activity and copies their trades
- * with minimal latency. Optimized for 5-minute crypto markets.
- *
- * Speed advantages over PolyGun / PolyCop:
- * - Bun runtime (faster startup, native fetch with keep-alive)
- * - 200-500ms polling interval (configurable)
- * - FOK orders for instant fill (no limit→cancel→market fallback)
- * - Pre-initialized CLOB client (API keys derived at startup)
- * - Minimal processing between detection and execution
+ * Detection: Polygon WebSocket (real-time, ~2s) + Data API polling (fallback)
+ * Execution: GTC limit orders at target's exact price (0% maker fee)
+ * Runtime: Optimized for Bun (also works with Node.js/tsx)
  *
  * Usage:
  *   bun run src/copytrade/index.ts    # Fast (recommended)
@@ -31,45 +25,42 @@ import type { Logger } from "../logger.js";
 const BANNER = `
 ╔═══════════════════════════════════════════════╗
 ║  HolyPoly CopyTrader                         ║
-║  Ultra-fast Polymarket copy trading           ║
 ║                                               ║
-║  Optimized for 5-min crypto markets           ║
+║  Detection: Polygon WebSocket (real-time)     ║
+║  Orders:    GTC Limit (0% maker fee)          ║
+║  Slippage:  Same price as target              ║
 ╚═══════════════════════════════════════════════╝
 `;
 
 async function main() {
   console.log(BANNER);
 
-  // Load config
   const config = loadCopyTradeConfig();
   const logger = createLogger(config.debug);
 
-  // Detect runtime
   const runtime = typeof (globalThis as Record<string, unknown>).Bun !== "undefined" ? "Bun" : "Node.js";
   logger.info(`Runtime: ${runtime} ${process.version}`);
 
-  if (runtime !== "Bun") {
-    logger.warn("Running on Node.js — for maximum speed, use: bun run src/copytrade/index.ts");
-  }
-
   logger.info("Config loaded", {
     target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
+    detection: config.rpcWsUrl ? "WebSocket + API polling" : "API polling only",
     pollInterval: `${config.pollIntervalMs}ms`,
+    orderType: "GTC limit (maker, 0% fee)",
+    slippage: config.bumpAfterMs > 0 ? `bump +${config.maxSlippageCents}¢ after ${config.bumpAfterMs}ms` : "same price (no bump)",
+    sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
+      : config.sizingMode === "portfolio" ? `portfolio-weighted (leader=$${config.leaderPortfolioUsd})`
+      : `${config.copyAmountPct}% of target`,
     dryRun: config.dryRun,
-    fixedAmount: config.fixedAmountUsd > 0 ? `$${config.fixedAmountUsd}` : `${config.copyAmountPct}%`,
-    maxSlippage: `${config.maxSlippageCents}¢`,
-    maxPrice: `${config.maxPriceCents}¢`,
-    marketFilter: config.marketFilter.length > 0 ? config.marketFilter.join(",") : "all",
   });
 
-  // Initialize Telegram
+  // Init Telegram
   const telegram = new TelegramNotifier(
     config.telegramBotToken,
     config.telegramChatId,
     logger,
   );
 
-  // Initialize CLOB client (pre-derive API keys for speed)
+  // Init CLOB (pre-derive API keys)
   logger.info("Initializing CLOB client...");
   const clob = await ClobService.init(
     {
@@ -83,7 +74,6 @@ async function main() {
     logger,
   );
 
-  // Get initial balance
   const balance = await clob.getBalance();
   logger.info(`Balance: $${balance.toFixed(2)} USDC`);
 
@@ -92,53 +82,54 @@ async function main() {
     process.exit(1);
   }
 
-  // Initialize executor
+  // Init executor (GTC limit orders)
   const executor = new CopyExecutor(clob, config, logger);
 
-  // Initialize tracker
+  // Init tracker (WebSocket + API polling)
   const tracker = new TargetTracker(
     config.dataApiHost,
     config.targetAddress,
+    config.rpcWsUrl,
     config.pollIntervalMs,
     logger,
   );
 
-  // Wire up: tracker → executor
+  // Wire: tracker → executor → telegram
   tracker.onNewTrade(async (trade) => {
     const result = await executor.executeCopy(trade);
     await notifyResult(result, telegram, logger);
   });
 
-  // Send startup alert
+  // Startup alert
   await telegram.send(
     [
       `*CopyTrader Started*`,
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
-      `Poll: ${config.pollIntervalMs}ms`,
+      `Detection: ${config.rpcWsUrl ? "WebSocket + API" : "API polling"}`,
+      `Orders: GTC limit (0% fee)`,
+      `Slippage: ${config.bumpAfterMs > 0 ? `bump +${config.maxSlippageCents}¢ after ${config.bumpAfterMs / 1000}s` : "same price"}`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
-      `Runtime: ${runtime}`,
     ].join("\n"),
   );
 
-  // Start tracking
+  // Start
   tracker.start();
 
-  // Status reporting loop
+  // Status every 60s
   const statusInterval = setInterval(() => {
-    const trackerStats = tracker.getStats();
-    const execStats = executor.getStats();
-
+    const ts = tracker.getStats();
+    const es = executor.getStats();
     logger.info("Status", {
-      polls: trackerStats.totalPolls,
-      detected: trackerStats.totalTrades,
-      copied: execStats.totalCopied,
-      skipped: execStats.totalSkipped,
-      failed: execStats.totalFailed,
-      balance: `$${execStats.balance.toFixed(2)}`,
-      errors: trackerStats.consecutiveErrors,
+      chainEvents: ts.chainEvents,
+      apiDetections: ts.apiDetections,
+      polls: ts.totalPolls,
+      copied: es.totalCopied,
+      skipped: es.totalSkipped,
+      failed: es.totalFailed,
+      balance: `$${es.balance.toFixed(2)}`,
     });
-  }, 60_000); // Every minute
+  }, 60_000);
 
   // Graceful shutdown
   const shutdown = async () => {
@@ -146,14 +137,14 @@ async function main() {
     tracker.stop();
     clearInterval(statusInterval);
 
-    const execStats = executor.getStats();
+    const es = executor.getStats();
     await telegram.send(
       [
         `*CopyTrader Stopped*`,
-        `Copied: ${execStats.totalCopied}`,
-        `Skipped: ${execStats.totalSkipped}`,
-        `Failed: ${execStats.totalFailed}`,
-        `Final balance: $${execStats.balance.toFixed(2)}`,
+        `Copied: ${es.totalCopied}`,
+        `Skipped: ${es.totalSkipped}`,
+        `Failed: ${es.totalFailed}`,
+        `Balance: $${es.balance.toFixed(2)}`,
       ].join("\n"),
     );
 
@@ -163,51 +154,54 @@ async function main() {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  // Keep alive
-  logger.info("CopyTrader running. Monitoring target wallet...");
+  logger.info("CopyTrader running. Watching target wallet...");
   while (true) {
     await sleep(60_000);
   }
 }
 
-/**
- * Send Telegram notification for copy trade results.
- */
 async function notifyResult(
   result: CopyResult,
   telegram: TelegramNotifier,
-  logger: Logger,
+  _logger: Logger,
 ): Promise<void> {
   if (result.success) {
+    const ourPrice = result.executedPrice ? (result.executedPrice * 100).toFixed(1) : "?";
+    const leaderPrice = result.leaderPriceCents ? result.leaderPriceCents.toFixed(1) : "?";
+    const leaderUsd = result.leaderUsd ? `$${result.leaderUsd.toFixed(2)}` : "?";
+    const leaderShares = result.leaderShares ? result.leaderShares.toFixed(1) : "?";
+    const ourUsd = result.executedUsd ? `$${result.executedUsd.toFixed(2)}` : "?";
+    const ourShares = result.executedShares ? result.executedShares.toFixed(1) : "?";
+    const priceDiff = result.executedPrice && result.leaderPriceCents
+      ? ((result.executedPrice * 100) - result.leaderPriceCents).toFixed(1)
+      : null;
+    const priceDiffStr = priceDiff ? ` (${Number(priceDiff) >= 0 ? "+" : ""}${priceDiff}¢)` : "";
+    const dryTag = result.reason === "dry_run" ? " [DRY]" : "";
+
     await telegram.send(
       [
-        `*COPY TRADE ${result.trade.side}*`,
-        `Market: ${result.trade.title.slice(0, 50)}`,
-        `Outcome: ${result.trade.outcome}`,
-        `Target price: ${result.trade.priceCents}¢`,
-        `Our price: ${result.executedPrice ? Math.round(result.executedPrice * 100) + "¢" : "?"}`,
-        `Amount: $${result.executedUsd?.toFixed(2) || "?"}`,
-        `Shares: ${result.executedShares?.toFixed(1) || "?"}`,
-        `Latency: ${result.latencyMs}ms`,
-        result.reason === "dry_run" ? "_(dry run)_" : "",
+        `Copy-Trade ${result.trade.side}${dryTag}`,
+        `${result.trade.title.slice(0, 60) || "?"}`,
+        `Outcome: ${result.trade.outcome || "?"}`,
+        ``,
+        `Leader: ${leaderUsd} · ${leaderShares} sh @ ${leaderPrice}¢`,
+        `Ours:   ${ourUsd} · ${ourShares} sh @ ${ourPrice}¢${priceDiffStr}`,
+        ``,
+        `GTC limit · ${result.latencyMs}ms · ${result.trade.source}`,
       ].join("\n"),
       "copy_filled",
     );
   } else if (result.reason && !["cooldown", "sell_filtered", "market_filtered"].includes(result.reason)) {
-    // Only notify for interesting skips/failures
     await telegram.send(
       [
-        `*Copy Skipped*`,
-        `Reason: ${result.reason}`,
-        `Market: ${result.trade.title.slice(0, 40)}`,
-        `${result.trade.outcome} @ ${result.trade.priceCents}¢`,
+        `Copy Skipped: ${result.reason}`,
+        `${result.trade.outcome || "?"} @ ${result.trade.priceCents}¢`,
       ].join("\n"),
       "copy_skipped",
     );
   }
 }
 
-// Bun and Node.js compatible entry
 main().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);

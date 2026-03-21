@@ -17,24 +17,33 @@ export interface CopyTradeConfig {
   // Target trader to copy
   targetAddress: string;
 
-  // Polling speed (ms) — lower = faster detection, more API calls
+  // Detection
+  /** Polygon WebSocket RPC URL for real-time on-chain detection */
+  rpcWsUrl: string;
+  /** Data API polling interval (ms) — fallback + metadata enrichment */
   pollIntervalMs: number;
 
   // Position sizing
-  /** Fixed USD amount per copy trade (0 = use percentage) */
+  /** Sizing mode: "fixed" | "percentage" | "portfolio" */
+  sizingMode: "fixed" | "percentage" | "portfolio";
+  /** Fixed USD amount per copy trade (sizingMode=fixed) */
   fixedAmountUsd: number;
-  /** % of balance per copy trade (used when fixedAmountUsd = 0) */
+  /** % of target's trade size to copy (sizingMode=percentage, 100 = same size) */
   copyAmountPct: number;
+  /** Leader's estimated portfolio size for portfolio-weighted sizing */
+  leaderPortfolioUsd: number;
   /** Max USD per single copy trade */
   maxTradeUsd: number;
   /** Min USD per single copy trade */
   minTradeUsd: number;
 
-  // Slippage
-  /** Max slippage in cents above target's price (e.g. 3 = pay up to 3¢ more) */
+  // Slippage / Price control
+  /** Max slippage in cents for bump (e.g. 1 = bump by 1¢ if not filled) */
   maxSlippageCents: number;
-  /** Max price willing to pay (cents). Skip if ask > this */
+  /** Max price willing to pay (cents). Skip if price > this */
   maxPriceCents: number;
+  /** Bump price after this many ms if GTC order not filled (0 = no bump) */
+  bumpAfterMs: number;
 
   // Filters
   /** Only copy trades on these market types (empty = all) */
@@ -142,18 +151,24 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   // Target trader
   const targetAddress = requireEnv("COPY_TARGET_ADDRESS").toLowerCase();
 
-  // Polling speed
-  const pollIntervalMs = parseNumber("COPY_POLL_INTERVAL_MS", 300);
+  // Detection
+  const rpcWsUrl = getEnv("RPC_WS_URL") ?? "wss://polygon-bor-rpc.publicnode.com";
+  const pollIntervalMs = parseNumber("COPY_POLL_INTERVAL_MS", 500);
 
   // Position sizing
+  const sizingModeRaw = (getEnv("COPY_SIZING_MODE") ?? "portfolio").toLowerCase();
+  const sizingMode = (["fixed", "percentage", "portfolio"].includes(sizingModeRaw)
+    ? sizingModeRaw : "portfolio") as "fixed" | "percentage" | "portfolio";
   const fixedAmountUsd = parseNumber("COPY_FIXED_AMOUNT_USD", 0);
   const copyAmountPct = parseNumber("COPY_AMOUNT_PCT", 100);
+  const leaderPortfolioUsd = parseNumber("COPY_LEADER_PORTFOLIO_USD", 0);
   const maxTradeUsd = parseNumber("COPY_MAX_TRADE_USD", 500);
   const minTradeUsd = parseNumber("COPY_MIN_TRADE_USD", 1);
 
-  // Slippage
-  const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 3);
+  // Slippage — default 1¢ (not 3¢)
+  const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 1);
   const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 95);
+  const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 0); // 0 = no bump (order just sits)
 
   // Filters
   const marketFilterRaw = getEnv("COPY_MARKET_FILTER") ?? "";
@@ -165,7 +180,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const maxExposurePct = parseNumber("COPY_MAX_EXPOSURE_PCT", 50);
   const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50);
   const maxCopiesPerWindow = parseNumber("COPY_MAX_PER_WINDOW", 10);
-  const cooldownMs = parseNumber("COPY_COOLDOWN_MS", 500);
+  const cooldownMs = parseNumber("COPY_COOLDOWN_MS", 200);
 
   // Auto-redeem
   const autoRedeem = parseBoolean("AUTO_REDEEM", true);
@@ -202,13 +217,17 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     profileAddress,
     apiCreds,
     targetAddress,
+    rpcWsUrl,
     pollIntervalMs,
+    sizingMode,
     fixedAmountUsd,
     copyAmountPct,
+    leaderPortfolioUsd,
     maxTradeUsd,
     minTradeUsd,
     maxSlippageCents,
     maxPriceCents,
+    bumpAfterMs,
     marketFilter,
     copyBuysOnly,
     copyRedemptions,
