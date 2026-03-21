@@ -308,7 +308,7 @@ export class CopyExecutor {
         side,
         price,
         size: shares,
-        timeoutMs: 10_000, // 10s to try maker, then FOK
+        timeoutMs: 1_500, // 1.5s to try maker, then FOK (fast fill)
       });
 
       if (!result.filled && result.orderIds.length === 0) {
