@@ -279,12 +279,14 @@ async function notifyResult(
         `Leader: ${leaderUsd} · ${leaderShares} sh @ ${leaderPrice}¢`,
         `Ours:   ${ourUsd} · ${ourShares} sh @ ${ourPrice}¢${priceDiffStr}`,
         ``,
-        `GTC limit · ${result.latencyMs}ms · ${result.trade.source}`,
-        result.reason !== "dry_run" ? `_Waiting for fill..._` : "",
-      ].filter(Boolean).join("\n"),
+        result.reason === "maker_fill" ? `Maker fill (0% fee) · ${result.latencyMs}ms`
+          : result.reason === "taker_fill" ? `Taker fill · ${result.latencyMs}ms`
+          : result.reason === "dry_run" ? `DRY RUN · ${result.latencyMs}ms`
+          : `Limit placed · ${result.latencyMs}ms · ${result.trade.source}`,
+      ].join("\n"),
       "copy_placed",
     );
-  } else if (result.reason === "order_failed_after_retries") {
+  } else if (result.reason === "order_failed_after_retries" || result.reason === "order_failed" || result.reason === "order_failed_no_liquidity") {
     await telegram.send(
       [
         `*Copy Trade Failed*`,
