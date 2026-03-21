@@ -92,8 +92,8 @@ export class CopyExecutor {
     trade: TargetTrade;
   }> = new Map();
 
-  /** Fill timeout — cancel unfilled orders after this many ms (default 60s) */
-  private fillTimeoutMs = 60_000;
+  /** Fill timeout — cancel unfilled orders after this many ms (default 5 min) */
+  private fillTimeoutMs = 5 * 60_000;
   /** Fill check interval (ms) */
   private fillCheckIntervalMs = 3_000;
   /** Guard against overlapping checkPendingOrders runs */
@@ -181,29 +181,55 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
     }
 
-    // Determine price — use correct side of book
+    // Determine price — maximize fill probability while staying maker (0% fee)
     let priceCents: number;
     if (needsOrderbook) {
       if (obResult) {
-        // For maker strategy: BUY → use bestBid (sit on bid = maker, 0% fee)
-        //                     SELL → use bestAsk (sit on ask = maker, 0% fee)
-        // This matches the leader's likely entry price while keeping maker status
         const isBuy = trade.side === "BUY";
-        const bookPrice = isBuy ? obResult.bestBid : obResult.bestAsk;
-        if (bookPrice !== null) {
-          priceCents = Math.round(bookPrice * 100);
-          this.logger.info("Orderbook price resolved", {
-            tokenId: trade.tokenId.slice(0, 12) + "...",
-            side: trade.side,
-            price: `${priceCents}¢`,
-            bestAsk: obResult.bestAsk !== null ? `${Math.round(obResult.bestAsk * 100)}¢` : "null",
-            bestBid: obResult.bestBid !== null ? `${Math.round(obResult.bestBid * 100)}¢` : "null",
-          });
+        const bestBid = obResult.bestBid;
+        const bestAsk = obResult.bestAsk;
+
+        if (isBuy) {
+          if (bestBid !== null && bestAsk !== null) {
+            // Place at bestAsk - 1 tick: top of bid book, just below the ask
+            // This is still MAKER (0% fee) but maximizes fill probability
+            // Example: bestBid=50, bestAsk=52 → we place at 51¢ (matches leader's likely entry)
+            priceCents = Math.round(bestAsk * 100) - 1;
+            // But never below bestBid
+            priceCents = Math.max(priceCents, Math.round(bestBid * 100));
+          } else if (bestAsk !== null) {
+            // No bids — place just below ask
+            priceCents = Math.round(bestAsk * 100) - 1;
+          } else if (bestBid !== null) {
+            // No asks — place at bestBid + 1 (become top bidder)
+            priceCents = Math.round(bestBid * 100) + 1;
+          } else {
+            this.totalSkipped++;
+            return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_liquidity" };
+          }
         } else {
-          // No liquidity on our side of the book — skip trade
-          this.totalSkipped++;
-          return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_liquidity" };
+          // SELL: place at bestBid + 1 tick (top of ask book, just above bid)
+          if (bestBid !== null && bestAsk !== null) {
+            priceCents = Math.round(bestBid * 100) + 1;
+            priceCents = Math.min(priceCents, Math.round(bestAsk * 100));
+          } else if (bestBid !== null) {
+            priceCents = Math.round(bestBid * 100) + 1;
+          } else if (bestAsk !== null) {
+            priceCents = Math.round(bestAsk * 100);
+          } else {
+            this.totalSkipped++;
+            return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_liquidity" };
+          }
         }
+
+        this.logger.info("Orderbook price resolved", {
+          tokenId: trade.tokenId.slice(0, 12) + "...",
+          side: trade.side,
+          ourPrice: `${priceCents}¢`,
+          bestAsk: bestAsk !== null ? `${Math.round(bestAsk * 100)}¢` : "null",
+          bestBid: bestBid !== null ? `${Math.round(bestBid * 100)}¢` : "null",
+          strategy: "maker (bestAsk-1 for BUY, bestBid+1 for SELL)",
+        });
       } else {
         // Orderbook lookup failed entirely — skip trade (don't guess a price)
         this.totalSkipped++;
