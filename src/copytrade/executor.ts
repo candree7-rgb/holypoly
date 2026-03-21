@@ -53,15 +53,16 @@ interface WindowTracker {
 /**
  * Order executor for copy trading.
  *
- * Strategy: GTC limit first (0% maker fee), then escalate if not filled.
+ * Strategy: GTC limit order, let it sit and fill naturally (like the leader).
+ * These are pre-market orders (5-10min before start) — price stays ~49-51¢,
+ * order fills gradually as counterparties enter.
  *
  * Flow:
- * 1. Place GTC limit at maker price (bestAsk-1¢) → 0% fee
- * 2. After bumpAfterMs (30s), bump price +1¢ and re-place GTC
- * 3. Repeat up to maxBumps times (default 3: 50¢→51¢→52¢→53¢)
- * 4. If still unfilled after all bumps → FOK fallback (market order, taker fee)
+ * 1. Place GTC limit at maker price → 0% fee, wait up to 15 min
+ * 2. If still unfilled after 5 min → bump price +1¢ (up to 2x)
+ * 3. If still unfilled after all bumps → FOK fallback (last resort)
  *
- * This ensures: cheapest fills when possible, but never miss a trade.
+ * Primary fill comes from patience (step 1). Bumps + FOK are safety nets.
  */
 export class CopyExecutor {
   private clob: ClobService;
@@ -95,8 +96,8 @@ export class CopyExecutor {
     trade: TargetTrade;
   }> = new Map();
 
-  /** Fill timeout — cancel unfilled orders after this many ms (default 5 min) */
-  private fillTimeoutMs = 5 * 60_000;
+  /** Fill timeout — cancel unfilled orders after this many ms (default 15 min) */
+  private fillTimeoutMs = 15 * 60_000;
   /** Fill check interval (ms) */
   private fillCheckIntervalMs = 3_000;
   /** Guard against overlapping checkPendingOrders runs */
