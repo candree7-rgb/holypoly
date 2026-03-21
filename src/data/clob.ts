@@ -189,7 +189,7 @@ export class ClobService {
     side: Side;
     price: number;
     size: number;
-  }): Promise<void> {
+  }): Promise<{ orderId: string }> {
     const { tokenId, side } = params;
     const meta = await this.getMarketMeta(tokenId);
 
@@ -197,12 +197,7 @@ export class ClobService {
     const size = params.size;
 
     if (size < meta.minOrderSize) {
-      this.logger.warn("Order size below minimum", {
-        tokenId,
-        size,
-        min: meta.minOrderSize,
-      });
-      return;
+      throw new Error(`Order size ${size} below minimum ${meta.minOrderSize}`);
     }
 
     const resp = await this.client.createAndPostOrder(
@@ -221,6 +216,7 @@ export class ClobService {
     if (resp?.status && resp.status >= 400) {
       throw new Error(`Order failed (status ${resp.status})`);
     }
+    return { orderId: (resp as Record<string, unknown>)?.orderID as string ?? "" };
   }
 
   /**

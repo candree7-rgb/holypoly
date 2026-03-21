@@ -197,57 +197,80 @@ export class CopyExecutor {
       };
     }
 
-    // LIVE: Place GTC limit order at target's exact price
-    try {
-      const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
+    // LIVE: Place GTC limit order at target's exact price (with retry)
+    const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
+    const maxRetries = 3;
 
-      await this.clob.placeLimitOrder({
-        tokenId: trade.tokenId,
-        side,
-        price,
-        size: shares,
-      });
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const { orderId } = await this.clob.placeLimitOrder({
+          tokenId: trade.tokenId,
+          side,
+          price,
+          size: shares,
+        });
 
-      this.lastCopyTime = Date.now();
-      tracker.copies++;
-      tracker.totalUsd += copyUsd;
-      this.totalCopied++;
-      this.balance -= copyUsd;
+        this.lastCopyTime = Date.now();
+        tracker.copies++;
+        tracker.totalUsd += copyUsd;
+        this.totalCopied++;
+        this.balance -= copyUsd;
 
-      const latency = Date.now() - startMs;
+        // Track pending order for bump logic
+        if (orderId && this.config.bumpAfterMs > 0) {
+          this.pendingOrders.set(orderId, {
+            orderId,
+            tokenId: trade.tokenId,
+            price,
+            size: shares,
+            placedAt: Date.now(),
+            bumped: false,
+          });
+        }
 
-      this.logger.info("GTC LIMIT ORDER PLACED", {
-        side: trade.side,
-        outcome: trade.outcome || "?",
-        price: `${priceCents}¢ (same as target)`,
-        shares: shares.toFixed(1),
-        usd: `$${copyUsd.toFixed(2)}`,
-        fee: "0% (maker)",
-        latency: `${latency}ms`,
-        source: trade.source,
-        totalCopied: this.totalCopied,
-      });
+        const latency = Date.now() - startMs;
 
-      return {
-        success: true, trade,
-        executedPrice: price, executedShares: shares, executedUsd: copyUsd,
-        leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
-        latencyMs: latency,
-      };
-    } catch (err) {
-      this.totalFailed++;
-      this.logger.error("GTC order placement error", {
-        error: (err as Error).message,
-        outcome: trade.outcome,
-        latency: `${Date.now() - startMs}ms`,
-      });
+        this.logger.info("GTC LIMIT ORDER PLACED", {
+          side: trade.side,
+          outcome: trade.outcome || "?",
+          price: `${priceCents}¢ (same as target)`,
+          shares: shares.toFixed(1),
+          usd: `$${copyUsd.toFixed(2)}`,
+          fee: "0% (maker)",
+          latency: `${latency}ms`,
+          source: trade.source,
+          orderId: orderId ? orderId.slice(0, 12) + "..." : "?",
+          totalCopied: this.totalCopied,
+        });
 
-      return {
-        success: false, trade,
-        latencyMs: Date.now() - startMs,
-        reason: `error: ${(err as Error).message}`,
-      };
+        return {
+          success: true, trade, orderId,
+          executedPrice: price, executedShares: shares, executedUsd: copyUsd,
+          leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
+          latencyMs: latency,
+        };
+      } catch (err) {
+        const msg = (err as Error).message;
+        this.logger.warn(`Order attempt ${attempt}/${maxRetries} failed`, {
+          error: msg,
+          outcome: trade.outcome,
+        });
+
+        // Don't retry on non-transient errors
+        if (msg.includes("below minimum") || msg.includes("insufficient")) break;
+
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, attempt * 500));
+        }
+      }
     }
+
+    this.totalFailed++;
+    return {
+      success: false, trade,
+      latencyMs: Date.now() - startMs,
+      reason: "order_failed_after_retries",
+    };
   }
 
   /**
