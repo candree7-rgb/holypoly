@@ -13,6 +13,7 @@
  */
 
 import "dotenv/config";
+import { webcrypto } from "crypto";
 import { createLogger } from "../logger.js";
 import { ClobService } from "../data/clob.js";
 import { TelegramNotifier } from "../telegram.js";
@@ -33,6 +34,12 @@ const BANNER = `
 `;
 
 async function main() {
+  // Polyfill crypto.subtle for Node 18 (needed by CLOB client for API key derivation)
+  if (!globalThis.crypto) {
+    (globalThis as typeof globalThis & { crypto?: Crypto }).crypto =
+      webcrypto as Crypto;
+  }
+
   console.log(BANNER);
 
   const config = loadCopyTradeConfig();
@@ -80,8 +87,12 @@ async function main() {
   logger.info(`Balance: $${balance.toFixed(2)} USDC`);
 
   if (balance < config.minBalanceFloorUsd) {
-    logger.error(`Balance ($${balance.toFixed(2)}) below floor ($${config.minBalanceFloorUsd}). Exiting.`);
-    process.exit(1);
+    if (config.dryRun) {
+      logger.warn(`Balance ($${balance.toFixed(2)}) below floor — continuing anyway (DRY RUN)`);
+    } else {
+      logger.error(`Balance ($${balance.toFixed(2)}) below floor ($${config.minBalanceFloorUsd}). Exiting.`);
+      process.exit(1);
+    }
   }
 
   // Init executor (GTC limit orders)
