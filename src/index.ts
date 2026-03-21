@@ -651,6 +651,7 @@ const main = async () => {
       },
       logger,
       telegram,
+      config.dryRun,
     );
 
     // Start webhook server and wire signal handler

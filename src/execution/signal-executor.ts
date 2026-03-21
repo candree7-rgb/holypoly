@@ -93,6 +93,7 @@ export class SignalExecutor {
     private config: SignalExecutorConfig,
     private logger: Logger,
     private telegram: TelegramNotifier,
+    private dryRun: boolean = false,
   ) {}
 
   /**
@@ -321,6 +322,11 @@ export class SignalExecutor {
       ),
     });
 
+    if (this.dryRun) {
+      this.logger.info("DRY_RUN — ladder simulated (no real orders placed)");
+      return [];
+    }
+
     const result = await this.clob.placeBatchOrders(orders, OrderType.GTC);
 
     this.logger.info("Ladder placed", {
@@ -371,6 +377,12 @@ export class SignalExecutor {
     });
 
     const size = remainingUsd / fallbackPrice;
+
+    if (this.dryRun) {
+      this.logger.info("DRY_RUN — fallback simulated (no real order placed)");
+      exec.fallbackSent = true;
+      return;
+    }
 
     const result = await this.clob.placeBatchOrders(
       [{ tokenId, side: Side.BUY, price: fallbackPrice, size }],
@@ -434,8 +446,10 @@ export class SignalExecutor {
     const exec = this.activeExecution!;
 
     // Cancel any remaining unfilled GTC orders
-    for (const orderId of exec.orderIds) {
-      await this.clob.cancelOrder(orderId);
+    if (!this.dryRun) {
+      for (const orderId of exec.orderIds) {
+        await this.clob.cancelOrder(orderId);
+      }
     }
 
     // Final fill update
