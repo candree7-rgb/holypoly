@@ -24,18 +24,25 @@ export interface CopyTradeConfig {
   pollIntervalMs: number;
 
   // Position sizing
-  /** Sizing mode: "fixed" | "percentage" | "portfolio" */
-  sizingMode: "fixed" | "percentage" | "portfolio";
+  /** Sizing mode: "fixed" | "percentage" | "portfolio" | "shares" */
+  sizingMode: "fixed" | "percentage" | "portfolio" | "shares";
   /** Fixed USD amount per copy trade (sizingMode=fixed) */
   fixedAmountUsd: number;
+  /** Fixed shares per copy trade (sizingMode=shares) */
+  fixedShares: number;
   /** % of target's trade size to copy (sizingMode=percentage, 100 = same size) */
   copyAmountPct: number;
-  /** Leader's estimated portfolio size for portfolio-weighted sizing */
+  /** Multiplier on top of portfolio weighting (1=same%, 2=double%, 0.5=half%) */
+  copyMultiplier: number;
+  /** Fallback leader portfolio if on-chain check fails */
   leaderPortfolioUsd: number;
   /** Max USD per single copy trade */
   maxTradeUsd: number;
   /** Min USD per single copy trade */
   minTradeUsd: number;
+
+  // RPC for on-chain balance checks
+  rpcUrl: string;
 
   // Slippage / Price control
   /** Max slippage in cents for bump (e.g. 1 = bump by 1¢ if not filled) */
@@ -68,7 +75,6 @@ export interface CopyTradeConfig {
   relayerUrl: string;
   relayerTxType: "SAFE" | "PROXY";
   builderCreds?: { key: string; secret: string; passphrase: string };
-  rpcUrl?: string;
 
   // Telegram
   telegramBotToken?: string;
@@ -157,13 +163,18 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
 
   // Position sizing
   const sizingModeRaw = (getEnv("COPY_SIZING_MODE") ?? "portfolio").toLowerCase();
-  const sizingMode = (["fixed", "percentage", "portfolio"].includes(sizingModeRaw)
-    ? sizingModeRaw : "portfolio") as "fixed" | "percentage" | "portfolio";
+  const sizingMode = (["fixed", "percentage", "portfolio", "shares"].includes(sizingModeRaw)
+    ? sizingModeRaw : "portfolio") as "fixed" | "percentage" | "portfolio" | "shares";
   const fixedAmountUsd = parseNumber("COPY_FIXED_AMOUNT_USD", 0);
+  const fixedShares = parseNumber("COPY_FIXED_SHARES", 0);
   const copyAmountPct = parseNumber("COPY_AMOUNT_PCT", 100);
-  const leaderPortfolioUsd = parseNumber("COPY_LEADER_PORTFOLIO_USD", 0);
+  const copyMultiplier = parseNumber("COPY_MULTIPLIER", 1.0);
+  const leaderPortfolioUsd = parseNumber("COPY_LEADER_PORTFOLIO_USD", 0); // fallback only
   const maxTradeUsd = parseNumber("COPY_MAX_TRADE_USD", 500);
   const minTradeUsd = parseNumber("COPY_MIN_TRADE_USD", 1);
+
+  // RPC for on-chain balance checks (leader portfolio)
+  const rpcUrl = getEnv("RPC_URL") ?? "https://polygon-rpc.com";
 
   // Slippage — default 1¢ (not 3¢)
   const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 1);
@@ -192,7 +203,6 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const builderCreds = builderKey && builderSecret && builderPassphrase
     ? { key: builderKey, secret: builderSecret, passphrase: builderPassphrase }
     : undefined;
-  const rpcUrl = getEnv("RPC_URL");
 
   // Telegram
   const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
@@ -221,10 +231,13 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     pollIntervalMs,
     sizingMode,
     fixedAmountUsd,
+    fixedShares,
     copyAmountPct,
+    copyMultiplier,
     leaderPortfolioUsd,
     maxTradeUsd,
     minTradeUsd,
+    rpcUrl,
     maxSlippageCents,
     maxPriceCents,
     bumpAfterMs,
@@ -239,7 +252,6 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     relayerUrl,
     relayerTxType,
     builderCreds,
-    rpcUrl,
     telegramBotToken,
     telegramChatId,
     dryRun,

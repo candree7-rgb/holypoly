@@ -48,7 +48,8 @@ async function main() {
     orderType: "GTC limit (maker, 0% fee)",
     slippage: config.bumpAfterMs > 0 ? `bump +${config.maxSlippageCents}¢ after ${config.bumpAfterMs}ms` : "same price (no bump)",
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
-      : config.sizingMode === "portfolio" ? `portfolio-weighted (leader=$${config.leaderPortfolioUsd})`
+      : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
+      : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
       : `${config.copyAmountPct}% of target`,
     dryRun: config.dryRun,
   });

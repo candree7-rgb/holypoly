@@ -1,5 +1,8 @@
-import { Side, OrderType } from "@polymarket/clob-client";
+import { Side } from "@polymarket/clob-client";
 import { ClobService } from "../data/clob.js";
+
+/** USDC.e on Polygon (Polymarket uses this for balances) */
+const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 import type { Logger } from "../logger.js";
 import type { CopyTradeConfig } from "./config.js";
 import type { TargetTrade } from "./tracker.js";
@@ -51,6 +54,10 @@ export class CopyExecutor {
   private totalCopied = 0;
   private totalSkipped = 0;
   private totalFailed = 0;
+
+  // Leader balance (fetched dynamically from on-chain)
+  private leaderBalance: number = 0;
+  private lastLeaderBalanceCheck: number = 0;
 
   // Track pending GTC orders so we can cancel them if window ends
   private pendingOrders: Map<string, {
@@ -115,8 +122,9 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: "window_limit" };
     }
 
-    // Balance check (cached 10s)
+    // Balance checks (cached)
     await this.refreshBalance();
+    await this.refreshLeaderBalance();
     if (this.balance < this.config.minBalanceFloorUsd) {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
@@ -294,15 +302,22 @@ export class CopyExecutor {
   /**
    * Calculate copy trade size in USD.
    *
-   * Three modes:
-   * - "fixed":      Always trade fixedAmountUsd
-   * - "percentage": Copy X% of target's trade size
-   * - "portfolio":  Scale proportionally to our balance vs leader's portfolio.
-   *                 If leader has $4000 and trades $100 (2.5%), and we have $200,
-   *                 we trade $5 (2.5% of our balance). Same risk proportionally.
+   * Four modes:
+   * - "portfolio":  Scale proportionally. Leader uses X% of their balance,
+   *                 we use X% * COPY_MULTIPLIER of ours.
+   *                 Leader balance fetched dynamically from on-chain USDC.
+   * - "percentage": Copy X% of target's trade size (COPY_AMOUNT_PCT)
+   * - "fixed":      Always trade COPY_FIXED_AMOUNT_USD
+   * - "shares":     Always trade COPY_FIXED_SHARES shares
+   *
+   * COPY_MULTIPLIER applies on top of portfolio mode:
+   *   1.0 = same % as leader (1:1)
+   *   2.0 = double the % (2x risk)
+   *   0.5 = half the % (conservative)
    */
   private calculateCopySize(trade: TargetTrade, priceCents: number): number {
     const targetUsd = trade.usdValue > 0 ? trade.usdValue : trade.shares * priceCents / 100;
+    const price = priceCents / 100;
     let copyUsd: number;
 
     switch (this.config.sizingMode) {
@@ -310,21 +325,24 @@ export class CopyExecutor {
         copyUsd = this.config.fixedAmountUsd;
         break;
 
+      case "shares":
+        copyUsd = this.config.fixedShares * price;
+        break;
+
       case "percentage":
         copyUsd = targetUsd * (this.config.copyAmountPct / 100);
         break;
 
       case "portfolio": {
-        // Portfolio-weighted: same % of our balance as leader uses of theirs
-        // Leader portfolio is estimated from COPY_LEADER_PORTFOLIO_USD env var
-        // or we use a reasonable default
-        const leaderPortfolio = this.config.leaderPortfolioUsd;
-        if (leaderPortfolio > 0 && targetUsd > 0) {
-          const pct = targetUsd / leaderPortfolio;
-          copyUsd = this.balance * pct;
+        const leaderBal = this.leaderBalance > 0 ? this.leaderBalance : this.config.leaderPortfolioUsd;
+        if (leaderBal > 0 && targetUsd > 0) {
+          // What % of their balance did the leader use?
+          const leaderPct = targetUsd / leaderBal;
+          // Apply same % to our balance, times multiplier
+          copyUsd = this.balance * leaderPct * this.config.copyMultiplier;
         } else {
-          // Fallback: percentage mode
-          copyUsd = targetUsd * (this.config.copyAmountPct / 100);
+          // Fallback: just copy same USD * multiplier
+          copyUsd = targetUsd * this.config.copyMultiplier;
         }
         break;
       }
@@ -338,6 +356,8 @@ export class CopyExecutor {
     return Math.max(copyUsd, 0);
   }
 
+  // ==================== BALANCE MANAGEMENT ====================
+
   private async refreshBalance(): Promise<void> {
     const now = Date.now();
     if (now - this.lastBalanceCheck < 10_000 && this.balance > 0) return;
@@ -346,6 +366,54 @@ export class CopyExecutor {
       this.lastBalanceCheck = now;
     } catch (err) {
       this.logger.warn("Balance check failed", { error: (err as Error).message });
+    }
+  }
+
+  /**
+   * Fetch leader's USDC balance on-chain from Polygon.
+   * Called periodically (every 60s) to keep portfolio-weighted sizing accurate.
+   */
+  async refreshLeaderBalance(): Promise<void> {
+    if (this.config.sizingMode !== "portfolio") return;
+    const now = Date.now();
+    if (now - this.lastLeaderBalanceCheck < 60_000 && this.leaderBalance > 0) return;
+
+    try {
+      // ERC-20 balanceOf(address) selector = 0x70a08231
+      const paddedAddr = this.config.targetAddress.replace("0x", "").toLowerCase().padStart(64, "0");
+      const callData = "0x70a08231" + paddedAddr;
+
+      const resp = await fetch(this.config.rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "eth_call",
+          params: [
+            { to: USDC_ADDRESS, data: callData },
+            "latest",
+          ],
+        }),
+      });
+
+      const data = (await resp.json()) as { result?: string };
+      if (data.result) {
+        const raw = BigInt(data.result);
+        this.leaderBalance = Number(raw) / 1e6; // USDC has 6 decimals
+        this.lastLeaderBalanceCheck = now;
+
+        this.logger.info("Leader USDC balance updated", {
+          target: this.config.targetAddress.slice(0, 8) + "...",
+          balance: `$${this.leaderBalance.toFixed(2)}`,
+        });
+      }
+    } catch (err) {
+      this.logger.warn("Failed to fetch leader balance", { error: (err as Error).message });
+      // Use fallback from config
+      if (this.leaderBalance === 0 && this.config.leaderPortfolioUsd > 0) {
+        this.leaderBalance = this.config.leaderPortfolioUsd;
+      }
     }
   }
 
