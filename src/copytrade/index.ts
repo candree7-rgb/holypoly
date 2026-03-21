@@ -105,12 +105,19 @@ async function main() {
     config.rpcWsUrl,
     config.pollIntervalMs,
     logger,
+    config.gammaHost,
   );
 
   // Wire: tracker → executor → telegram
-  tracker.onNewTrade(async (trade) => {
-    const result = await executor.executeCopy(trade);
-    await notifyResult(result, telegram, logger);
+  tracker.onNewTrade((trade) => {
+    // Fire-and-forget: don't let Telegram failures block detection pipeline
+    executor.executeCopy(trade)
+      .then((result) => notifyResult(result, telegram, logger).catch((err) => {
+        logger.warn("Telegram notify failed", { error: (err as Error).message });
+      }))
+      .catch((err) => {
+        logger.error("executeCopy crashed", { error: (err as Error).message, trade: trade.id });
+      });
   });
 
   // Startup alert
@@ -214,6 +221,10 @@ async function notifyResult(
     );
   }
 }
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
 
 main().catch((err) => {
   console.error("Fatal error:", err);

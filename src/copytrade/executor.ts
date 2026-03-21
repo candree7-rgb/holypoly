@@ -63,6 +63,7 @@ export class CopyExecutor {
   private pendingOrders: Map<string, {
     orderId: string;
     tokenId: string;
+    side: Side;
     price: number;
     size: number;
     placedAt: number;
@@ -221,6 +222,7 @@ export class CopyExecutor {
           this.pendingOrders.set(orderId, {
             orderId,
             tokenId: trade.tokenId,
+            side,
             price,
             size: shares,
             placedAt: Date.now(),
@@ -310,7 +312,7 @@ export class CopyExecutor {
         // Place new order at bumped price
         await this.clob.placeLimitOrder({
           tokenId: order.tokenId,
-          side: Side.BUY,
+          side: order.side,
           price: bumpPrice,
           size: order.size - filled,
         });

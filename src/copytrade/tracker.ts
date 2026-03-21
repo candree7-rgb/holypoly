@@ -58,6 +58,7 @@ const padAddress = (addr: string): string => "0x" + addr.replace("0x", "").toLow
  */
 export class TargetTracker {
   private dataApiHost: string;
+  private gammaHost: string;
   private targetAddress: string;
   private logger: Logger;
   private seenIds: Set<string> = new Set();
@@ -80,6 +81,9 @@ export class TargetTracker {
   // Pending on-chain events waiting for metadata from API
   private pendingChainEvents: Map<string, { tokenId: string; shares: number; timestamp: number }> = new Map();
 
+  // Cache: token ID → market metadata (avoid repeated Gamma lookups)
+  private marketCache: Map<string, { conditionId: string; title: string; outcome: string; clobTokenId: string } | null> = new Map();
+
   // Stats
   private stats = {
     chainEvents: 0,
@@ -94,8 +98,10 @@ export class TargetTracker {
     rpcWsUrl: string,
     pollIntervalMs: number,
     logger: Logger,
+    gammaHost?: string,
   ) {
     this.dataApiHost = dataApiHost.replace(/\/$/, "");
+    this.gammaHost = (gammaHost ?? "https://gamma-api.polymarket.com").replace(/\/$/, "");
     this.targetAddress = targetAddress.toLowerCase();
     this.rpcWsUrl = rpcWsUrl;
     this.pollIntervalMs = pollIntervalMs;
@@ -250,7 +256,9 @@ export class TargetTracker {
       const data = log.data.replace("0x", "");
       if (data.length < 128) return;
 
-      const tokenId = "0x" + data.slice(0, 64).replace(/^0+/, "") || "0";
+      // Convert token ID from hex to decimal string (CLOB/Gamma expect decimal)
+      const tokenIdBigInt = BigInt("0x" + data.slice(0, 64));
+      const tokenIdDecimal = tokenIdBigInt.toString();
       const rawValue = BigInt("0x" + data.slice(64, 128));
       // CTF tokens use 6 decimals (like USDC)
       const shares = Number(rawValue) / 1e6;
@@ -258,7 +266,7 @@ export class TargetTracker {
       if (shares <= 0) return;
 
       const txHash = log.transactionHash || "";
-      const eventId = `chain-${txHash}-${tokenId}`;
+      const eventId = `chain-${txHash}-${tokenIdDecimal}`;
 
       if (this.seenIds.has(eventId)) return;
       this.seenIds.add(eventId);
@@ -266,40 +274,142 @@ export class TargetTracker {
       this.stats.chainEvents++;
 
       this.logger.info("ON-CHAIN: Target received tokens", {
-        tokenId: tokenId.slice(0, 16) + "...",
+        tokenId: tokenIdDecimal.slice(0, 16) + "...",
         shares: shares.toFixed(1),
         tx: txHash.slice(0, 12) + "...",
         latency: "~2s (block time)",
       });
 
-      // Store pending event — we'll get full metadata (price, market name) from the API poll
-      this.pendingChainEvents.set(tokenId, {
-        tokenId: "0x" + data.slice(0, 64), // Full token ID with leading zeros
+      // Store pending event for API dedup
+      this.pendingChainEvents.set(tokenIdDecimal, {
+        tokenId: tokenIdDecimal,
         shares,
         timestamp: Date.now(),
       });
 
-      // Also emit immediately with what we know (no price/market info yet)
-      // The executor can still act on this — it knows the token ID and can look up the market
-      const trade: TargetTrade = {
-        id: eventId,
-        side: "BUY",
-        type: "TRADE",
-        conditionId: "", // Will be resolved by executor via CLOB
-        tokenId: "0x" + data.slice(0, 64),
-        outcome: "", // Unknown yet
-        priceCents: 0, // Unknown yet — executor will use current orderbook
-        shares,
-        usdValue: 0,
-        title: "",
-        timestamp: Date.now(),
-        source: "chain",
-      };
-
-      if (this.onTrade) {
-        this.onTrade(trade);
-      }
+      // Resolve market metadata via Gamma API, THEN emit
+      this.resolveAndEmitChainEvent(eventId, tokenIdDecimal, shares);
     }
+  }
+
+  /**
+   * Resolve chain event metadata via Gamma API, then emit.
+   * If Gamma fails, emit with partial data (executor will use orderbook fallback).
+   */
+  private async resolveAndEmitChainEvent(eventId: string, tokenIdDecimal: string, shares: number): Promise<void> {
+    let conditionId = "";
+    let title = "";
+    let outcome = "";
+    let priceCents = 0;
+    let clobTokenId = tokenIdDecimal;
+
+    try {
+      const cached = this.marketCache.get(tokenIdDecimal);
+      if (cached !== undefined) {
+        if (cached) {
+          conditionId = cached.conditionId;
+          title = cached.title;
+          outcome = cached.outcome;
+          clobTokenId = cached.clobTokenId;
+        }
+      } else {
+        const meta = await this.lookupMarketByTokenId(tokenIdDecimal);
+        this.marketCache.set(tokenIdDecimal, meta);
+        if (meta) {
+          conditionId = meta.conditionId;
+          title = meta.title;
+          outcome = meta.outcome;
+          clobTokenId = meta.clobTokenId;
+
+          this.logger.info("Gamma: Resolved chain event", {
+            tokenId: tokenIdDecimal.slice(0, 12) + "...",
+            market: title.slice(0, 50),
+            outcome,
+            conditionId: conditionId.slice(0, 12) + "...",
+          });
+        } else {
+          this.logger.warn("Gamma: Could not resolve token ID", {
+            tokenId: tokenIdDecimal.slice(0, 16) + "...",
+          });
+        }
+      }
+    } catch (err) {
+      this.logger.warn("Gamma lookup failed", { error: (err as Error).message });
+    }
+
+    const trade: TargetTrade = {
+      id: eventId,
+      side: "BUY",
+      type: "TRADE",
+      conditionId,
+      tokenId: clobTokenId,
+      outcome,
+      priceCents, // 0 = executor will look up orderbook
+      shares,
+      usdValue: 0,
+      title,
+      timestamp: Date.now(),
+      source: "chain",
+    };
+
+    if (this.onTrade) {
+      this.onTrade(trade);
+    }
+  }
+
+  /**
+   * Look up market metadata from Gamma API using a CLOB token ID.
+   * Returns conditionId, title, outcome name, and the canonical CLOB token ID.
+   */
+  private async lookupMarketByTokenId(tokenId: string): Promise<{
+    conditionId: string;
+    title: string;
+    outcome: string;
+    clobTokenId: string;
+  } | null> {
+    const url = `${this.gammaHost}/markets?clob_token_ids=${encodeURIComponent(tokenId)}&limit=1`;
+    const resp = await fetch(url, {
+      headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+      signal: AbortSignal.timeout(5000),
+    });
+
+    if (!resp.ok) return null;
+
+    const data = (await resp.json()) as Array<{
+      conditionId?: string;
+      condition_id?: string;
+      question?: string;
+      title?: string;
+      outcomes?: string;
+      clobTokenIds?: string;
+      clob_token_ids?: string;
+    }>;
+
+    if (!data || data.length === 0) return null;
+
+    const m = data[0];
+    const conditionId = m.conditionId || m.condition_id || "";
+    const title = m.question || m.title || "";
+
+    // Parse outcomes and token IDs to find which outcome this token represents
+    const outcomes = (() => { try { return JSON.parse(m.outcomes || "[]") as string[]; } catch { return []; } })();
+    const clobTokenIds = (() => {
+      try { return JSON.parse(m.clobTokenIds || m.clob_token_ids || "[]") as string[]; } catch { return []; }
+    })();
+
+    let outcome = "";
+    let clobTokenId = tokenId;
+    const idx = clobTokenIds.findIndex((id) => id === tokenId);
+    if (idx >= 0) {
+      outcome = outcomes[idx] || "";
+      clobTokenId = clobTokenIds[idx];
+    } else if (outcomes.length > 0) {
+      // Token ID didn't match - might be a format issue. Use first outcome as fallback.
+      outcome = outcomes[0] || "";
+      clobTokenId = clobTokenIds[0] || tokenId;
+    }
+
+    return { conditionId, title, outcome, clobTokenId };
   }
 
   private scheduleChainReconnect(): void {
@@ -349,7 +459,11 @@ export class TargetTracker {
         if (this.seenIds.has(trade.id)) continue;
 
         // Also check if we have a pending chain event for this token
-        const chainPending = this.pendingChainEvents.get(trade.tokenId);
+        // (chain events use decimal token IDs, API may use different format)
+        const chainPending = this.pendingChainEvents.get(trade.tokenId)
+          || Array.from(this.pendingChainEvents.values()).find(
+            (p) => Math.abs(p.shares - trade.shares) < 0.01 && Date.now() - p.timestamp < 60000,
+          );
         if (chainPending) {
           // Already emitted via chain — skip API duplicate
           this.pendingChainEvents.delete(trade.tokenId);
