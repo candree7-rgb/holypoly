@@ -80,6 +80,9 @@ export interface CopyTradeConfig {
   telegramBotToken?: string;
   telegramChatId?: string;
 
+  // Database (optional)
+  databaseUrl?: string;
+
   // Operation
   dryRun: boolean;
   debug: boolean;
@@ -208,6 +211,9 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
   const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
 
+  // Database (optional)
+  const databaseUrl = getEnv("DATABASE_URL");
+
   // Operation
   const dryRun = parseBoolean("DRY_RUN", true);
   const debug = parseBoolean("DEBUG", false);
@@ -254,6 +260,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     builderCreds,
     telegramBotToken,
     telegramChatId,
+    databaseUrl,
     dryRun,
     debug,
   };

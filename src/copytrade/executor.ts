@@ -23,6 +23,26 @@ export interface CopyResult {
   reason?: string;
 }
 
+export interface FillEvent {
+  orderId: string;
+  trade: TargetTrade;
+  filledShares: number;
+  price: number;
+  usd: number;
+  placedAt: number;
+  filledAt: number;
+}
+
+export interface UnfilledEvent {
+  orderId: string;
+  trade: TargetTrade;
+  requestedShares: number;
+  filledShares: number;
+  price: number;
+  placedAt: number;
+  cancelled: boolean;
+}
+
 interface WindowTracker {
   windowKey: string;
   copies: number;
@@ -59,7 +79,7 @@ export class CopyExecutor {
   private leaderBalance: number = 0;
   private lastLeaderBalanceCheck: number = 0;
 
-  // Track pending GTC orders so we can cancel them if window ends
+  // Track pending GTC orders for fill tracking + bumps
   private pendingOrders: Map<string, {
     orderId: string;
     tokenId: string;
@@ -68,18 +88,32 @@ export class CopyExecutor {
     size: number;
     placedAt: number;
     bumped: boolean;
+    trade: TargetTrade;
   }> = new Map();
+
+  /** Fill timeout — cancel unfilled orders after this many ms (default 60s) */
+  private fillTimeoutMs = 60_000;
+  /** Fill check interval (ms) */
+  private fillCheckIntervalMs = 3_000;
+
+  // Callbacks
+  private onFilledCb: ((event: FillEvent) => void) | null = null;
+  private onUnfilledCb: ((event: UnfilledEvent) => void) | null = null;
 
   constructor(clob: ClobService, config: CopyTradeConfig, logger: Logger) {
     this.clob = clob;
     this.config = config;
     this.logger = logger;
 
-    // Start bump checker (checks if pending orders need price bump)
-    if (config.bumpAfterMs > 0) {
-      setInterval(() => this.checkPendingBumps(), 2000);
-    }
+    // Always run fill checker — tracks fills AND handles bumps
+    setInterval(() => this.checkPendingOrders(), this.fillCheckIntervalMs);
   }
+
+  /** Register callback for when an order is filled */
+  onFilled(cb: (event: FillEvent) => void): void { this.onFilledCb = cb; }
+
+  /** Register callback for when an order times out unfilled */
+  onUnfilled(cb: (event: UnfilledEvent) => void): void { this.onUnfilledCb = cb; }
 
   /**
    * Execute a copy trade based on detected target trade.
@@ -123,9 +157,22 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: "window_limit" };
     }
 
-    // Balance checks (cached)
-    await this.refreshBalance();
-    await this.refreshLeaderBalance();
+    // Parallel: refresh balances + resolve orderbook price simultaneously
+    const needsOrderbook = trade.source === "chain" || trade.priceCents === 0;
+    const [, , obResult] = await Promise.all([
+      this.refreshBalance(),
+      this.refreshLeaderBalance(),
+      needsOrderbook
+        ? this.clob.getOrderbook(trade.tokenId).catch((err: Error) => {
+            this.logger.warn("Orderbook lookup failed, using 51¢ fallback", {
+              tokenId: trade.tokenId.slice(0, 12) + "...",
+              error: err.message,
+            });
+            return null;
+          })
+        : Promise.resolve(null),
+    ]);
+
     if (this.balance < this.config.minBalanceFloorUsd) {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
@@ -133,29 +180,18 @@ export class CopyExecutor {
 
     // Determine price
     let priceCents: number;
-    if (trade.source === "chain" || trade.priceCents === 0) {
-      // Chain event — look up orderbook for current best ask
-      try {
-        const ob = await this.clob.getOrderbook(trade.tokenId);
-        if (ob.bestAsk !== null) {
-          priceCents = Math.round(ob.bestAsk * 100);
-          this.logger.info("Orderbook price resolved", {
-            tokenId: trade.tokenId.slice(0, 12) + "...",
-            bestAsk: `${priceCents}¢`,
-            bestBid: ob.bestBid !== null ? `${Math.round(ob.bestBid * 100)}¢` : "null",
-          });
-        } else {
-          priceCents = 51;
-          this.logger.warn("Orderbook empty, using 51¢ fallback", { tokenId: trade.tokenId.slice(0, 12) + "..." });
-        }
-      } catch (err) {
-        priceCents = 51;
-        this.logger.warn("Orderbook lookup failed, using 51¢ fallback", {
+    if (needsOrderbook) {
+      if (obResult && obResult.bestAsk !== null) {
+        priceCents = Math.round(obResult.bestAsk * 100);
+        this.logger.info("Orderbook price resolved", {
           tokenId: trade.tokenId.slice(0, 12) + "...",
-          error: (err as Error).message,
+          bestAsk: `${priceCents}¢`,
+          bestBid: obResult.bestBid !== null ? `${Math.round(obResult.bestBid * 100)}¢` : "null",
         });
+      } else {
+        priceCents = 51;
+        if (obResult) this.logger.warn("Orderbook empty, using 51¢ fallback", { tokenId: trade.tokenId.slice(0, 12) + "..." });
       }
-      // Update trade object so notifications show resolved price
       trade.priceCents = priceCents;
     } else {
       priceCents = trade.priceCents;
@@ -229,8 +265,8 @@ export class CopyExecutor {
         this.totalCopied++;
         this.balance -= copyUsd;
 
-        // Track pending order for bump logic
-        if (orderId && this.config.bumpAfterMs > 0) {
+        // Track pending order for fill tracking + optional bump
+        if (orderId) {
           this.pendingOrders.set(orderId, {
             orderId,
             tokenId: trade.tokenId,
@@ -239,6 +275,7 @@ export class CopyExecutor {
             size: shares,
             placedAt: Date.now(),
             bumped: false,
+            trade,
           });
         }
 
@@ -288,50 +325,120 @@ export class CopyExecutor {
   }
 
   /**
-   * Check pending GTC orders and bump price if not filled after bumpAfterMs.
+   * Check all pending orders: detect fills, handle bumps, cancel timed-out orders.
+   *
+   * Runs every 3s. For each pending order:
+   * 1. Check if filled (≥95%) → emit onFilled callback
+   * 2. If bumpAfterMs > 0 and not bumped → bump price
+   * 3. If past fillTimeoutMs → cancel and emit onUnfilled callback
    */
-  private async checkPendingBumps(): Promise<void> {
+  private async checkPendingOrders(): Promise<void> {
+    if (this.pendingOrders.size === 0) return;
     const now = Date.now();
-    for (const [key, order] of this.pendingOrders) {
-      if (order.bumped) continue;
-      if (now - order.placedAt < this.config.bumpAfterMs) continue;
 
-      // Check if filled
+    for (const [key, order] of this.pendingOrders) {
       try {
         const filled = await this.clob.getFilledShares(order.orderId);
+
+        // FILLED (≥95% matched)
         if (filled >= order.size * 0.95) {
-          // Filled — remove from pending
           this.pendingOrders.delete(key);
-          this.logger.info("Pending order filled (maker)", {
+
+          this.logger.info("Order FILLED (maker, 0% fee)", {
             orderId: order.orderId.slice(0, 12) + "...",
             filled: filled.toFixed(1),
+            price: `${Math.round(order.price * 100)}¢`,
+            elapsed: `${((now - order.placedAt) / 1000).toFixed(1)}s`,
           });
+
+          if (this.onFilledCb) {
+            this.onFilledCb({
+              orderId: order.orderId,
+              trade: order.trade,
+              filledShares: filled,
+              price: order.price,
+              usd: filled * order.price,
+              placedAt: order.placedAt,
+              filledAt: now,
+            });
+          }
           continue;
         }
 
-        // Not filled — bump by maxSlippageCents
-        const bumpPrice = order.price + this.config.maxSlippageCents / 100;
-        this.logger.info("Bumping unfilled order", {
-          orderId: order.orderId.slice(0, 12) + "...",
-          oldPrice: `${Math.round(order.price * 100)}¢`,
-          newPrice: `${Math.round(bumpPrice * 100)}¢`,
-          bump: `+${this.config.maxSlippageCents}¢`,
-        });
+        // BUMP: if bumpAfterMs > 0, not yet bumped, and past threshold
+        if (this.config.bumpAfterMs > 0 && !order.bumped && now - order.placedAt >= this.config.bumpAfterMs) {
+          const bumpPrice = order.price + this.config.maxSlippageCents / 100;
+          this.logger.info("Bumping unfilled order", {
+            orderId: order.orderId.slice(0, 12) + "...",
+            oldPrice: `${Math.round(order.price * 100)}¢`,
+            newPrice: `${Math.round(bumpPrice * 100)}¢`,
+            bump: `+${this.config.maxSlippageCents}¢`,
+          });
 
-        // Cancel old order
-        await this.clob.cancelOrder(order.orderId);
+          await this.clob.cancelOrder(order.orderId);
+          const remaining = order.size - filled;
+          try {
+            const { orderId: newId } = await this.clob.placeLimitOrder({
+              tokenId: order.tokenId,
+              side: order.side,
+              price: bumpPrice,
+              size: remaining,
+            });
+            // Replace in pending map with new order
+            this.pendingOrders.delete(key);
+            if (newId) {
+              this.pendingOrders.set(newId, {
+                ...order,
+                orderId: newId,
+                price: bumpPrice,
+                size: remaining,
+                placedAt: now,
+                bumped: true,
+              });
+            }
+          } catch (err) {
+            this.logger.warn("Bump order placement failed", { error: (err as Error).message });
+            order.bumped = true; // Don't retry
+          }
+          continue;
+        }
 
-        // Place new order at bumped price
-        await this.clob.placeLimitOrder({
-          tokenId: order.tokenId,
-          side: order.side,
-          price: bumpPrice,
-          size: order.size - filled,
-        });
+        // TIMEOUT: cancel unfilled orders after fillTimeoutMs
+        if (now - order.placedAt >= this.fillTimeoutMs) {
+          this.pendingOrders.delete(key);
 
-        order.bumped = true;
+          const cancelled = filled < order.size * 0.1; // Only cancel if barely filled
+          if (cancelled) {
+            await this.clob.cancelOrder(order.orderId);
+          }
+
+          this.logger.warn("Order UNFILLED — timed out", {
+            orderId: order.orderId.slice(0, 12) + "...",
+            filled: filled.toFixed(1),
+            requested: order.size.toFixed(1),
+            elapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
+            cancelled,
+          });
+
+          if (this.onUnfilledCb) {
+            this.onUnfilledCb({
+              orderId: order.orderId,
+              trade: order.trade,
+              requestedShares: order.size,
+              filledShares: filled,
+              price: order.price,
+              placedAt: order.placedAt,
+              cancelled,
+            });
+          }
+
+          // Refund balance for unfilled portion
+          if (cancelled) {
+            this.balance += (order.size - filled) * order.price;
+          }
+        }
       } catch (err) {
-        this.logger.warn("Bump check failed", { error: (err as Error).message });
+        this.logger.warn("Fill check failed", { error: (err as Error).message, orderId: order.orderId.slice(0, 12) + "..." });
       }
     }
   }

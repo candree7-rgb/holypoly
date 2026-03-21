@@ -19,7 +19,8 @@ import { ClobService } from "../data/clob.js";
 import { TelegramNotifier } from "../telegram.js";
 import { loadCopyTradeConfig } from "./config.js";
 import { TargetTracker } from "./tracker.js";
-import { CopyExecutor, type CopyResult } from "./executor.js";
+import { CopyExecutor, type CopyResult, type FillEvent, type UnfilledEvent } from "./executor.js";
+import { CopyTradeDB } from "./db.js";
 import { sleep } from "../utils.js";
 import type { Logger } from "../logger.js";
 
@@ -98,6 +99,18 @@ async function main() {
   // Init executor (GTC limit orders)
   const executor = new CopyExecutor(clob, config, logger);
 
+  // Init DB (optional — only if DATABASE_URL is set)
+  let db: CopyTradeDB | null = null;
+  if (config.databaseUrl) {
+    try {
+      db = new CopyTradeDB(config.databaseUrl, logger);
+      await db.init();
+    } catch (err) {
+      logger.warn("DB init failed — continuing without persistence", { error: (err as Error).message });
+      db = null;
+    }
+  }
+
   // Init tracker (WebSocket + API polling)
   const tracker = new TargetTracker(
     config.dataApiHost,
@@ -108,16 +121,75 @@ async function main() {
     config.gammaHost,
   );
 
-  // Wire: tracker → executor → telegram
+  // Wire: tracker → executor → telegram → DB
   tracker.onNewTrade((trade) => {
-    // Fire-and-forget: don't let Telegram failures block detection pipeline
     executor.executeCopy(trade)
-      .then((result) => notifyResult(result, telegram, logger).catch((err) => {
-        logger.warn("Telegram notify failed", { error: (err as Error).message });
-      }))
+      .then(async (result) => {
+        // Telegram (fire-and-forget)
+        notifyResult(result, telegram, logger).catch((err) => {
+          logger.warn("Telegram notify failed", { error: (err as Error).message });
+        });
+        // DB persistence
+        if (db) {
+          try {
+            if (result.success) {
+              await db.recordPlacement({
+                orderId: result.orderId,
+                tradeId: trade.id,
+                side: trade.side,
+                marketTitle: trade.title,
+                outcome: trade.outcome,
+                conditionId: trade.conditionId,
+                tokenId: trade.tokenId,
+                priceCents: trade.priceCents,
+                requestedShares: result.executedShares ?? 0,
+                requestedUsd: result.executedUsd ?? 0,
+                leaderPriceCents: result.leaderPriceCents,
+                leaderUsd: result.leaderUsd,
+                leaderShares: result.leaderShares,
+                source: trade.source,
+                latencyMs: result.latencyMs,
+                dryRun: result.reason === "dry_run",
+              });
+            } else if (result.reason === "order_failed_after_retries") {
+              await db.recordFailed(trade.id, trade.side, trade.title, result.reason);
+            } else if (result.reason && !["cooldown", "sell_filtered", "market_filtered"].includes(result.reason)) {
+              await db.recordSkip({
+                tradeId: trade.id, side: trade.side, marketTitle: trade.title,
+                outcome: trade.outcome, reason: result.reason, source: trade.source,
+              });
+            }
+          } catch (err) {
+            logger.warn("DB record failed", { error: (err as Error).message });
+          }
+        }
+      })
       .catch((err) => {
         logger.error("executeCopy crashed", { error: (err as Error).message, trade: trade.id });
       });
+  });
+
+  // Wire: fill tracking → telegram + DB
+  executor.onFilled((event) => {
+    notifyFilled(event, telegram, logger).catch((err) => {
+      logger.warn("Telegram fill notify failed", { error: (err as Error).message });
+    });
+    if (db) {
+      db.recordFill(event.orderId, event.filledShares, event.usd).catch((err) => {
+        logger.warn("DB fill record failed", { error: (err as Error).message });
+      });
+    }
+  });
+
+  executor.onUnfilled((event) => {
+    notifyUnfilled(event, telegram, logger).catch((err) => {
+      logger.warn("Telegram unfilled notify failed", { error: (err as Error).message });
+    });
+    if (db) {
+      db.recordUnfilled(event.orderId, event.filledShares, event.cancelled).catch((err) => {
+        logger.warn("DB unfilled record failed", { error: (err as Error).message });
+      });
+    }
   });
 
   // Startup alert
@@ -200,26 +272,99 @@ async function notifyResult(
 
     await telegram.send(
       [
-        `Copy-Trade ${result.trade.side}${dryTag}`,
-        `${result.trade.title.slice(0, 60) || "?"}`,
+        `*Copy Trade ${result.trade.side}${dryTag}*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
         `Outcome: ${result.trade.outcome || "?"}`,
         ``,
         `Leader: ${leaderUsd} · ${leaderShares} sh @ ${leaderPrice}¢`,
         `Ours:   ${ourUsd} · ${ourShares} sh @ ${ourPrice}¢${priceDiffStr}`,
         ``,
         `GTC limit · ${result.latencyMs}ms · ${result.trade.source}`,
-      ].join("\n"),
-      "copy_filled",
+        result.reason !== "dry_run" ? `_Waiting for fill..._` : "",
+      ].filter(Boolean).join("\n"),
+      "copy_placed",
     );
-  } else if (result.reason && !["cooldown", "sell_filtered", "market_filtered"].includes(result.reason)) {
+  } else if (result.reason === "order_failed_after_retries") {
     await telegram.send(
       [
-        `Copy Skipped: ${result.reason}`,
-        `${result.trade.outcome || "?"} @ ${result.trade.priceCents}¢`,
+        `*Copy Trade Failed*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Action: ${result.trade.side}`,
+        `Error: No matching orders available or insufficient liquidity.`,
+      ].join("\n"),
+    );
+  } else if (result.reason?.startsWith("price_too_high")) {
+    const price = result.trade.priceCents;
+    await telegram.send(
+      [
+        `*Copy Trade Skipped*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Reason: Price ${price}¢ out of configured range`,
+        `Your position is protected.`,
+      ].join("\n"),
+      "copy_skipped",
+    );
+  } else if (result.reason === "exposure_limit") {
+    await telegram.send(
+      [
+        `*Copy Trade Skipped*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Reason: Exposure limit reached`,
+        `Your position is protected.`,
+      ].join("\n"),
+      "copy_skipped",
+    );
+  } else if (result.reason?.startsWith("balance_floor")) {
+    await telegram.send(
+      [
+        `*Copy Trade Skipped*`,
+        `Market: ${result.trade.title.slice(0, 60) || "?"}`,
+        `Reason: Balance too low`,
       ].join("\n"),
       "copy_skipped",
     );
   }
+  // Silently skip cooldown, sell_filtered, market_filtered, window_limit
+}
+
+async function notifyFilled(
+  event: FillEvent,
+  telegram: TelegramNotifier,
+  _logger: Logger,
+): Promise<void> {
+  const priceCents = (event.price * 100).toFixed(1);
+  const elapsed = ((event.filledAt - event.placedAt) / 1000).toFixed(1);
+  await telegram.send(
+    [
+      `*Copy Trade Filled*`,
+      `Market: ${event.trade.title.slice(0, 60) || "?"}`,
+      `Outcome: ${event.trade.outcome || "?"}`,
+      `${event.filledShares.toFixed(1)} shares @ ${priceCents}¢ ($${event.usd.toFixed(2)})`,
+      `Maker fee: 0%`,
+      `Filled in ${elapsed}s`,
+    ].join("\n"),
+  );
+}
+
+async function notifyUnfilled(
+  event: UnfilledEvent,
+  telegram: TelegramNotifier,
+  _logger: Logger,
+): Promise<void> {
+  const priceCents = (event.price * 100).toFixed(1);
+  const elapsed = ((Date.now() - event.placedAt) / 1000).toFixed(0);
+  const partial = event.filledShares > 0
+    ? `Partial fill: ${event.filledShares.toFixed(1)}/${event.requestedShares.toFixed(1)} shares`
+    : `0/${event.requestedShares.toFixed(1)} shares filled`;
+  await telegram.send(
+    [
+      `*Copy Trade Unfilled*`,
+      `Market: ${event.trade.title.slice(0, 60) || "?"}`,
+      `Price: ${priceCents}¢`,
+      partial,
+      event.cancelled ? `Order cancelled after ${elapsed}s` : `Order expired after ${elapsed}s`,
+    ].join("\n"),
+  );
 }
 
 process.on("unhandledRejection", (err) => {
