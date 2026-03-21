@@ -642,8 +642,8 @@ const main = async () => {
       {
         ladderPricesCents: config.signalLadderPrices,
         ladderWeights: config.signalLadderWeights,
-        fokFallbackAfterSec: config.signalFokFallbackSec,
-        fokMaxPriceCents: config.signalFokMaxPriceCents,
+        fallbackAfterSec: config.signalFokFallbackSec,
+        fallbackMaxPriceCents: config.signalFokMaxPriceCents,
         buyAmountPct: config.buyAmountPct,
         fillPollIntervalMs: 5000,
         makerFeeRate: config.makerFeeRate,

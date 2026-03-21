@@ -24,10 +24,10 @@ export interface SignalExecutorConfig {
   ladderPricesCents: number[];
   /** How to distribute size across ladder levels (fractions, must sum to 1) */
   ladderWeights: number[];
-  /** Seconds into the target window before placing FOK fallback */
-  fokFallbackAfterSec: number;
-  /** Max price (cents) for FOK fallback */
-  fokMaxPriceCents: number;
+  /** Seconds into the target window before placing GTC fallback at max price */
+  fallbackAfterSec: number;
+  /** Max price (cents) for GTC fallback order */
+  fallbackMaxPriceCents: number;
   /** Total buy amount as % of balance */
   buyAmountPct: number;
   /** How often (ms) to poll for fills */
@@ -41,8 +41,8 @@ export interface SignalExecutorConfig {
 export const DEFAULT_SIGNAL_CONFIG: SignalExecutorConfig = {
   ladderPricesCents: [49, 50, 51],
   ladderWeights: [0.25, 0.40, 0.35], // 25% at 49¢, 40% at 50¢, 35% at 51¢
-  fokFallbackAfterSec: 240, // 4 min into the window
-  fokMaxPriceCents: 52,     // 52¢ + 2% taker fee = 53.04¢ effective — max acceptable
+  fallbackAfterSec: 240, // 4 min into the window
+  fallbackMaxPriceCents: 52, // 52¢ + 0% maker = 52¢ effective
   buyAmountPct: 4,
   fillPollIntervalMs: 5000,
   makerFeeRate: 0,
@@ -84,7 +84,7 @@ export class SignalExecutor {
     totalCostUsd: number;
     makerFills: number;
     takerFills: number;
-    fokSent: boolean;
+    fallbackSent: boolean;
   } | null = null;
 
   constructor(
@@ -226,7 +226,7 @@ export class SignalExecutor {
         totalCostUsd: 0,
         makerFills: 0,
         takerFills: 0,
-        fokSent: false,
+        fallbackSent: false,
       };
 
       this.pendingSignal = null;
@@ -249,11 +249,11 @@ export class SignalExecutor {
 
       // FOK fallback: if not enough filled and past the threshold
       if (
-        !exec.fokSent &&
-        windowElapsedSec >= this.config.fokFallbackAfterSec &&
+        !exec.fallbackSent &&
+        windowElapsedSec >= this.config.fallbackAfterSec &&
         exec.totalShares < 1 // minimum viable position
       ) {
-        await this.placeFokFallback(currentBalance);
+        await this.placeGtcFallback(currentBalance);
       }
 
       // If window is about to end (< 10s), finalize early for clean settlement
@@ -318,25 +318,29 @@ export class SignalExecutor {
   }
 
   /**
-   * FOK fallback for unfilled portion.
-   * Uses taker (2% fee) but ensures we have a position.
+   * GTC fallback for unfilled portion.
+   * Cancels lower ladder orders and places a single GTC at the fallback price.
+   * Still maker = 0% fee (much better than FOK at 2% taker).
    */
-  private async placeFokFallback(balance: number): Promise<void> {
+  private async placeGtcFallback(balance: number): Promise<void> {
     if (!this.activeExecution) return;
     const exec = this.activeExecution;
 
-    // Cancel remaining GTC orders first
+    // Cancel remaining unfilled GTC orders (lower prices that didn't fill)
     for (const orderId of exec.orderIds) {
       await this.clob.cancelOrder(orderId);
     }
+
+    // Re-check fills after cancellation
+    await this.updateFills();
 
     const totalBuyUsd = balance * this.config.buyAmountPct / 100;
     const alreadySpent = exec.totalCostUsd;
     const remainingUsd = Math.max(0, totalBuyUsd - alreadySpent);
 
     if (remainingUsd < 1) {
-      this.logger.info("Ladder fills sufficient, skipping FOK fallback");
-      exec.fokSent = true;
+      this.logger.info("Ladder fills sufficient, skipping fallback");
+      exec.fallbackSent = true;
       return;
     }
 
@@ -344,29 +348,28 @@ export class SignalExecutor {
       ? exec.window.upTokenId
       : exec.window.downTokenId;
 
-    const worstPrice = this.config.fokMaxPriceCents / 100;
+    const fallbackPrice = this.config.fallbackMaxPriceCents / 100; // e.g. 0.52
 
-    this.logger.info("FOK fallback (taker 2% fee)", {
+    this.logger.info("GTC fallback at max price (maker 0% fee)", {
       remainingUsd: `$${remainingUsd.toFixed(2)}`,
-      maxPrice: `${this.config.fokMaxPriceCents}¢`,
+      price: `${this.config.fallbackMaxPriceCents}¢`,
     });
 
-    const fokResult = await this.clob.placeMarketOrderFOK({
-      tokenId,
-      side: Side.BUY,
-      amount: remainingUsd,
-      worstPrice,
-    });
+    const size = remainingUsd / fallbackPrice;
 
-    exec.fokSent = true;
+    const result = await this.clob.placeBatchOrders(
+      [{ tokenId, side: Side.BUY, price: fallbackPrice, size }],
+      OrderType.GTC,
+    );
 
-    if (fokResult.filled) {
-      exec.orderIds.push(...fokResult.orderIds);
-      exec.takerFills++;
-      // Fills will be picked up on next updateFills()
-      this.logger.info("FOK fallback filled");
+    exec.fallbackSent = true;
+
+    if (result.placed > 0) {
+      exec.orderIds.push(...result.orderIds);
+      exec.makerFills++; // still maker!
+      this.logger.info("GTC fallback placed", { size: size.toFixed(1) });
     } else {
-      this.logger.warn("FOK fallback not filled — holding partial or no position");
+      this.logger.warn("GTC fallback failed to place");
     }
   }
 
@@ -416,7 +419,7 @@ export class SignalExecutor {
     const exec = this.activeExecution!;
 
     // Cancel any remaining GTC orders
-    if (!exec.fokSent) {
+    if (!exec.fallbackSent) {
       for (const orderId of exec.orderIds) {
         await this.clob.cancelOrder(orderId);
       }
@@ -429,13 +432,8 @@ export class SignalExecutor {
       ? (exec.totalCostUsd / exec.totalShares) * 100
       : 0;
 
-    // Estimate fees: maker fills = 0%, taker fills = 2%
-    // For simplicity, all GTC fills are maker (0%), FOK fills are taker (2%)
-    const makerCost = exec.fokSent
-      ? Math.max(0, exec.totalCostUsd - (exec.totalCostUsd * (exec.takerFills / Math.max(1, exec.makerFills + exec.takerFills))))
-      : exec.totalCostUsd;
-    const takerCost = exec.totalCostUsd - makerCost;
-    const estimatedFees = makerCost * this.config.makerFeeRate + takerCost * this.config.takerFeeRate;
+    // All orders are GTC (maker = 0% fee) — no taker fees in this strategy
+    const estimatedFees = exec.totalCostUsd * this.config.makerFeeRate;
 
     const result: SignalResult = {
       success: exec.totalShares > 0,
