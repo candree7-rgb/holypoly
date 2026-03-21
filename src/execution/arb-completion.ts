@@ -75,8 +75,12 @@ export class ArbCompletionMonitor {
   private lastFlippedLogAt = 0;
   /** Track hedge retry attempts to prevent infinite loops */
   private hedgeRetryCount = 0;
+  /** Set to true after all exit attempts exhausted — prevents re-triggering the same exit cycle */
+  private exitExhausted = false;
   private static readonly MAX_HEDGE_RETRIES = 3;
+  private static readonly MAX_SELLBACK_RETRIES = 5;
   private static readonly HEDGE_RETRY_STEP_CENTS = 2; // widen by 2¢ each retry
+  private static readonly SELLBACK_RETRY_STEP_CENTS = 5; // widen by 5¢ each retry (more aggressive)
 
   constructor(
     private clobWs: ClobWsClient,
@@ -109,6 +113,7 @@ export class ArbCompletionMonitor {
     const entryDelta = params.currentBtcPrice - params.window.openingPrice;
 
     this.generation++;
+    this.exitExhausted = false;
 
     this.state = {
       active: true,
@@ -250,7 +255,7 @@ export class ArbCompletionMonitor {
    * Triggers emergency sell-back if delta collapses.
    */
   private checkReversal(currentDelta: number): void {
-    if (!this.state || this.state.fillInFlight) return;
+    if (!this.state || this.state.fillInFlight || this.exitExhausted) return;
 
     const entryDelta = this.state.entryDelta;
     const absDeltaNow = Math.abs(currentDelta);
@@ -368,7 +373,7 @@ export class ArbCompletionMonitor {
    * Checks lookup table safety, velocity, flash crash, data staleness.
    */
   private safetyCheck(): void {
-    if (!this.state || !this.state.active || this.state.filled || this.state.soldBack || this.state.fillInFlight) return;
+    if (!this.state || !this.state.active || this.state.filled || this.state.soldBack || this.state.fillInFlight || this.exitExhausted) return;
 
     // Check Binance data staleness — if we haven't received a tick in 5s, we're flying blind
     const binanceTimestamp = this.binance.timestamp;
@@ -677,15 +682,18 @@ export class ArbCompletionMonitor {
   private async emergencySellBackWithRetry(reason: string): Promise<void> {
     if (!this.state || this.state.soldBack || this.state.filled) return;
 
-    for (let attempt = 0; attempt < ArbCompletionMonitor.MAX_HEDGE_RETRIES; attempt++) {
+    for (let attempt = 0; attempt < ArbCompletionMonitor.MAX_SELLBACK_RETRIES; attempt++) {
       if (!this.state || this.state.soldBack || this.state.filled) return;
 
-      // Widen spread tolerance each retry: 3¢, 5¢, 7¢
-      const spreadCents = this.config.emergencySellMaxSpreadCents + (attempt * ArbCompletionMonitor.HEDGE_RETRY_STEP_CENTS);
+      // Widen spread aggressively: 5¢, 10¢, 15¢, 20¢, then accept ANY price
+      const isLastAttempt = attempt === ArbCompletionMonitor.MAX_SELLBACK_RETRIES - 1;
+      const spreadCents = isLastAttempt
+        ? 99 // Accept any price — selling at 1¢ is better than losing everything
+        : this.config.emergencySellMaxSpreadCents + (attempt * ArbCompletionMonitor.SELLBACK_RETRY_STEP_CENTS);
 
-      this.logger.info(`Sell-back attempt ${attempt + 1}/${ArbCompletionMonitor.MAX_HEDGE_RETRIES}`, {
+      this.logger.info(`Sell-back attempt ${attempt + 1}/${ArbCompletionMonitor.MAX_SELLBACK_RETRIES}`, {
         reason,
-        spreadTolerance: `${spreadCents}¢`,
+        spreadTolerance: isLastAttempt ? "ANY PRICE" : `${spreadCents}¢`,
       });
 
       await this.emergencySellBackAtSpread(reason, spreadCents);
@@ -693,14 +701,15 @@ export class ArbCompletionMonitor {
       if (this.state?.soldBack) return; // Success!
 
       // Wait 300ms before retry
-      if (attempt < ArbCompletionMonitor.MAX_HEDGE_RETRIES - 1) {
+      if (attempt < ArbCompletionMonitor.MAX_SELLBACK_RETRIES - 1) {
         await new Promise(r => setTimeout(r, 300));
       }
     }
 
-    // All sell-back retries failed — holding naked as absolute last resort
+    // All sell-back retries failed — mark exhausted to prevent re-triggering
     if (this.state && !this.state.soldBack && !this.state.filled) {
-      this.logger.error("ALL EXIT ATTEMPTS FAILED — forced naked hold", { reason });
+      this.exitExhausted = true;
+      this.logger.error("ALL EXIT ATTEMPTS FAILED — forced naked hold (will not retry)", { reason });
       this.telegram.alertError(`All exits failed (${reason}). Naked hold: ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh`);
       this.state.fillInFlight = false;
     }
