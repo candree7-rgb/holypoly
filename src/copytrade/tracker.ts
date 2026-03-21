@@ -84,6 +84,9 @@ export class TargetTracker {
   // Cache: token ID → market metadata (avoid repeated Gamma lookups)
   private marketCache: Map<string, { conditionId: string; title: string; outcome: string; clobTokenId: string } | null> = new Map();
 
+  // Bot start time — ignore trades before this
+  private startedAt: number = 0;
+
   // Stats
   private stats = {
     chainEvents: 0,
@@ -106,6 +109,7 @@ export class TargetTracker {
     this.rpcWsUrl = rpcWsUrl;
     this.pollIntervalMs = pollIntervalMs;
     this.logger = logger;
+    this.startedAt = Date.now();
     this.lastPollTimestamp = Math.floor(Date.now() / 1000);
   }
 
@@ -468,6 +472,12 @@ export class TargetTracker {
       for (const item of data) {
         const trade = this.parseActivity(item);
         if (!trade) continue;
+
+        // Skip historical trades from before bot started
+        if (trade.timestamp < this.startedAt - 5000) {
+          this.seenIds.add(trade.id);
+          continue;
+        }
 
         // Dedup — may have already been detected via chain WS
         if (this.seenIds.has(trade.id)) continue;

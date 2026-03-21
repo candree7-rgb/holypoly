@@ -167,12 +167,12 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `price_too_high_${priceCents}c` };
     }
 
-    // Calculate copy size
+    // Calculate copy size — clamp to minimum rather than skipping
     const price = priceCents / 100;
-    const copyUsd = this.calculateCopySize(trade, priceCents);
+    let copyUsd = this.calculateCopySize(trade, priceCents);
     if (copyUsd < this.config.minTradeUsd) {
-      this.totalSkipped++;
-      return { success: false, trade, latencyMs: Date.now() - startMs, reason: `size_too_small` };
+      // Use minimum trade size instead of skipping — we still want to follow the trade
+      copyUsd = this.config.minTradeUsd;
     }
 
     // Exposure check
@@ -410,11 +410,21 @@ export class CopyExecutor {
    * Fetch leader's USDC balance on-chain from Polygon.
    * Called periodically (every 60s) to keep portfolio-weighted sizing accurate.
    */
+  private leaderBalancePromise: Promise<void> | null = null;
+
   async refreshLeaderBalance(): Promise<void> {
     if (this.config.sizingMode !== "portfolio") return;
     const now = Date.now();
     if (now - this.lastLeaderBalanceCheck < 60_000 && this.leaderBalance > 0) return;
 
+    // Prevent concurrent fetches (avoid spam when many trades fire simultaneously)
+    if (this.leaderBalancePromise) return this.leaderBalancePromise;
+    this.leaderBalancePromise = this._fetchLeaderBalance();
+    try { await this.leaderBalancePromise; } finally { this.leaderBalancePromise = null; }
+  }
+
+  private async _fetchLeaderBalance(): Promise<void> {
+    const now = Date.now();
     try {
       // ERC-20 balanceOf(address) selector = 0x70a08231
       const paddedAddr = this.config.targetAddress.replace("0x", "").toLowerCase().padStart(64, "0");
