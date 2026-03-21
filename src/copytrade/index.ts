@@ -132,6 +132,7 @@ async function main() {
         // DB persistence
         if (db) {
           try {
+            logger.info("DB: recording trade", { success: result.success, reason: result.reason });
             if (result.success) {
               await db.recordPlacement({
                 orderId: result.orderId,
@@ -151,7 +152,7 @@ async function main() {
                 latencyMs: result.latencyMs,
                 dryRun: result.reason === "dry_run",
               });
-            } else if (result.reason === "order_failed_after_retries") {
+            } else if (result.reason && result.reason.startsWith("order_failed")) {
               await db.recordFailed(trade.id, trade.side, trade.title, result.reason);
             } else if (result.reason && !["cooldown", "sell_filtered", "market_filtered"].includes(result.reason)) {
               await db.recordSkip({
