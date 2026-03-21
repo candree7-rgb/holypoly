@@ -271,13 +271,9 @@ async function notifyResult(
     const priceDiffStr = priceDiff ? ` (${Number(priceDiff) >= 0 ? "+" : ""}${priceDiff}¢)` : "";
     const dryTag = result.reason === "dry_run" ? " [DRY]" : "";
 
-    const statusLine = result.reason === "maker_fill"
-      ? `Filled (maker, 0% fee) · ${result.latencyMs}ms`
-      : result.reason === "taker_fill"
-        ? `Filled (taker) · ${result.latencyMs}ms`
-        : result.reason === "dry_run"
-          ? `DRY RUN · ${result.latencyMs}ms`
-          : `Pending · ${result.latencyMs}ms`;
+    const statusLine = result.reason === "dry_run"
+      ? `DRY RUN · ${result.latencyMs}ms`
+      : `GTC limit placed (0% fee) · ${result.latencyMs}ms`;
 
     await telegram.send(
       [

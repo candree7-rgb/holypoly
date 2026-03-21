@@ -292,33 +292,26 @@ export class CopyExecutor {
       };
     }
 
-    // LIVE: GTC limit first (maker, 0% fee), then FOK fallback (taker, guaranteed fill)
+    // LIVE: Pure GTC limit order (maker, 0% fee)
     //
-    // Strategy: "always fill, cheapest price possible"
-    //   1. Place GTC limit at our price (bestAsk-1¢) → maker = 0% fee
-    //   2. Wait 10s for fill (maker fill = best outcome)
-    //   3. If not filled → cancel → FOK at bestAsk (taker, ~1% fee, but GUARANTEED fill)
-    //   Result: ~80% of trades fill as maker (free), ~20% as taker (small fee)
+    // Strategy: place GTC at bestAsk-1¢ and let it sit until filled.
+    // Pre-market orders (placed 5-10min early) fill naturally as maker.
+    // checkPendingOrders() polls every 3s and notifies on fill.
+    // Orders auto-cancel after 5 min if still unfilled.
+    //
+    // Why NOT FOK: pre-market books are thin → FOK often fails with
+    // "no matching orders". GTC creates liquidity (we ARE the bid),
+    // someone sells INTO us → guaranteed fill + 0% fee.
     //
     const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
 
     try {
-      const result = await this.clob.placeLimitThenFOK({
+      const { orderId } = await this.clob.placeLimitOrder({
         tokenId: trade.tokenId,
         side,
         price,
         size: shares,
-        timeoutMs: 500, // 0.5s to try maker, then FOK (fastest fill)
       });
-
-      if (!result.filled && result.orderIds.length === 0) {
-        this.totalFailed++;
-        return {
-          success: false, trade,
-          latencyMs: Date.now() - startMs,
-          reason: "order_failed_no_liquidity",
-        };
-      }
 
       this.lastCopyTime = Date.now();
       tracker.copies++;
@@ -327,26 +320,9 @@ export class CopyExecutor {
       this.balance -= copyUsd;
 
       const latency = Date.now() - startMs;
-      const feeType = result.maker ? "0% (maker)" : "~1% (taker)";
-      const orderId = result.orderIds[0] || "";
 
-      this.logger.info(result.filled ? "ORDER FILLED" : "ORDER PLACED (pending)", {
-        side: trade.side,
-        outcome: trade.outcome || "?",
-        price: `${priceCents}¢`,
-        shares: shares.toFixed(1),
-        usd: `$${copyUsd.toFixed(2)}`,
-        fee: feeType,
-        maker: result.maker,
-        latency: `${latency}ms`,
-        source: trade.source,
-        totalCopied: this.totalCopied,
-      });
-
-      // Only track in pendingOrders if NOT already filled
-      // (filled orders get notified via notifyResult, not onFilledCb)
-      if (!result.filled && orderId) {
-        // GTC still pending (maker attempt, FOK not triggered yet within placeLimitThenFOK)
+      // Track for fill detection (checkPendingOrders polls every 3s)
+      if (orderId) {
         this.pendingOrders.set(orderId, {
           orderId,
           tokenId: trade.tokenId,
@@ -359,12 +335,25 @@ export class CopyExecutor {
         });
       }
 
+      this.logger.info("GTC LIMIT ORDER PLACED", {
+        side: trade.side,
+        outcome: trade.outcome || "?",
+        price: `${priceCents}¢`,
+        shares: shares.toFixed(1),
+        usd: `$${copyUsd.toFixed(2)}`,
+        fee: "0% (maker)",
+        latency: `${latency}ms`,
+        source: trade.source,
+        orderId: orderId ? orderId.slice(0, 12) + "..." : "?",
+        totalCopied: this.totalCopied,
+      });
+
       return {
         success: true, trade, orderId,
         executedPrice: price, executedShares: shares, executedUsd: copyUsd,
         leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
         latencyMs: latency,
-        reason: result.maker ? "maker_fill" : result.filled ? "taker_fill" : "pending",
+        reason: "pending",
       };
     } catch (err) {
       const msg = (err as Error).message;
