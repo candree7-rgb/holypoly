@@ -183,8 +183,8 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   // RPC for on-chain balance checks (leader portfolio)
   const rpcUrl = getEnv("RPC_URL") ?? "https://polygon-rpc.com";
 
-  // Slippage — default 1¢ (not 3¢)
-  const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 1);
+  // Slippage — FOK worst price = leader price + this (default 2¢)
+  const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 2);
   const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 95);
   const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 5 * 60_000); // 5 min — bump only if still unfilled after a long wait
   const maxBumps = parseNumber("COPY_MAX_BUMPS", 2); // up to 2 bumps (+1¢ each)

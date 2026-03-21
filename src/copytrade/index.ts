@@ -53,10 +53,7 @@ async function main() {
     target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
     detection: config.rpcWsUrl ? "WebSocket + API polling" : "API polling only",
     pollInterval: `${config.pollIntervalMs}ms`,
-    strategy: "GTC → FOK (500ms) → patient GTC",
-    fallbackBumps: config.bumpAfterMs > 0
-      ? `+${config.maxSlippageCents}¢ after ${config.bumpAfterMs / 1000}s (max ${config.maxBumps}x)`
-      : "none",
+    strategy: `GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
       : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
       : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
@@ -202,8 +199,7 @@ async function main() {
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
       `Detection: ${config.rpcWsUrl ? "WebSocket + API" : "API polling"}`,
-      `Strategy: GTC → FOK (500ms) → patient GTC`,
-      `Fallback bumps: +${config.maxSlippageCents}¢ after ${config.bumpAfterMs / 1000}s (max ${config.maxBumps}x)`,
+      `Strategy: GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
     ].join("\n"),
   );
@@ -276,14 +272,14 @@ async function notifyResult(
     let statusLine: string;
     if (result.reason === "dry_run") {
       statusLine = `DRY RUN · ${result.latencyMs}ms`;
-    } else if (result.reason === "phase1_gtc_filled") {
-      statusLine = `Instant GTC fill (0% fee) · ${result.latencyMs}ms`;
-    } else if (result.reason === "phase1_fok_filled") {
-      statusLine = `FOK filled (taker) · ${result.latencyMs}ms`;
-    } else if (result.reason === "phase2_patient_gtc") {
+    } else if (result.reason === "gtc_instant_fill") {
+      statusLine = `GTC instant fill (0% fee) · ${result.latencyMs}ms`;
+    } else if (result.reason === "fok_filled") {
+      statusLine = `FOK filled · ${result.latencyMs}ms`;
+    } else if (result.reason === "gtc_pending") {
       statusLine = `Patient GTC placed (0% fee) · ${result.latencyMs}ms`;
     } else {
-      statusLine = `GTC limit placed (0% fee) · ${result.latencyMs}ms`;
+      statusLine = `${result.reason} · ${result.latencyMs}ms`;
     }
 
     await telegram.send(
