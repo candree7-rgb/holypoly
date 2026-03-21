@@ -187,7 +187,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 1);
   const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 95);
   const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 30_000); // 30s default — bump if not filled
-  const maxBumps = parseNumber("COPY_MAX_BUMPS", 3); // up to 3 bumps (+1¢ each)
+  const maxBumps = parseNumber("COPY_MAX_BUMPS", 2); // up to 2 bumps (+1¢ each → max 52¢)
   const fokFallback = parseBoolean("COPY_FOK_FALLBACK", true); // FOK after bumps exhausted
 
   // Filters
