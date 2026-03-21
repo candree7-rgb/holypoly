@@ -54,7 +54,9 @@ async function main() {
     detection: config.rpcWsUrl ? "WebSocket + API polling" : "API polling only",
     pollInterval: `${config.pollIntervalMs}ms`,
     orderType: "GTC limit (maker, 0% fee)",
-    slippage: config.bumpAfterMs > 0 ? `bump +${config.maxSlippageCents}¢ after ${config.bumpAfterMs}ms` : "same price (no bump)",
+    slippage: config.bumpAfterMs > 0
+      ? `${config.maxBumps}x bump +${config.maxSlippageCents}¢ every ${config.bumpAfterMs / 1000}s${config.fokFallback ? " → FOK fallback" : ""}`
+      : "same price (no bump)",
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
       : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
       : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
@@ -200,8 +202,8 @@ async function main() {
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
       `Detection: ${config.rpcWsUrl ? "WebSocket + API" : "API polling"}`,
-      `Orders: GTC limit (0% fee)`,
-      `Slippage: ${config.bumpAfterMs > 0 ? `bump +${config.maxSlippageCents}¢ after ${config.bumpAfterMs / 1000}s` : "same price"}`,
+      `Orders: GTC → ${config.maxBumps}x bump → ${config.fokFallback ? "FOK" : "cancel"}`,
+      `Bumps: +${config.maxSlippageCents}¢ every ${config.bumpAfterMs / 1000}s (max ${config.maxBumps}x)`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
     ].join("\n"),
   );

@@ -45,12 +45,16 @@ export interface CopyTradeConfig {
   rpcUrl: string;
 
   // Slippage / Price control
-  /** Max slippage in cents for bump (e.g. 1 = bump by 1¢ if not filled) */
+  /** Max slippage in cents per bump (e.g. 1 = bump by 1¢ each time) */
   maxSlippageCents: number;
   /** Max price willing to pay (cents). Skip if price > this */
   maxPriceCents: number;
   /** Bump price after this many ms if GTC order not filled (0 = no bump) */
   bumpAfterMs: number;
+  /** Max number of price bumps before giving up or falling back to FOK (default 3) */
+  maxBumps: number;
+  /** Use FOK (market order) as fallback after all bumps exhausted (default true) */
+  fokFallback: boolean;
 
   // Filters
   /** Only copy trades on these market types (empty = all) */
@@ -182,7 +186,9 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   // Slippage — default 1¢ (not 3¢)
   const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 1);
   const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 95);
-  const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 0); // 0 = no bump (order just sits)
+  const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 30_000); // 30s default — bump if not filled
+  const maxBumps = parseNumber("COPY_MAX_BUMPS", 3); // up to 3 bumps (+1¢ each)
+  const fokFallback = parseBoolean("COPY_FOK_FALLBACK", true); // FOK after bumps exhausted
 
   // Filters
   const marketFilterRaw = getEnv("COPY_MARKET_FILTER") ?? "";
@@ -247,6 +253,8 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     maxSlippageCents,
     maxPriceCents,
     bumpAfterMs,
+    maxBumps,
+    fokFallback,
     marketFilter,
     copyBuysOnly,
     copyRedemptions,

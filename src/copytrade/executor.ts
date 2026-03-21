@@ -53,16 +53,15 @@ interface WindowTracker {
 /**
  * Order executor for copy trading.
  *
- * Strategy: GTC limit orders at the same price as target.
+ * Strategy: GTC limit first (0% maker fee), then escalate if not filled.
  *
- * Why GTC limit (not FOK):
- * - The target buys at ~50-51¢ on markets that haven't started yet
- * - There's plenty of liquidity and time — no urgency
- * - GTC limit = MAKER = 0% fee (vs ~1.5% taker fee at 50¢)
- * - Order sits in the book and fills when liquidity arrives
- * - If price moves away, we don't overpay (unlike FOK with slippage)
+ * Flow:
+ * 1. Place GTC limit at maker price (bestAsk-1¢) → 0% fee
+ * 2. After bumpAfterMs (30s), bump price +1¢ and re-place GTC
+ * 3. Repeat up to maxBumps times (default 3: 50¢→51¢→52¢→53¢)
+ * 4. If still unfilled after all bumps → FOK fallback (market order, taker fee)
  *
- * Optional: if not filled after bumpAfterMs, bump price by 1¢ (configurable).
+ * This ensures: cheapest fills when possible, but never miss a trade.
  */
 export class CopyExecutor {
   private clob: ClobService;
@@ -86,9 +85,13 @@ export class CopyExecutor {
     tokenId: string;
     side: Side;
     price: number;
+    /** Original price at first placement (for slippage tracking) */
+    originalPrice: number;
     size: number;
     placedAt: number;
-    bumped: boolean;
+    /** When this specific order was placed (resets on bump) */
+    orderPlacedAt: number;
+    bumpCount: number;
     trade: TargetTrade;
   }> = new Map();
 
@@ -323,14 +326,17 @@ export class CopyExecutor {
 
       // Track for fill detection (checkPendingOrders polls every 3s)
       if (orderId) {
+        const now2 = Date.now();
         this.pendingOrders.set(orderId, {
           orderId,
           tokenId: trade.tokenId,
           side,
           price,
+          originalPrice: price,
           size: shares,
-          placedAt: Date.now(),
-          bumped: false,
+          placedAt: now2,
+          orderPlacedAt: now2,
+          bumpCount: 0,
           trade,
         });
       }
@@ -410,52 +416,163 @@ export class CopyExecutor {
           continue;
         }
 
-        // BUMP: if bumpAfterMs > 0, not yet bumped, and past threshold
-        if (this.config.bumpAfterMs > 0 && !order.bumped && now - order.placedAt >= this.config.bumpAfterMs) {
+        // BUMP: if bumpAfterMs > 0, bumps remaining, and enough time since last order placement
+        if (
+          this.config.bumpAfterMs > 0 &&
+          order.bumpCount < this.config.maxBumps &&
+          now - order.orderPlacedAt >= this.config.bumpAfterMs
+        ) {
           const bumpPrice = order.price + this.config.maxSlippageCents / 100;
-          this.logger.info("Bumping unfilled order", {
-            orderId: order.orderId.slice(0, 12) + "...",
-            oldPrice: `${Math.round(order.price * 100)}¢`,
-            newPrice: `${Math.round(bumpPrice * 100)}¢`,
-            bump: `+${this.config.maxSlippageCents}¢`,
-          });
 
-          await this.clob.cancelOrder(order.orderId);
-          const remaining = order.size - filled;
-          try {
-            const { orderId: newId } = await this.clob.placeLimitOrder({
-              tokenId: order.tokenId,
-              side: order.side,
-              price: bumpPrice,
-              size: remaining,
+          // Don't bump beyond maxPriceCents
+          if (Math.round(bumpPrice * 100) > this.config.maxPriceCents) {
+            this.logger.info("Bump would exceed max price, skipping to FOK/timeout", {
+              orderId: order.orderId.slice(0, 12) + "...",
+              bumpPrice: `${Math.round(bumpPrice * 100)}¢`,
+              maxPrice: `${this.config.maxPriceCents}¢`,
             });
-            // Replace in pending map with new order
-            this.pendingOrders.delete(key);
-            if (newId) {
-              this.pendingOrders.set(newId, {
-                ...order,
-                orderId: newId,
+            // Force to timeout/FOK path by setting bumpCount to max
+            order.bumpCount = this.config.maxBumps;
+          } else {
+            this.logger.info(`Bump #${order.bumpCount + 1}/${this.config.maxBumps}`, {
+              orderId: order.orderId.slice(0, 12) + "...",
+              oldPrice: `${Math.round(order.price * 100)}¢`,
+              newPrice: `${Math.round(bumpPrice * 100)}¢`,
+              totalSlippage: `+${Math.round((bumpPrice - order.originalPrice) * 100)}¢`,
+            });
+
+            await this.clob.cancelOrder(order.orderId);
+            const remaining = order.size - filled;
+            try {
+              const { orderId: newId } = await this.clob.placeLimitOrder({
+                tokenId: order.tokenId,
+                side: order.side,
                 price: bumpPrice,
                 size: remaining,
-                placedAt: now,
-                bumped: true,
+              });
+              // Replace in pending map with new order
+              this.pendingOrders.delete(key);
+              if (newId) {
+                this.pendingOrders.set(newId, {
+                  ...order,
+                  orderId: newId,
+                  price: bumpPrice,
+                  size: remaining,
+                  orderPlacedAt: now,
+                  bumpCount: order.bumpCount + 1,
+                });
+              }
+            } catch (err) {
+              this.logger.warn("Bump order placement failed", { error: (err as Error).message });
+              order.bumpCount = this.config.maxBumps; // Don't retry, go to FOK/timeout
+            }
+            continue;
+          }
+        }
+
+        // FOK FALLBACK: all bumps exhausted, try FOK for remaining shares
+        if (
+          this.config.fokFallback &&
+          order.bumpCount >= this.config.maxBumps &&
+          now - order.orderPlacedAt >= this.config.bumpAfterMs
+        ) {
+          this.pendingOrders.delete(key);
+          await this.clob.cancelOrder(order.orderId);
+
+          // Get final fill count after cancel
+          let finalFilled = filled;
+          try {
+            finalFilled = await this.clob.getFilledShares(order.orderId);
+          } catch { /* use stale value */ }
+
+          const remaining = order.size - finalFilled;
+
+          if (remaining > 0 && finalFilled < order.size * 0.95) {
+            // Try FOK for the remaining unfilled shares
+            const worstPrice = order.price + this.config.maxSlippageCents / 100;
+            this.logger.info("FOK fallback for remaining shares", {
+              remaining: remaining.toFixed(1),
+              filled: finalFilled.toFixed(1),
+              worstPrice: `${Math.round(worstPrice * 100)}¢`,
+              totalElapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
+            });
+
+            try {
+              const fokResult = await this.clob.placeMarketOrderFOK({
+                tokenId: order.tokenId,
+                side: order.side,
+                amount: remaining * order.price,
+                worstPrice,
+              });
+
+              if (fokResult.filled) {
+                this.logger.info("FOK filled remaining shares", {
+                  remaining: remaining.toFixed(1),
+                  totalShares: order.size.toFixed(1),
+                });
+                // Count total filled = GTC partial + FOK remainder
+                const totalFilled = order.size; // FOK filled the rest
+                if (this.onFilledCb) {
+                  this.onFilledCb({
+                    orderId: order.orderId,
+                    trade: order.trade,
+                    filledShares: totalFilled,
+                    price: order.price,
+                    usd: totalFilled * order.price,
+                    placedAt: order.placedAt,
+                    filledAt: now,
+                  });
+                }
+                continue;
+              } else {
+                this.logger.warn("FOK fallback failed — no matching orders", {
+                  remaining: remaining.toFixed(1),
+                });
+              }
+            } catch (err) {
+              this.logger.warn("FOK fallback error", { error: (err as Error).message });
+            }
+          }
+
+          // FOK failed or not needed — emit unfilled/filled based on what we got
+          const unfilled = order.size - finalFilled;
+          if (unfilled > 0) {
+            this.balance += unfilled * order.originalPrice;
+          }
+
+          if (finalFilled >= order.size * 0.95) {
+            if (this.onFilledCb) {
+              this.onFilledCb({
+                orderId: order.orderId,
+                trade: order.trade,
+                filledShares: finalFilled,
+                price: order.price,
+                usd: finalFilled * order.price,
+                placedAt: order.placedAt,
+                filledAt: now,
               });
             }
-          } catch (err) {
-            this.logger.warn("Bump order placement failed", { error: (err as Error).message });
-            order.bumped = true; // Don't retry
+          } else {
+            if (this.onUnfilledCb) {
+              this.onUnfilledCb({
+                orderId: order.orderId,
+                trade: order.trade,
+                requestedShares: order.size,
+                filledShares: finalFilled,
+                price: order.price,
+                placedAt: order.placedAt,
+                cancelled: true,
+              });
+            }
           }
           continue;
         }
 
-        // TIMEOUT: always cancel remaining unfilled portion after fillTimeoutMs
+        // TIMEOUT: final safety net — cancel after fillTimeoutMs regardless
         if (now - order.placedAt >= this.fillTimeoutMs) {
           this.pendingOrders.delete(key);
-
-          // Always cancel to free locked collateral (cancel on filled order is a safe no-op)
           await this.clob.cancelOrder(order.orderId);
 
-          // Re-check fill after cancel to get accurate final state
           let finalFilled = filled;
           try {
             finalFilled = await this.clob.getFilledShares(order.orderId);
@@ -471,12 +588,10 @@ export class CopyExecutor {
             elapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
           });
 
-          // Refund balance for unfilled portion
           if (unfilled > 0) {
-            this.balance += unfilled * order.price;
+            this.balance += unfilled * order.originalPrice;
           }
 
-          // Emit filled if partially filled, unfilled otherwise
           if (finalFilled >= order.size * 0.95) {
             if (this.onFilledCb) {
               this.onFilledCb({
