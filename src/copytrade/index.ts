@@ -59,6 +59,7 @@ async function main() {
     config.telegramBotToken,
     config.telegramChatId,
     logger,
+    "🤖",
   );
 
   // Init CLOB (pre-derive API keys)

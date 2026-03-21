@@ -17,11 +17,15 @@ export class TelegramNotifier {
   private alertWindowStart = Date.now();
   private maxAlertsPerWindow = 15;
 
+  private prefix: string;
+
   constructor(
     private token: string | undefined,
     private chatId: string | undefined,
     private logger: Logger,
+    prefix = "🍷",
   ) {
+    this.prefix = prefix;
     this.enabled = Boolean(token && chatId);
     this.apiUrl = token
       ? `https://api.telegram.org/bot${token}/sendMessage`
@@ -70,7 +74,7 @@ export class TelegramNotifier {
     if (!this.enabled) return false;
     if (alertType && !this.shouldSend(alertType)) return false;
 
-    const prefixed = `🍷 ${message}`;
+    const prefixed = `${this.prefix} ${message}`;
 
     try {
       let resp = await fetch(this.apiUrl, {
