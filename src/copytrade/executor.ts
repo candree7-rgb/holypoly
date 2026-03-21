@@ -51,18 +51,27 @@ interface WindowTracker {
 }
 
 /**
- * Order executor for copy trading.
+ * Order executor for copy trading pre-market 5-min window trades.
  *
- * Strategy: GTC limit order, let it sit and fill naturally (like the leader).
- * These are pre-market orders (5-10min before start) — price stays ~49-51¢,
- * order fills gradually as counterparties enter.
+ * Context: Leader buys at ~51¢, 5-10 min before market starts.
+ * Price stays ~49-54¢ pre-market. Orderbook is thin but fills gradually.
  *
- * Flow:
- * 1. Place GTC limit at maker price → 0% fee, wait up to 15 min
- * 2. If still unfilled after 5 min → bump price +1¢ (up to 2x)
- * 3. If still unfilled after all bumps → FOK fallback (last resort)
+ * Strategy (2 phases):
  *
- * Primary fill comes from patience (step 1). Bumps + FOK are safety nets.
+ * Phase 1 — Quick fill attempt (first ~500ms):
+ *   1a. GTC at leader's price → if instantly matched, 0% maker fee
+ *   1b. Wait 500ms, check fill
+ *   1c. Not filled? → FOK at leader's price (instant fill if any liquidity)
+ *
+ * Phase 2 — Patient fallback (if Phase 1 didn't fill):
+ *   2a. Place GTC at leader's price, let it sit (like the leader does)
+ *   2b. Order fills gradually as counterparties enter over minutes
+ *   2c. 0% maker fee, 15 min timeout
+ *
+ * This is the smartest approach because:
+ * - Best case: instant fill at leader's price as maker (0% fee)
+ * - Good case: instant fill via FOK (taker fee, but same price)
+ * - Fallback: patient GTC fills over time, exactly like the leader
  */
 export class CopyExecutor {
   private clob: ClobService;
@@ -296,25 +305,143 @@ export class CopyExecutor {
       };
     }
 
-    // LIVE: Pure GTC limit order (maker, 0% fee)
+    // LIVE: 2-phase execution
     //
-    // Strategy: place GTC at bestAsk-1¢ and let it sit until filled.
-    // Pre-market orders (placed 5-10min early) fill naturally as maker.
-    // checkPendingOrders() polls every 3s and notifies on fill.
-    // Orders auto-cancel after 5 min if still unfilled.
+    // Phase 1: Quick fill attempt at leader's price (500ms)
+    //   → GTC at leader price, wait 500ms, if not filled → FOK at same price
     //
-    // Why NOT FOK: pre-market books are thin → FOK often fails with
-    // "no matching orders". GTC creates liquidity (we ARE the bid),
-    // someone sells INTO us → guaranteed fill + 0% fee.
+    // Phase 2: If Phase 1 didn't fill → patient GTC at leader price
+    //   → Let it sit and fill gradually (like the leader does)
     //
     const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
 
     try {
-      const { orderId } = await this.clob.placeLimitOrder({
+      // ─── PHASE 1: Quick fill attempt ───
+      const { orderId: phase1Id } = await this.clob.placeLimitOrder({
         tokenId: trade.tokenId,
         side,
         price,
         size: shares,
+      });
+
+      // Wait 500ms and check if GTC filled immediately
+      let phase1Filled = 0;
+      if (phase1Id) {
+        await new Promise((r) => setTimeout(r, 500));
+        try {
+          phase1Filled = await this.clob.getFilledShares(phase1Id);
+        } catch { /* continue */ }
+      }
+
+      if (phase1Filled >= shares * 0.95) {
+        // Instant fill as maker — best case (0% fee)
+        this.lastCopyTime = Date.now();
+        tracker.copies++;
+        tracker.totalUsd += copyUsd;
+        this.totalCopied++;
+        this.balance -= copyUsd;
+
+        this.logger.info("PHASE 1: Instant GTC fill (maker, 0% fee)", {
+          side: trade.side,
+          outcome: trade.outcome || "?",
+          price: `${priceCents}¢`,
+          shares: phase1Filled.toFixed(1),
+          usd: `$${copyUsd.toFixed(2)}`,
+          latency: `${Date.now() - startMs}ms`,
+        });
+
+        if (this.onFilledCb) {
+          this.onFilledCb({
+            orderId: phase1Id!,
+            trade,
+            filledShares: phase1Filled,
+            price,
+            usd: phase1Filled * price,
+            placedAt: Date.now(),
+            filledAt: Date.now(),
+          });
+        }
+
+        return {
+          success: true, trade, orderId: phase1Id ?? undefined,
+          executedPrice: price, executedShares: phase1Filled, executedUsd: copyUsd,
+          leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
+          latencyMs: Date.now() - startMs,
+          reason: "phase1_gtc_filled",
+        };
+      }
+
+      // GTC didn't fill instantly → cancel and try FOK
+      const phase1Remaining = shares - phase1Filled;
+      if (phase1Id) {
+        await this.clob.cancelOrder(phase1Id);
+      }
+
+      // FOK at leader's price — instant fill if any liquidity exists
+      let fokFilled = false;
+      if (phase1Remaining > 0) {
+        try {
+          const fokResult = await this.clob.placeMarketOrderFOK({
+            tokenId: trade.tokenId,
+            side,
+            amount: phase1Remaining * price,
+            worstPrice: price + 0.01, // accept +1¢ max for FOK
+          });
+
+          if (fokResult.filled) {
+            fokFilled = true;
+            const totalFilled = phase1Filled + phase1Remaining;
+            this.lastCopyTime = Date.now();
+            tracker.copies++;
+            tracker.totalUsd += copyUsd;
+            this.totalCopied++;
+            this.balance -= copyUsd;
+
+            this.logger.info("PHASE 1: FOK filled (taker)", {
+              side: trade.side,
+              outcome: trade.outcome || "?",
+              price: `${priceCents}¢`,
+              shares: totalFilled.toFixed(1),
+              usd: `$${copyUsd.toFixed(2)}`,
+              latency: `${Date.now() - startMs}ms`,
+              partial: phase1Filled > 0 ? `${phase1Filled.toFixed(1)} maker + ${phase1Remaining.toFixed(1)} FOK` : undefined,
+            });
+
+            if (this.onFilledCb) {
+              this.onFilledCb({
+                orderId: phase1Id || "fok",
+                trade,
+                filledShares: totalFilled,
+                price,
+                usd: totalFilled * price,
+                placedAt: Date.now(),
+                filledAt: Date.now(),
+              });
+            }
+
+            return {
+              success: true, trade, orderId: phase1Id ?? undefined,
+              executedPrice: price, executedShares: totalFilled, executedUsd: copyUsd,
+              leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
+              latencyMs: Date.now() - startMs,
+              reason: "phase1_fok_filled",
+            };
+          }
+        } catch (err) {
+          this.logger.info("Phase 1 FOK failed, moving to Phase 2", {
+            error: (err as Error).message,
+          });
+        }
+      }
+
+      // ─── PHASE 2: Patient GTC — let it sit like the leader ───
+      // Place GTC at leader's price and wait for gradual fills
+      const phase2Shares = shares - phase1Filled; // subtract any partial from Phase 1
+      const { orderId: phase2Id } = await this.clob.placeLimitOrder({
+        tokenId: trade.tokenId,
+        side,
+        price,
+        size: phase2Shares,
       });
 
       this.lastCopyTime = Date.now();
@@ -326,15 +453,15 @@ export class CopyExecutor {
       const latency = Date.now() - startMs;
 
       // Track for fill detection (checkPendingOrders polls every 3s)
-      if (orderId) {
+      if (phase2Id) {
         const now2 = Date.now();
-        this.pendingOrders.set(orderId, {
-          orderId,
+        this.pendingOrders.set(phase2Id, {
+          orderId: phase2Id,
           tokenId: trade.tokenId,
           side,
           price,
           originalPrice: price,
-          size: shares,
+          size: phase2Shares,
           placedAt: now2,
           orderPlacedAt: now2,
           bumpCount: 0,
@@ -342,25 +469,23 @@ export class CopyExecutor {
         });
       }
 
-      this.logger.info("GTC LIMIT ORDER PLACED", {
+      this.logger.info("PHASE 2: Patient GTC placed (0% fee)", {
         side: trade.side,
         outcome: trade.outcome || "?",
         price: `${priceCents}¢`,
-        shares: shares.toFixed(1),
-        usd: `$${copyUsd.toFixed(2)}`,
-        fee: "0% (maker)",
+        shares: phase2Shares.toFixed(1),
+        usd: `$${(phase2Shares * price).toFixed(2)}`,
         latency: `${latency}ms`,
-        source: trade.source,
-        orderId: orderId ? orderId.slice(0, 12) + "..." : "?",
-        totalCopied: this.totalCopied,
+        phase1Partial: phase1Filled > 0 ? `${phase1Filled.toFixed(1)} already filled` : "none",
+        orderId: phase2Id ? phase2Id.slice(0, 12) + "..." : "?",
       });
 
       return {
-        success: true, trade, orderId,
-        executedPrice: price, executedShares: shares, executedUsd: copyUsd,
+        success: true, trade, orderId: phase2Id ?? undefined,
+        executedPrice: price, executedShares: phase2Shares, executedUsd: phase2Shares * price,
         leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
         latencyMs: latency,
-        reason: "pending",
+        reason: "phase2_patient_gtc",
       };
     } catch (err) {
       const msg = (err as Error).message;
