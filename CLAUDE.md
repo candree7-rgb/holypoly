@@ -8,7 +8,7 @@ Polymarket trading bot for BTC/ETH 5-minute Up/Down binary markets.
 
 The active strategy is signal-based directional trading:
 1. TradingView webhook sends UP/DOWN signal for BTC or ETH
-2. Bot targets the NEXT 5-min window (not current)
+2. Bot targets the CURRENT 5-min window if >60s remaining, otherwise NEXT
 3. Places GTC limit ladder at 49-51¢ (maker = 0% fee)
 4. Monitors fills for ~4 minutes
 5. FOK fallback at 52¢ for unfilled remainder at T+4:00

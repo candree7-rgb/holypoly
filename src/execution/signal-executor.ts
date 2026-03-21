@@ -98,17 +98,31 @@ export class SignalExecutor {
 
   /**
    * Called when webhook receives a signal.
-   * Computes the next 5-min window and queues the signal.
+   * Targets the CURRENT 5-min window if enough time remains (>60s),
+   * otherwise falls back to the next window.
    */
   queueSignal(direction: TradeSide, asset: "btc" | "eth" = "btc"): PendingSignal {
     const now = Date.now();
     const nowSec = Math.floor(now / 1000);
     const windowSize = 300;
 
-    // Current window start (rounded down)
+    // Current window boundaries
     const currentWindowStart = Math.floor(nowSec / windowSize) * windowSize;
-    // Target is the NEXT window
-    const targetWindowStartSec = currentWindowStart + windowSize;
+    const currentWindowEnd = currentWindowStart + windowSize;
+    const remainingInCurrent = currentWindowEnd - nowSec;
+
+    // Target CURRENT window if >60s remaining, otherwise NEXT
+    const minRemainingForEntry = 60;
+    let targetWindowStartSec: number;
+    if (remainingInCurrent >= minRemainingForEntry) {
+      targetWindowStartSec = currentWindowStart;
+      this.logger.info("Targeting CURRENT window", { remainingSec: remainingInCurrent });
+    } else {
+      targetWindowStartSec = currentWindowStart + windowSize;
+      this.logger.info("Targeting NEXT window (current too late)", {
+        remainingSec: remainingInCurrent,
+      });
+    }
 
     const signal: PendingSignal = {
       direction,
