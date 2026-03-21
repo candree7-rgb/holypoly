@@ -12,20 +12,33 @@ const pool = new Pool({
 
 // ---- Types ----
 
-export interface WindowTrade {
+export interface CopyTrade {
   id: number
-  window_start: string
+  order_id: string | null
+  trade_id: string
+  side: string
+  market_title: string
+  outcome: string
   condition_id: string
-  traded: boolean
-  primary_side: string
-  orders: Array<{ side: string; price: number; amount: number }>
-  fill_count: number
-  pnl: number | null
-  winner: string | null
-  balance_before: number
-  balance_after: number | null
+  token_id: string
+  price_cents: number
+  requested_shares: number
+  requested_usd: number
+  filled_shares: number
+  filled_usd: number
+  status: string
+  leader_price_cents: number | null
+  leader_usd: number | null
+  leader_shares: number | null
+  source: string
+  latency_ms: number
+  dry_run: boolean
   created_at: string
+  filled_at: string | null
 }
+
+// Keep old type for backwards compat
+export type WindowTrade = CopyTrade
 
 export interface DailySnapshot {
   date: string
@@ -66,7 +79,7 @@ function buildDateFilter(
   return ''
 }
 
-// ---- Stats (aggregated) ----
+// ---- Stats (aggregated from copy_trades) ----
 
 export async function getStats(opts?: { days?: string }): Promise<Stats> {
   const client = await pool.connect()
@@ -78,47 +91,49 @@ export async function getStats(opts?: { days?: string }): Promise<Stats> {
       values,
     )
 
-    // Trade stats
+    // Trade stats from copy_trades
     const { rows: [tradeStats] } = await client.query(`
       SELECT
         COUNT(*)::int AS total_trades,
-        COUNT(*) FILTER (WHERE pnl > 0)::int AS wins,
-        COUNT(*) FILTER (WHERE pnl <= 0)::int AS losses,
-        CASE WHEN COUNT(*) > 0
-          THEN COUNT(*) FILTER (WHERE pnl > 0)::float / COUNT(*)::float * 100
-          ELSE 0
-        END AS win_rate,
-        COALESCE(SUM(pnl), 0)::float AS total_pnl,
-        COALESCE(AVG(pnl), 0)::float AS avg_pnl,
-        COALESCE(MAX(pnl), 0)::float AS best_trade,
-        COALESCE(MIN(pnl), 0)::float AS worst_trade
-      FROM window_trades
-      WHERE traded = true AND pnl IS NOT NULL ${dateFilter}
+        COUNT(*) FILTER (WHERE status = 'filled')::int AS wins,
+        COUNT(*) FILTER (WHERE status IN ('cancelled', 'expired', 'placed'))::int AS pending,
+        COUNT(*) FILTER (WHERE status LIKE 'skipped:%' OR status LIKE 'failed:%')::int AS losses,
+        COALESCE(SUM(filled_usd), 0)::float AS total_filled_usd,
+        COALESCE(SUM(requested_usd), 0)::float AS total_requested_usd,
+        COALESCE(AVG(filled_usd) FILTER (WHERE status = 'filled'), 0)::float AS avg_fill_usd,
+        COALESCE(MAX(filled_usd), 0)::float AS best_trade,
+        COUNT(*) FILTER (WHERE status = 'filled' OR status = 'placed' OR status = 'dry_run')::int AS filled_count
+      FROM copy_trades
+      WHERE 1=1 ${dateFilter}
     `, values)
 
-    // Today's snapshot
-    const today = new Date().toISOString().slice(0, 10)
-    const { rows: todayRows } = await client.query(
-      'SELECT total_pnl, windows_traded FROM daily_snapshots WHERE date = $1',
-      [today],
-    )
+    // Today's trades
+    const { rows: todayRows } = await client.query(`
+      SELECT
+        COUNT(*)::int AS today_trades,
+        COALESCE(SUM(filled_usd) FILTER (WHERE status = 'filled'), 0)::float AS today_filled_usd
+      FROM copy_trades
+      WHERE created_at >= CURRENT_DATE
+    `)
 
-    // Current balance (latest trade's balance_before or starting_balance)
-    const { rows: balanceRows } = await client.query(
-      'SELECT balance_before FROM window_trades ORDER BY created_at DESC LIMIT 1',
-    )
-
-    // Losing streak from bot_state
-    const { rows: streakRows } = await client.query(
-      "SELECT value FROM bot_state WHERE key = 'losing_streak'",
-    )
+    // Fill rate as "win rate"
+    const total = tradeStats.total_trades || 0
+    const filled = tradeStats.filled_count || 0
+    const winRate = total > 0 ? (filled / total) * 100 : 0
 
     return {
-      ...tradeStats,
-      current_balance: balanceRows[0]?.balance_before ?? 0,
-      today_pnl: todayRows[0]?.total_pnl ?? 0,
-      today_trades: todayRows[0]?.windows_traded ?? 0,
-      losing_streak: streakRows[0]?.value ?? 0,
+      total_trades: total,
+      wins: filled,
+      losses: tradeStats.losses || 0,
+      win_rate: winRate,
+      total_pnl: tradeStats.total_filled_usd || 0,
+      avg_pnl: tradeStats.avg_fill_usd || 0,
+      best_trade: tradeStats.best_trade || 0,
+      worst_trade: 0,
+      current_balance: 0, // Will be fetched from CLOB at runtime
+      today_pnl: todayRows[0]?.today_filled_usd ?? 0,
+      today_trades: todayRows[0]?.today_trades ?? 0,
+      losing_streak: 0,
     }
   } finally {
     client.release()
@@ -130,7 +145,7 @@ export async function getStats(opts?: { days?: string }): Promise<Stats> {
 export async function getTrades(opts?: {
   limit?: number
   days?: string
-}): Promise<WindowTrade[]> {
+}): Promise<CopyTrade[]> {
   const client = await pool.connect()
   try {
     const values: unknown[] = []
@@ -143,8 +158,8 @@ export async function getTrades(opts?: {
     values.push(limit)
 
     const { rows } = await client.query(
-      `SELECT * FROM window_trades
-       WHERE traded = true AND pnl IS NOT NULL ${dateFilter}
+      `SELECT * FROM copy_trades
+       WHERE 1=1 ${dateFilter}
        ORDER BY created_at DESC LIMIT $${values.length}`,
       values,
     )
