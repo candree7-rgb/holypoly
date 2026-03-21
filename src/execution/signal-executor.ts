@@ -281,12 +281,29 @@ export class SignalExecutor {
     const totalBuyUsd = balance * this.config.buyAmountPct / 100;
     const orders: Array<{ tokenId: string; side: Side; price: number; size: number }> = [];
 
+    // First pass: find which levels meet the 5-share minimum
+    const validLevels: Array<{ priceCents: number; weight: number }> = [];
     for (let i = 0; i < this.config.ladderPricesCents.length; i++) {
       const priceCents = this.config.ladderPricesCents[i];
       const weight = this.config.ladderWeights[i] ?? (1 / this.config.ladderPricesCents.length);
-      const amountUsd = totalBuyUsd * weight;
-      const priceDecimal = priceCents / 100;
-      const size = amountUsd / priceDecimal; // shares = USD / price
+      const size = (totalBuyUsd * weight) / (priceCents / 100);
+      if (size >= 5) {
+        validLevels.push({ priceCents, weight });
+      } else {
+        this.logger.debug("Skipping ladder level below 5-share minimum", {
+          price: `${priceCents}¢`, size: size.toFixed(1),
+        });
+      }
+    }
+
+    // Redistribute weights across valid levels
+    const totalWeight = validLevels.reduce((s, l) => s + l.weight, 0);
+
+    for (const level of validLevels) {
+      const adjustedWeight = totalWeight > 0 ? level.weight / totalWeight : 0;
+      const amountUsd = totalBuyUsd * adjustedWeight;
+      const priceDecimal = level.priceCents / 100;
+      const size = amountUsd / priceDecimal;
 
       orders.push({
         tokenId,

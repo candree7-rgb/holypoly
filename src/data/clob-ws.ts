@@ -107,12 +107,13 @@ export class ClobWsClient {
         this.sendSubscription();
       }
 
-      // Keepalive: Polymarket requires PING every 10 seconds (docs say 10s, server disconnects otherwise)
+      // Keepalive: Polymarket requires PING within 10 seconds.
+      // Send every 5s to avoid race condition with server's 10s timeout.
       this.pingTimer = setInterval(() => {
         if (this.ws?.readyState === WebSocket.OPEN) {
           this.ws.send("PING");
         }
-      }, 10000);
+      }, 5000);
     });
 
     this.ws.on("message", (data: WebSocket.Data) => {
