@@ -23,7 +23,7 @@ export class TelegramNotifier {
     private token: string | undefined,
     private chatId: string | undefined,
     private logger: Logger,
-    prefix = "🍷",
+    prefix = "🤖",
   ) {
     this.prefix = prefix;
     this.enabled = Boolean(token && chatId);
