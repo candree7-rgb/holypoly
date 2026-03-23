@@ -306,52 +306,62 @@ export class MergeArbExecutor {
         const book = this.getBook(shortToken);
         const bestAsk = book?.asks?.[0]?.price ?? 0.50;
 
-        // Price cap: skip rebalance if ask > maxTakerRebalancePrice (default 55¢)
-        if (bestAsk > this.config.maxTakerRebalancePrice) {
-          this.logger.warn("Rebalance skipped — ask too expensive", {
+        // Dynamic price cap: max_taker_price = (1.00 - avg_maker_price_other_side) - 0.01
+        // Guarantees combined < 100¢ after rebalance (always profitable merge)
+        const longSide: TradeSide = shortSide === "Up" ? "Down" : "Up";
+        const longShares = longSide === "Up" ? filledUpShares : filledDnShares;
+        const longCost = longSide === "Up" ? totalUpCost : totalDnCost;
+        const avgLongPrice = longShares > 0 ? longCost / longShares : 0.50;
+        const dynamicMaxPrice = (1.00 - avgLongPrice) - 0.01;
+
+        if (bestAsk > dynamicMaxPrice) {
+          this.logger.warn("Rebalance skipped — would make combined > 99¢", {
             side: shortSide,
             bestAsk: `${(bestAsk * 100).toFixed(1)}¢`,
-            maxPrice: `${(this.config.maxTakerRebalancePrice * 100).toFixed(1)}¢`,
+            avgLongPrice: `${(avgLongPrice * 100).toFixed(1)}¢`,
+            dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
             imbalance: sharesToRebalance.toFixed(0),
           });
           this.telegram.send(
-            `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > cap ${(this.config.maxTakerRebalancePrice * 100).toFixed(1)}¢ — holding ${sharesToRebalance.toFixed(0)}sh imbalance`,
+            `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > dynamic cap ${(dynamicMaxPrice * 100).toFixed(1)}¢ ` +
+            `(${longSide} avg ${(avgLongPrice * 100).toFixed(1)}¢) — holding ${sharesToRebalance.toFixed(0)}sh imbalance`,
           );
         } else {
-        const rebalancePrice = bestAsk + this.config.slippageBuffer;
+          const rebalancePrice = bestAsk + this.config.slippageBuffer;
 
-        // Execute taker buy for rebalance
-        const fill = await this.buyOrder(shortToken, sharesToRebalance, rebalancePrice, shortSide);
-        if (fill.filled) {
-          const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
-          if (shortSide === "Up") {
-            filledUpShares += fill.filledSize;
-            totalUpCost += fill.totalCost;
+          // Execute taker buy for rebalance
+          const fill = await this.buyOrder(shortToken, sharesToRebalance, rebalancePrice, shortSide);
+          if (fill.filled) {
+            const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+            if (shortSide === "Up") {
+              filledUpShares += fill.filledSize;
+              totalUpCost += fill.totalCost;
+            } else {
+              filledDnShares += fill.filledSize;
+              totalDnCost += fill.totalCost;
+            }
+            availableBudget -= fill.totalCost;
+            orderFills.push({
+              orderNum: orderCount, side: shortSide, filledSize: fill.filledSize,
+              avgPrice: fill.avgPrice, totalCost: fill.totalCost, fee, timestamp: Date.now(),
+            });
+            orderCount++;
+
+            this.logger.info("Taker rebalance filled", {
+              side: shortSide, size: fill.filledSize.toFixed(0),
+              price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+              fee: `$${fee.toFixed(2)}`,
+              dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
+              newBalance: `Up=${filledUpShares.toFixed(0)} Dn=${filledDnShares.toFixed(0)}`,
+            });
+            this.telegram.send(
+              `⚖️ Rebalance: bought ${fill.filledSize.toFixed(0)}sh ${shortSide} as taker ` +
+              `at ${(fill.avgPrice * 100).toFixed(1)}¢ (fee: $${fee.toFixed(2)}) [cap: ${(dynamicMaxPrice * 100).toFixed(1)}¢]`,
+            );
           } else {
-            filledDnShares += fill.filledSize;
-            totalDnCost += fill.totalCost;
+            this.logger.warn("Taker rebalance failed — will have imbalance at merge");
           }
-          availableBudget -= fill.totalCost;
-          orderFills.push({
-            orderNum: orderCount, side: shortSide, filledSize: fill.filledSize,
-            avgPrice: fill.avgPrice, totalCost: fill.totalCost, fee, timestamp: Date.now(),
-          });
-          orderCount++;
-
-          this.logger.info("Taker rebalance filled", {
-            side: shortSide, size: fill.filledSize.toFixed(0),
-            price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
-            fee: `$${fee.toFixed(2)}`,
-            newBalance: `Up=${filledUpShares.toFixed(0)} Dn=${filledDnShares.toFixed(0)}`,
-          });
-          this.telegram.send(
-            `⚖️ Rebalance: bought ${fill.filledSize.toFixed(0)}sh ${shortSide} as taker ` +
-            `at ${(fill.avgPrice * 100).toFixed(1)}¢ (fee: $${fee.toFixed(2)})`,
-          );
-        } else {
-          this.logger.warn("Taker rebalance failed — will have imbalance at merge");
         }
-        } // end price cap else
       }
     }
 

@@ -141,8 +141,6 @@ export interface Config {
   makerPhaseEndS: number;
   /** V5: Max shares to buy as taker for rebalancing (limits fee exposure) */
   maxTakerRebalanceShares: number;
-  /** V5: Max price (dollars) to pay per share in taker rebalance — skip if ask > this */
-  maxTakerRebalancePrice: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -345,7 +343,6 @@ export const loadConfig = (): Config => {
   const quoteUpdateMs = parseNumber("QUOTE_UPDATE_MS", 1000);
   const makerPhaseEndS = parseNumber("MAKER_PHASE_END_S", 60);
   const maxTakerRebalanceShares = parseNumber("MAX_TAKER_REBALANCE_SHARES", 500);
-  const maxTakerRebalancePrice = parseNumber("MAX_TAKER_REBALANCE_PRICE", 0.55);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -433,7 +430,6 @@ export const loadConfig = (): Config => {
     quoteUpdateMs,
     makerPhaseEndS,
     maxTakerRebalanceShares,
-    maxTakerRebalancePrice,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,
