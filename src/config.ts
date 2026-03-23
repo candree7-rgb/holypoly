@@ -347,7 +347,7 @@ export const loadConfig = (): Config => {
   const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 0);
   const sameSideCooldownMs = parseNumber("SAME_SIDE_COOLDOWN_MS", 10000);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
-  const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.55);
+  const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
 
   // Merge-Arb Strategy parameters (V3)
   const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);

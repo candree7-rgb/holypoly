@@ -45,7 +45,7 @@ Bei 50¢: 1.56% → 50.78¢ (worst case)
 - MAX_IMBALANCE_CHUNKS: 0 (only buy the side that's behind)
 - SAME_SIDE_COOLDOWN_MS: 10000 (10s min between orders on same side)
 - BUDGET_RESERVE_PCT: 0.50 (max 50% budget on one side until other has ≥1 fill)
-- REBALANCE_MAX_PRICE: 0.55 (fixed 55¢ cap for rebalance buys)
+- REBALANCE_MAX_PRICE: 0.99 (no effective cap — always rebalance, breakeven OK)
 - EQUITY_PER_WINDOW: 30% (conservative start, scale up later)
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares
