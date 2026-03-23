@@ -17,6 +17,26 @@ export const fromBaseUnits = (amount: bigint, decimals = 6): number => {
 
 export const formatUsd = (amount: number) => amount.toFixed(2);
 
+/**
+ * Polymarket crypto taker fee (non-flat curve).
+ * Formula: fee = shares × price × feeRate × (price × (1 - price))^exponent
+ * For crypto markets: feeRate=0.25, exponent=2
+ * Max effective rate ~1.56% at price=0.50, drops toward extremes.
+ * See: https://docs.polymarket.com/trading/fees
+ */
+export const polymarketCryptoFee = (
+  shares: number,
+  price: number,
+  feeRate = 0.25,
+  exponent = 2,
+): number => {
+  if (shares <= 0 || price <= 0 || price >= 1) return 0;
+  const pq = price * (1 - price);
+  const fee = shares * price * feeRate * pq ** exponent;
+  // Round to 4 decimal places per Polymarket spec
+  return Math.round(fee * 10000) / 10000;
+};
+
 export const isPositive = (n: number) => Number.isFinite(n) && n > 0;
 
 /** Standard normal CDF approximation (Abramowitz & Stegun) */

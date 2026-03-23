@@ -13,7 +13,7 @@ import type {
   TradeSide,
 } from "../types.js";
 import { DryRunEngine } from "./dry-run-engine.js";
-import { sleep } from "../utils.js";
+import { sleep, polymarketCryptoFee } from "../utils.js";
 
 /**
  * MergeArbExecutor: Stargate5-style merge arbitrage.
@@ -346,11 +346,15 @@ export class MergeArbExecutor {
       ? completePairs.reduce((s, p) => s + p.combinedCents, 0) / completePairs.length
       : 0;
 
-    // totalCost from pairs already includes fees (buyFok returns cost+fee),
-    // so extract the fee portion: fee = totalWithFee - totalWithFee/(1+rate)
+    // totalCost from pairs already includes fees (buyFok returns cost+fee).
+    // For reporting, estimate fee portion using curve formula on avg price.
     const takerFees = this.config.dryRun && this.dryRunEngine
       ? this.dryRunEngine.fees
-      : totalCost - (totalCost / (1 + this.config.takerFeeRate));
+      : completePairs.reduce((sum, p) => {
+          return sum
+            + polymarketCryptoFee(p.upFilled, p.upPrice)
+            + polymarketCryptoFee(p.dnFilled, p.dnPrice);
+        }, 0);
 
     Object.assign(result, {
       pairs,
@@ -602,11 +606,12 @@ export class MergeArbExecutor {
       totalCost += fill.costFilled;
     }
 
-    const fee = totalCost * this.config.takerFeeRate;
+    const avgPriceFill = totalShares > 0 ? totalCost / totalShares : 0;
+    const fee = polymarketCryptoFee(totalShares, avgPriceFill);
     return {
       filled: totalShares > 0,
       filledSize: totalShares,
-      avgPrice: totalShares > 0 ? totalCost / totalShares : 0,
+      avgPrice: avgPriceFill,
       totalCost: totalCost + fee,
     };
   }
@@ -661,12 +666,13 @@ export class MergeArbExecutor {
       return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
     }
 
-    const fee = totalCost * this.config.takerFeeRate;
+    const avgPriceGtc = totalCost / totalShares;
+    const fee = polymarketCryptoFee(totalShares, avgPriceGtc);
     this.logger.info("GTC fallback filled", {
       side,
       requested: size.toFixed(1),
       filled: totalShares.toFixed(1),
-      avgPrice: `${((totalCost / totalShares) * 100).toFixed(1)}¢`,
+      avgPrice: `${(avgPriceGtc * 100).toFixed(1)}¢`,
     });
 
     return {

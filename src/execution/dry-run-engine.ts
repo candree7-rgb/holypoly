@@ -1,6 +1,7 @@
 import type { Logger } from "../logger.js";
 import type { ClobWsClient, BookSnapshot } from "../data/clob-ws.js";
 import type { SimulatedFill } from "../types.js";
+import { polymarketCryptoFee } from "../utils.js";
 
 /**
  * DryRunEngine: Realistic fill simulation against the LIVE orderbook.
@@ -151,7 +152,8 @@ export class DryRunEngine {
     }
 
     const avgPrice = totalCost / size;
-    const fee = totalCost * this.takerFeeRate;
+    // Polymarket crypto fee curve (not flat %)
+    const fee = polymarketCryptoFee(size, avgPrice);
     const totalWithFee = totalCost + fee;
 
     // Update virtual state
@@ -306,7 +308,8 @@ export class DryRunEngine {
     }
 
     const avgPrice = totalCost / filledSize;
-    const fee = totalCost * this.takerFeeRate;
+    // Polymarket crypto fee curve (not flat %)
+    const fee = polymarketCryptoFee(filledSize, avgPrice);
     const totalWithFee = totalCost + fee;
 
     // Update virtual state
