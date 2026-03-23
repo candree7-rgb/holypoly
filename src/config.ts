@@ -99,8 +99,20 @@ export interface Config {
   telegramChatId?: string;
 
   // Strategy mode
-  /** "merge-arb" = Stargate5-style merge arb, "edge" = edge-detection, "webhook" = TradingView signals */
-  strategyMode: "merge-arb" | "edge" | "webhook";
+  /** "merge-arb" = V5 maker, "signal-taker" = V6 Binance signal, "edge" = edge-detection, "webhook" = TradingView signals */
+  strategyMode: "merge-arb" | "signal-taker" | "edge" | "webhook";
+
+  // V6 Signal-Taker parameters
+  /** BTC % move threshold to trigger buy (e.g. 0.0005 = 0.05%) */
+  btcMoveThreshold: number;
+  /** Only buy when ask < this price (e.g. 0.45 = 45¢) */
+  cheapThreshold: number;
+  /** How often (ms) to check Binance price and evaluate signal */
+  signalCheckIntervalMs: number;
+  /** Max chunks more on one side before pausing that side */
+  maxImbalanceChunks: number;
+  /** Max price for end-of-window taker rebalance (0.55 = 55¢) */
+  rebalanceMaxPrice: number;
 
   // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
   /** Fraction of balance to allocate per window (e.g. 0.80 = 80%) */
@@ -321,7 +333,15 @@ export const loadConfig = (): Config => {
   const strategyModeRaw = getEnv("STRATEGY_MODE") ?? "merge-arb";
   const strategyMode = strategyModeRaw === "webhook" ? "webhook"
     : strategyModeRaw === "edge" ? "edge"
+    : strategyModeRaw === "signal-taker" ? "signal-taker"
     : "merge-arb" as const;
+
+  // V6 Signal-Taker parameters
+  const btcMoveThreshold = parseNumber("BTC_MOVE_THRESHOLD", 0.0005);
+  const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.45);
+  const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
+  const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 3);
+  const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.55);
 
   // Merge-Arb Strategy parameters (V3)
   const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);
@@ -411,6 +431,11 @@ export const loadConfig = (): Config => {
     telegramBotToken,
     telegramChatId,
     strategyMode,
+    btcMoveThreshold,
+    cheapThreshold,
+    signalCheckIntervalMs,
+    maxImbalanceChunks,
+    rebalanceMaxPrice,
     equityPerWindow,
     maxOrdersPerWindow,
     mergeMinSize,

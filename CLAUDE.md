@@ -2,72 +2,83 @@
 
 Polymarket merge-arb trading bot for BTC 5-minute Up/Down binary markets.
 
-## Strategy: Maker V5 (`STRATEGY_MODE=merge-arb`)
+## Strategy: Signal-Taker V6 (`STRATEGY_MODE=signal-taker`) — AKTIV
 
-**CRITICAL: Maker fee = 0% on Polymarket crypto markets. Taker fee = 1-1.5%. This IS the edge.**
+**Kern-Insight:** Nie beide Seiten gleichzeitig kaufen (Combined ≈101¢ = Verlust).
+Stattdessen: Binance BTC-Preis monitoren, jede Seite EINZELN kaufen wenn sie billig ist.
 
-V5 3-Phase Maker Strategy (replaces V1-V4 taker approaches):
-1. **Phase 1 MAKER (T+5s→T+240s):** Post GTC limit BUY orders BELOW the ask on BOTH sides
-   - Maker fee = **0%** — this is the entire edge
-   - Only requote DOWNWARD (never chase ask upward)
-   - BTC oscillation causes asks to cross our bids → fills
-2. **Phase 2 ASSESS+REBALANCE (T+240s→T+270s):** Cancel unfilled orders
-   - If imbalance: buy short side as TAKER (1% fee) to eliminate naked exposure
-   - Only ~5-10% of shares are taker, 90%+ were filled as maker (0% fee)
-3. **Phase 3 MERGE (T+270s→T+290s):** Merge all matched shares → profit + rebates
+### Warum V6 funktioniert (und V1-V5 nicht)
+V1-V5 kauften immer Up+Down quasi-gleichzeitig → Combined ≈ 101¢ → Verlust.
+V6 kauft jede Seite einzeln wenn BTC sich bewegt:
+- BTC STEIGT → Down wird billig → KAUF DOWN
+- BTC FÄLLT  → Up wird billig → KAUF UP
+- BTC FLAT   → nichts kaufen (kein Edge)
 
-### Kern-Edge
-**0% maker fee.** V1-V4 waren TAKER (hitten den Ask) → zahlten 1-1.5% Fee → Combined ≥ 101¢ + Fee = Verlust.
-V5 postet Limit-Orders UNTER dem Ask (Maker) → 0% Fee → Combined < 100¢ weil WIR die Preise wählen.
+Über 2-4 Min BTC-Oszillation sammeln wir beide Seiten billig. Combined < 100¢ → Merge → Profit.
 
-**WARUM V1-V4 (Taker) NICHT funktionierten:**
-- Taker hit den Ask → zahlt 1-1.5% Fee
-- Up+Down Asks = ~101¢ zu jedem Zeitpunkt
-- Combined als Taker: 101¢ + ~1.5¢ Fee = ~102.5¢ → garantierter Verlust
-- Kein Oscillation/DCA/Dip-Detection kann das fixen — die Fee frisst den Edge
+### Fee bei niedrigen Preisen ist kein Problem
+```
+Polymarket Fee: shares × price × 0.25 × (price × (1-price))²
+Bei 30¢: 0.53% → 30.16¢ effektiv
+Bei 20¢: 0.32% → 20.06¢ effektiv
+Bei 10¢: 0.08% → 10.01¢ effektiv
+Bei 50¢: 1.56% → 50.78¢ (worst case)
+```
+
+### 3-Phase Flow
+1. **Phase 1 ACCUMULATE (T+5s→T+260s):** Signal-based taker buys
+   - Monitor Binance BTCUSDT via WebSocket (real-time, ~100ms updates)
+   - BTC change > +0.05% → buy Down (cheap side)
+   - BTC change < -0.05% → buy Up (cheap side)
+   - Only buy if ask < CHEAP_THRESHOLD (45¢)
+   - Balance enforcement: max 3 chunks imbalance between sides
+2. **Phase 2 REBALANCE (T+260s):** Buy short side as taker
+   - Dynamic cap: max_price = (100¢ - avg_long_price) - 1¢
+   - Guarantees combined < 99¢ after rebalance
+3. **Phase 3 MERGE (T+270s):** Merge matched shares → $1.00 per pair
 
 ### Key Parameters
-- MAKER_OFFSET_CENTS: 2 (bid 2¢ unter Best Ask pro Seite → maker, nicht taker)
-- QUOTE_UPDATE_MS: 1000ms (quotes updaten / fills checken)
-- MAKER_PHASE_END_S: 60 (maker phase endet 60s vor Window-Ende → dann Rebalance)
-- MAX_TAKER_REBALANCE_SHARES: 500 (max Shares per Taker-Rebalance)
-- Dynamic Taker Cap: max_price = (100¢ - avg_maker_price_other_side) - 1¢ → garantiert Combined < 99¢
-- EQUITY_PER_WINDOW: 80%
+- BTC_MOVE_THRESHOLD: 0.0005 (0.05% BTC move triggers buy signal)
+- CHEAP_THRESHOLD: 0.45 (only buy when ask < 45¢)
+- SIGNAL_CHECK_INTERVAL_MS: 500 (check Binance every 500ms)
+- MAX_IMBALANCE_CHUNKS: 3 (max chunks more on one side)
+- REBALANCE_MAX_PRICE: 0.55 (hard cap for rebalance, dynamic cap is tighter)
+- EQUITY_PER_WINDOW: 30% (conservative start, scale up later)
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares
-- MERGE_BEFORE_END_S: 20s vor Window-Ende
+- STOP_BUYING_BEFORE_END_S: 40
 - MAX_CHUNK_SIZE: 200 shares
-- Fee: **0% (Maker)** for 90%+ of fills, **1-1.5% (Taker)** only for rebalance
+- SLIPPAGE_BUFFER: 0.02 (+2¢ over ask for FOK)
 
 ### Architecture
-- `src/execution/merge-arb-executor.ts` — V5 Core: 3-phase (maker→rebalance→merge)
-- `src/execution/dry-run-engine.ts` — Maker fill simulation (ask crosses bid = fill, 0% fee)
-- `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, price_change updates asks/bids)
-- `src/data/clob.ts` — CLOB REST API (orders, fills, balance, GTC limit orders)
+- `src/execution/signal-taker-executor.ts` — V6 Core: signal-based taker accumulation
+- `src/execution/merge-arb-executor.ts` — V5 (legacy): 3-phase maker strategy
+- `src/execution/dry-run-engine.ts` — FOK fill simulation against live orderbook
+- `src/data/binance-ws.ts` — Binance BTCUSDT WebSocket (real-time BTC price)
+- `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, price_change updates)
+- `src/data/clob.ts` — CLOB REST API (orders, fills, balance)
 - `src/data/redeem.ts` — CTF merge + redeem via relayer
 - `src/data/gamma.ts` — Market discovery (slug-based)
 - `src/config.ts` — All configuration parameters
-- `src/index.ts` — Main loop (merge-arb / edge / webhook modes)
+- `src/index.ts` — Main loop (signal-taker / merge-arb / edge / webhook modes)
 
 ### DRY_RUN Mode
 `DRY_RUN=true` (default) runs the **identical strategy code** but:
-- CLOB WebSocket connects normally (no auth needed) → real orderbook data
-- WebSocket `price_change` events update full asks[]/bids[] arrays
-- Maker bids are virtual; fill simulated when bestAsk ≤ our bid price
-- Maker fills: **0% fee** (recorded via `recordMakerFill()`)
-- Merges are simulated with correct P&L math
+- Binance WebSocket connects normally → real BTC price data
+- CLOB WebSocket connects normally → real orderbook data
+- FOK buys simulated against live orderbook depth
+- Taker fees applied via Polymarket crypto fee curve
+- Merges simulated with correct P&L math
 - Virtual balance, positions, and P&L tracked throughout
 
 ### Fee Model
-**Maker: 0% fee.** This is the entire edge.
-
-Taker fee (for reference, NOT used in V5):
 ```
 fee = shares × price × 0.25 × (price × (1 - price))²
 ```
-Max ~1.56% at 50¢, ~0.2% at extremes.
+Max ~1.56% at 50¢, drops toward extremes. At typical buy prices (25-40¢): 0.3-0.8%.
 
 ### WebSocket Notes
+- Binance: `wss://stream.binance.com:9443/ws/btcusdt@trade` — no auth, ~100ms updates
 - Polymarket CLOB WS requires subscription message immediately after connect
 - CLOB WS only connects when `subscribe()` is called with tokens
 - Market channel: client sends `PING` every 5s, server responds `PONG`
@@ -77,6 +88,6 @@ Max ~1.56% at 50¢, ~0.2% at extremes.
 - `book` events provide full snapshot (on subscribe)
 
 ### Specs
-- `HOLYPOLY_V3_DEFINITIVE.md` — V5 strategy specification (DEFINITIV, ersetzt alle vorherigen)
+- `HOLYPOLY_V3_DEFINITIVE.md` — V5 strategy specification (legacy)
 - `HOLYPOLY_STRATEGY_SPEC.md` — Original strategy specification (veraltet)
 - `HOLYPOLY_CHANGELOG.md` — Additions & updates

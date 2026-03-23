@@ -20,6 +20,7 @@ import { ArbCompletionMonitor } from "./execution/arb-completion.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { SignalExecutor } from "./execution/signal-executor.js";
 import { MergeArbExecutor } from "./execution/merge-arb-executor.js";
+import { SignalTakerExecutor } from "./execution/signal-taker-executor.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
 import { createWebhookServer } from "./webhook.js";
@@ -992,6 +993,123 @@ const main = async () => {
     }
   };
 
+  // === SIGNAL-TAKER V6 STRATEGY LOOP ===
+  const signalTakerLoop = async () => {
+    const executor = new SignalTakerExecutor(
+      clob,
+      clobWs,
+      binance,
+      redeemService,
+      config,
+      logger,
+      telegram,
+    );
+
+    logger.info("=== Signal-Taker V6 Strategy Active ===", {
+      btcMoveThreshold: `${(config.btcMoveThreshold * 100).toFixed(3)}%`,
+      cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
+      checkInterval: `${config.signalCheckIntervalMs}ms`,
+      maxImbalanceChunks: config.maxImbalanceChunks,
+      equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
+      dryRun: config.dryRun,
+    });
+
+    while (true) {
+      try {
+        const balance = await riskManager.getBalance();
+        const riskCheck = await riskManager.check();
+        if (!riskCheck.allowed) {
+          logger.warn("Risk blocked", { reason: riskCheck.reason });
+          await sleep(5000);
+          continue;
+        }
+
+        const window = await discovery.findActive5MinBtcMarket();
+        if (!window) {
+          await sleep(5000);
+          continue;
+        }
+
+        // Wait for window open + entry delay
+        const entryTime = window.startTime + config.mergeEntryDelayMs;
+        const now = Date.now();
+        if (now < entryTime) {
+          clobWs.subscribe([window.upTokenId, window.downTokenId]);
+          const waitMs = entryTime - now;
+          if (waitMs > 60_000) {
+            await sleep(5000);
+            continue;
+          }
+          logger.info("Waiting for entry", { waitMs });
+          await sleep(waitMs);
+        }
+
+        const timeRemaining = window.endTime - Date.now();
+        if (timeRemaining < 30_000) {
+          clobWs.clear();
+          await sleep(5000);
+          continue;
+        }
+
+        // Subscribe orderbook WS
+        clobWs.subscribe([window.upTokenId, window.downTokenId]);
+        await sleep(1000);
+
+        // Execute V6
+        const result = await executor.executeWindow(window, balance);
+
+        // Record to DB
+        const hadFills = !result.skipped && result.orderFills.length > 0;
+        if (hadFills) {
+          await db.recordWindow({
+            windowStart: result.windowStart,
+            conditionId: result.conditionId,
+            traded: true,
+            primarySide: null,
+            orders: result.orderFills.map(f => ({
+              side: f.side,
+              tokenId: f.side === "Up" ? window.upTokenId : window.downTokenId,
+              price: f.avgPrice * 100,
+              amount: f.totalCost,
+            })),
+            fillCount: result.orderFills.length,
+            pnl: result.totalMergeProfit,
+            winner: null,
+            balanceBefore: balance,
+            balanceAfter: config.dryRun ? balance + result.totalMergeProfit : null,
+          });
+
+          if (result.totalMergeProfit !== 0) {
+            await riskManager.recordResult(result.totalMergeProfit);
+            riskManager.invalidateBalanceCache();
+          }
+        }
+
+        // Post-resolution cleanup for remaining imbalance
+        if (result.remainingUp > 0 || result.remainingDn > 0) {
+          const waitForResolution = Math.max(0, window.endTime - Date.now()) + 5000;
+          if (waitForResolution > 0 && waitForResolution < 600_000) {
+            logger.info("Waiting for resolution", {
+              remainingUp: result.remainingUp.toFixed(1),
+              remainingDn: result.remainingDn.toFixed(1),
+            });
+            await sleep(waitForResolution);
+          }
+        }
+
+        clobWs.clear();
+        const sleepUntilNext = Math.max(0, window.endTime - Date.now()) + 2000;
+        if (sleepUntilNext > 0 && sleepUntilNext < 600_000) {
+          await sleep(sleepUntilNext);
+        }
+      } catch (err) {
+        logger.error("Signal-taker loop error", { error: (err as Error).message });
+        telegram.alertError((err as Error).message);
+        await sleep(5000);
+      }
+    }
+  };
+
   // === REDEEM LOOP ===
   const redeemLoop = async () => {
     if (!redeemService) return;
@@ -1037,9 +1155,11 @@ const main = async () => {
 
   const strategyLoop = config.strategyMode === "merge-arb"
     ? mergeArbLoop
-    : config.strategyMode === "webhook"
-      ? webhookSignalLoop
-      : hybridLoop;
+    : config.strategyMode === "signal-taker"
+      ? signalTakerLoop
+      : config.strategyMode === "webhook"
+        ? webhookSignalLoop
+        : hybridLoop;
 
   logger.info("Strategy mode", { mode: config.strategyMode });
   await Promise.all([strategyLoop(), redeemLoop()]);
