@@ -39,9 +39,6 @@ export class DryRunEngine {
     profit: number;
   }> = [];
 
-  /** Track consumed liquidity per token to simulate realistic depth depletion */
-  private consumedAsks: Map<string, Map<number, number>> = new Map();
-
   constructor(
     private clobWs: ClobWsClient,
     private takerFeeRate: number,
@@ -88,8 +85,11 @@ export class DryRunEngine {
   }
 
   /**
-   * Simulate a FOK buy order against the live orderbook.
+   * Simulate a FOK buy order against the LIVE orderbook.
    * FOK = Fill-or-Kill: entire size must be fillable or order is rejected.
+   *
+   * V3: No consumed liquidity subtracted — each order sees the fresh WS book.
+   * The 2s sleep between orders + MM replenishment means the book is real-time.
    */
   simulateFokBuy(
     tokenId: string,
@@ -103,8 +103,8 @@ export class DryRunEngine {
       return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0, levelsUsed: 0, timestamp: Date.now() };
     }
 
-    // Walk through asks, respecting previously consumed liquidity
-    const consumed = this.getConsumedAsks(tokenId);
+    // Walk through LIVE asks directly — no consumed liquidity subtraction.
+    // The WS book is real-time; between 2s-spaced orders, MMs replenish depth.
     let remaining = size;
     let totalCost = 0;
     let levelsUsed = 0;
@@ -112,11 +112,9 @@ export class DryRunEngine {
     for (const level of book.asks) {
       if (level.price > maxPrice) break;
 
-      const alreadyConsumed = consumed.get(level.price) ?? 0;
-      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
-      if (availableAtLevel <= 0) continue;
+      const fillAtLevel = Math.min(remaining, level.size);
+      if (fillAtLevel <= 0) continue;
 
-      const fillAtLevel = Math.min(remaining, availableAtLevel);
       totalCost += fillAtLevel * level.price;
       remaining -= fillAtLevel;
       levelsUsed++;
@@ -133,22 +131,6 @@ export class DryRunEngine {
         maxPrice: `${(maxPrice * 100).toFixed(0)}¢`,
       });
       return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0, levelsUsed: 0, timestamp: Date.now() };
-    }
-
-    // FOK success — consume the liquidity
-    remaining = size;
-    for (const level of book.asks) {
-      if (level.price > maxPrice) break;
-
-      const alreadyConsumed = consumed.get(level.price) ?? 0;
-      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
-      if (availableAtLevel <= 0) continue;
-
-      const fillAtLevel = Math.min(remaining, availableAtLevel);
-      consumed.set(level.price, alreadyConsumed + fillAtLevel);
-      remaining -= fillAtLevel;
-
-      if (remaining <= 0) break;
     }
 
     const avgPrice = totalCost / size;
@@ -256,7 +238,7 @@ export class DryRunEngine {
 
   /**
    * Simulate a GTC buy order — allows partial fills (unlike FOK).
-   * Used as fallback when FOK fails repeatedly on thin books.
+   * V3: Uses fresh WS book directly, no consumed liquidity subtraction.
    */
   simulateGtcFill(
     tokenId: string,
@@ -270,19 +252,16 @@ export class DryRunEngine {
       return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
     }
 
-    const consumed = this.getConsumedAsks(tokenId);
     let remaining = size;
     let totalCost = 0;
 
-    // Walk asks — accept partial fills (GTC behavior)
+    // Walk LIVE asks directly — no consumed subtraction (V3: MMs replenish between orders)
     for (const level of book.asks) {
       if (level.price > maxPrice) break;
 
-      const alreadyConsumed = consumed.get(level.price) ?? 0;
-      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
-      if (availableAtLevel <= 0) continue;
+      const fillAtLevel = Math.min(remaining, level.size);
+      if (fillAtLevel <= 0) continue;
 
-      const fillAtLevel = Math.min(remaining, availableAtLevel);
       totalCost += fillAtLevel * level.price;
       remaining -= fillAtLevel;
       if (remaining <= 0) break;
@@ -292,19 +271,6 @@ export class DryRunEngine {
     if (filledSize <= 0) {
       this.logger.debug("DRY_RUN: GTC no fills available", { side, maxPrice: `${(maxPrice * 100).toFixed(0)}¢` });
       return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
-    }
-
-    // Consume liquidity for filled portion
-    let rem2 = filledSize;
-    for (const level of book.asks) {
-      if (level.price > maxPrice) break;
-      const alreadyConsumed = consumed.get(level.price) ?? 0;
-      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
-      if (availableAtLevel <= 0) continue;
-      const fillAtLevel = Math.min(rem2, availableAtLevel);
-      consumed.set(level.price, alreadyConsumed + fillAtLevel);
-      rem2 -= fillAtLevel;
-      if (rem2 <= 0) break;
     }
 
     const avgPrice = totalCost / filledSize;
@@ -362,16 +328,12 @@ export class DryRunEngine {
       return { canFill: false, avgPrice: 0, levelsAvailable: 0 };
     }
 
-    const consumed = this.getConsumedAsks(tokenId);
     let remaining = targetSize;
     let totalCost = 0;
 
     for (const level of book.asks) {
-      const alreadyConsumed = consumed.get(level.price) ?? 0;
-      const available = Math.max(0, level.size - alreadyConsumed);
-      if (available <= 0) continue;
-
-      const fill = Math.min(remaining, available);
+      const fill = Math.min(remaining, level.size);
+      if (fill <= 0) continue;
       totalCost += fill * level.price;
       remaining -= fill;
       if (remaining <= 0) break;
@@ -381,33 +343,16 @@ export class DryRunEngine {
     return {
       canFill: remaining <= 0,
       avgPrice: filled > 0 ? totalCost / filled : 0,
-      levelsAvailable: book.asks.filter(a => {
-        const c = consumed.get(a.price) ?? 0;
-        return a.size - c > 0;
-      }).length,
+      levelsAvailable: book.asks.length,
     };
   }
 
   /**
-   * Get a book view adjusted for consumed liquidity (for executor pre-order checks).
+   * Get the live book view (V3: no consumed liquidity adjustment).
+   * The WS book is real-time — between 2s-spaced orders, MMs replenish.
    */
   getBookView(tokenId: string): BookSnapshot | null {
-    const book = this.clobWs.getBook(tokenId);
-    if (!book) return null;
-
-    const consumed = this.getConsumedAsks(tokenId);
-    const asks = (book.asks ?? [])
-      .map(a => {
-        const c = consumed.get(a.price) ?? 0;
-        return { price: a.price, size: Math.max(0, a.size - c) };
-      })
-      .filter(a => a.size > 0);
-
-    return {
-      ...book,
-      asks,
-      bestAsk: asks.length > 0 ? asks[0].price : book.bestAsk,
-    };
+    return this.clobWs.getBook(tokenId);
   }
 
   /** Reset state for a new window */
@@ -420,7 +365,6 @@ export class DryRunEngine {
     this.totalTakerFees = 0;
     this.fillLog = [];
     this.mergeLog = [];
-    this.consumedAsks.clear();
   }
 
   /** Update balance (e.g. after fetching real balance for initial state) */
@@ -428,12 +372,4 @@ export class DryRunEngine {
     this.virtualBalance = balance;
   }
 
-  private getConsumedAsks(tokenId: string): Map<number, number> {
-    let consumed = this.consumedAsks.get(tokenId);
-    if (!consumed) {
-      consumed = new Map();
-      this.consumedAsks.set(tokenId, consumed);
-    }
-    return consumed;
-  }
 }
