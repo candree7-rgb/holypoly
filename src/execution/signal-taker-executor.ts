@@ -108,6 +108,11 @@ export class SignalTakerExecutor {
     const orderFills: OrderFill[] = [];
     let totalTakerFees = 0;
 
+    // Per-side pacing: min 10s between orders on the SAME side
+    let lastUpBuyTime = 0;
+    let lastDnBuyTime = 0;
+    const sameSideCooldownMs = this.config.sameSideCooldownMs;
+
     this.logger.info("=== V6 Signal-Taker Window Start ===", {
       window: new Date(window.startTime).toISOString().slice(11, 19),
       btcPrice: `$${windowOpenPrice.toFixed(0)}`,
@@ -139,17 +144,41 @@ export class SignalTakerExecutor {
       // Determine which side to buy based on BTC movement
       let buySignal: TradeSide | null = null;
 
+      const now = Date.now();
+
       if (btcChange > this.config.btcMoveThreshold) {
         // BTC rising → Down is cheap → buy Down
-        // But only if we don't have too much Down already
         if (filledDnShares <= filledUpShares + chunkSize * this.config.maxImbalanceChunks) {
-          buySignal = "Down";
+          // Per-side pacing: 10s cooldown on same side, other side can buy immediately
+          if (now - lastDnBuyTime >= sameSideCooldownMs) {
+            // Budget-reserve: max 50% on one side until other side has ≥1 fill
+            const dnBudgetUsed = totalDnCost;
+            if (filledUpShares > 0 || dnBudgetUsed < budget * this.config.budgetReservePct) {
+              buySignal = "Down";
+            } else {
+              this.logger.debug("Budget-reserve: waiting for Up fill before more Down buys", {
+                dnCost: `$${dnBudgetUsed.toFixed(2)}`,
+                budgetLimit: `$${(budget * this.config.budgetReservePct).toFixed(2)}`,
+              });
+            }
+          }
         }
       } else if (btcChange < -this.config.btcMoveThreshold) {
         // BTC falling → Up is cheap → buy Up
-        // But only if we don't have too much Up already
         if (filledUpShares <= filledDnShares + chunkSize * this.config.maxImbalanceChunks) {
-          buySignal = "Up";
+          // Per-side pacing: 10s cooldown on same side
+          if (now - lastUpBuyTime >= sameSideCooldownMs) {
+            // Budget-reserve: max 50% on one side until other side has ≥1 fill
+            const upBudgetUsed = totalUpCost;
+            if (filledDnShares > 0 || upBudgetUsed < budget * this.config.budgetReservePct) {
+              buySignal = "Up";
+            } else {
+              this.logger.debug("Budget-reserve: waiting for Down fill before more Up buys", {
+                upCost: `$${upBudgetUsed.toFixed(2)}`,
+                budgetLimit: `$${(budget * this.config.budgetReservePct).toFixed(2)}`,
+              });
+            }
+          }
         }
       }
       // BTC flat → no signal → wait
@@ -171,9 +200,11 @@ export class SignalTakerExecutor {
             if (buySignal === "Up") {
               filledUpShares += fill.filledSize;
               totalUpCost += fill.totalCost;
+              lastUpBuyTime = Date.now();
             } else {
               filledDnShares += fill.filledSize;
               totalDnCost += fill.totalCost;
+              lastDnBuyTime = Date.now();
             }
             availableBudget -= fill.totalCost;
             orderFills.push({
@@ -223,23 +254,20 @@ export class SignalTakerExecutor {
       const shortSide: TradeSide = filledUpShares > filledDnShares ? "Down" : "Up";
       const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
 
-      // Dynamic cap based on avg price of long side
-      const longShares = shortSide === "Up" ? filledDnShares : filledUpShares;
-      const longCost = shortSide === "Up" ? totalDnCost : totalUpCost;
-      const avgLongPrice = longShares > 0 ? longCost / longShares : 0.50;
-      const dynamicMaxPrice = (1.00 - avgLongPrice) - 0.01;
+      // Fixed rebalance cap (dynamic cap was blocking everything — opposite side
+      // is always ~96-100¢ right after a directional BTC move)
+      const rebalanceMaxPrice = this.config.rebalanceMaxPrice;
 
       this.logger.info("Phase 2: Taker rebalance", {
         imbalance: imbalance.toFixed(0),
         shortSide,
-        avgLongPrice: `${(avgLongPrice * 100).toFixed(1)}¢`,
-        dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
+        rebalanceCap: `${(rebalanceMaxPrice * 100).toFixed(0)}¢`,
       });
 
       const book = this.getBook(shortToken);
       const bestAsk = book?.asks?.[0]?.price ?? 1.0;
 
-      if (bestAsk <= dynamicMaxPrice) {
+      if (bestAsk <= rebalanceMaxPrice) {
         const rebalancePrice = bestAsk + this.config.slippageBuffer;
         const fill = await this.buyOrder(shortToken, imbalance, rebalancePrice, shortSide);
 
@@ -269,22 +297,22 @@ export class SignalTakerExecutor {
             side: shortSide,
             size: fill.filledSize.toFixed(0),
             price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
-            dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
+            cap: `${(rebalanceMaxPrice * 100).toFixed(0)}¢`,
             newBalance: `Up=${filledUpShares.toFixed(0)} Dn=${filledDnShares.toFixed(0)}`,
           });
           this.telegram.send(
             `⚖️ Rebalance: ${fill.filledSize.toFixed(0)}sh ${shortSide} @ ${(fill.avgPrice * 100).toFixed(1)}¢ ` +
-            `[cap: ${(dynamicMaxPrice * 100).toFixed(1)}¢]`,
+            `[cap: ${(rebalanceMaxPrice * 100).toFixed(0)}¢]`,
           );
         }
       } else {
-        this.logger.warn("Rebalance skipped — ask exceeds dynamic cap", {
+        this.logger.warn("Rebalance skipped — ask exceeds cap", {
           shortSide,
           bestAsk: `${(bestAsk * 100).toFixed(1)}¢`,
-          dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
+          cap: `${(rebalanceMaxPrice * 100).toFixed(0)}¢`,
         });
         this.telegram.send(
-          `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > dynamic cap ${(dynamicMaxPrice * 100).toFixed(1)}¢`,
+          `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > cap ${(rebalanceMaxPrice * 100).toFixed(0)}¢`,
         );
       }
     }

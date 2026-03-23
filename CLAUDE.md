@@ -32,9 +32,10 @@ Bei 50¢: 1.56% → 50.78¢ (worst case)
    - BTC change < -0.05% → buy Up (cheap side)
    - Only buy if ask < CHEAP_THRESHOLD (45¢)
    - Balance enforcement: max 3 chunks imbalance between sides
+   - Per-side pacing: min 10s between orders on same side (wait for BTC to move more)
+   - Budget-reserve: max 50% budget on one side until other side has ≥1 fill
 2. **Phase 2 REBALANCE (T+260s):** Buy short side as taker
-   - Dynamic cap: max_price = (100¢ - avg_long_price) - 1¢
-   - Guarantees combined < 99¢ after rebalance
+   - Fixed cap: 55¢ (dynamic cap was blocking everything — opposite side always ~96-100¢ after directional move)
 3. **Phase 3 MERGE (T+270s):** Merge matched shares → $1.00 per pair
 
 ### Key Parameters
@@ -42,6 +43,9 @@ Bei 50¢: 1.56% → 50.78¢ (worst case)
 - CHEAP_THRESHOLD: 0.45 (only buy when ask < 45¢)
 - SIGNAL_CHECK_INTERVAL_MS: 500 (check Binance every 500ms)
 - MAX_IMBALANCE_CHUNKS: 3 (max chunks more on one side)
+- SAME_SIDE_COOLDOWN_MS: 10000 (10s min between orders on same side)
+- BUDGET_RESERVE_PCT: 0.50 (max 50% budget on one side until other has ≥1 fill)
+- REBALANCE_MAX_PRICE: 0.55 (fixed 55¢ cap for rebalance buys)
 - EQUITY_PER_WINDOW: 30% (conservative start, scale up later)
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares

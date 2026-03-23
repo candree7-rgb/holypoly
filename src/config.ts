@@ -111,6 +111,12 @@ export interface Config {
   signalCheckIntervalMs: number;
   /** Max chunks more on one side before pausing that side */
   maxImbalanceChunks: number;
+  /** Min ms between orders on the SAME side (other side can buy immediately) */
+  sameSideCooldownMs: number;
+  /** Max fraction of budget on one side before other side has ≥1 fill (e.g. 0.50 = 50%) */
+  budgetReservePct: number;
+  /** Fixed max price for rebalance taker buy (e.g. 0.55 = 55¢) */
+  rebalanceMaxPrice: number;
 
   // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
   /** Fraction of balance to allocate per window (e.g. 0.80 = 80%) */
@@ -339,6 +345,9 @@ export const loadConfig = (): Config => {
   const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.45);
   const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
   const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 3);
+  const sameSideCooldownMs = parseNumber("SAME_SIDE_COOLDOWN_MS", 10000);
+  const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
+  const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.55);
 
   // Merge-Arb Strategy parameters (V3)
   const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);
@@ -432,6 +441,9 @@ export const loadConfig = (): Config => {
     cheapThreshold,
     signalCheckIntervalMs,
     maxImbalanceChunks,
+    sameSideCooldownMs,
+    budgetReservePct,
+    rebalanceMaxPrice,
     equityPerWindow,
     maxOrdersPerWindow,
     mergeMinSize,
