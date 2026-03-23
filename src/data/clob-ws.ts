@@ -189,7 +189,7 @@ export class ClobWsClient {
           this.notifyUpdate(msg.asset_id, existing);
 
         } else if (msg.event_type === "price_change" && msg.price_changes) {
-          // Price level update — includes best bid/ask
+          // Price level update — update the actual asks/bids arrays
           for (const change of msg.price_changes) {
             let existing = this.books.get(change.asset_id);
             if (!existing) {
@@ -202,6 +202,35 @@ export class ClobWsClient {
               };
               this.books.set(change.asset_id, existing);
             }
+
+            // Update the specific price level in bids or asks
+            const price = parseFloat(change.price);
+            const size = parseFloat(change.size);
+            const side = change.side; // "BUY" = bid, "SELL" = ask
+
+            if (!isNaN(price)) {
+              const list = side === "BUY" ? existing.bids : existing.asks;
+              const idx = list.findIndex(l => l.price === price);
+
+              if (size > 0) {
+                // Upsert: update existing level or insert new one
+                if (idx >= 0) {
+                  list[idx].size = size;
+                } else {
+                  list.push({ price, size });
+                  // Re-sort: bids descending, asks ascending
+                  if (side === "BUY") {
+                    list.sort((a, b) => b.price - a.price);
+                  } else {
+                    list.sort((a, b) => a.price - b.price);
+                  }
+                }
+              } else {
+                // Size 0: remove level
+                if (idx >= 0) list.splice(idx, 1);
+              }
+            }
+
             existing.bestBid = parseFloat(change.best_bid) || existing.bestBid;
             existing.bestAsk = parseFloat(change.best_ask) || existing.bestAsk;
             this.notifyUpdate(change.asset_id, existing);
