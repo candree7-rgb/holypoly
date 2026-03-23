@@ -355,6 +355,42 @@ export class DryRunEngine {
     return this.clobWs.getBook(tokenId);
   }
 
+  /**
+   * Record a maker fill (V5). Maker fee = 0%.
+   * Called by the executor when a DRY_RUN maker bid is "filled"
+   * (bestAsk crossed down to our bid price).
+   */
+  recordMakerFill(side: "Up" | "Down", size: number, price: number): void {
+    const cost = size * price; // 0% maker fee!
+
+    if (side === "Up") {
+      this.virtualUpShares += size;
+      this.virtualUpCost += cost;
+    } else {
+      this.virtualDnShares += size;
+      this.virtualDnCost += cost;
+    }
+    this.virtualBalance -= cost;
+    // Note: NO fee added to totalTakerFees (maker = 0%)
+
+    this.fillLog.push({
+      timestamp: Date.now(),
+      side,
+      size,
+      avgPrice: price,
+      cost,
+      type: "GTC",
+    });
+
+    this.logger.info("DRY_RUN: Maker fill (0% fee)", {
+      side,
+      size: size.toFixed(1),
+      price: `${(price * 100).toFixed(1)}¢`,
+      cost: `$${cost.toFixed(2)}`,
+      fee: "$0.00 (maker)",
+    });
+  }
+
   /** Reset state for a new window */
   resetWindow(): void {
     this.virtualUpShares = 0;

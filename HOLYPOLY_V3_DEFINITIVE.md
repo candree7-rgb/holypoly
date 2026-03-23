@@ -1,148 +1,138 @@
-# HolyPoly v4 — DEFINITIVE Strategy Spec (Oscillation DCA)
+# HolyPoly v5 — DEFINITIVE Strategy Spec (Maker)
 
-## DIESES DOKUMENT ERSETZT ALLE VORHERIGEN SPECS (inkl. V3)
+## DIESES DOKUMENT ERSETZT ALLE VORHERIGEN SPECS (inkl. V3+V4)
 
-Basierend auf: 295.911 API-Einträge + Live-Screenshot-Analyse der aktuellen Stargate5-Activity (23. März 2026) + V3 DRY_RUN-Ergebnisse die IMMER ~101¢ Combined zeigten.
+V1-V4 waren alle **TAKER**-Strategien (hitten den Ask). Taker-Fee auf Polymarket Crypto = 1-1.5%.
+Up+Down Asks = ~101¢ zu jedem Zeitpunkt. 101¢ + 1.5¢ Fee = ~102.5¢ = **garantierter Verlust**.
+Kein DCA, kein Oscillation-Timing, kein Dip-Detection kann das fixen.
 
-V3 hatte einen **fundamentalen Fehler**: blindes Alternieren Up→Down→Up→Down kauft jedes Paar zum selben Zeitpunkt, und Up+Down = ~101¢ zu JEDEM Zeitpunkt. Ergebnis: garantierter Verlust.
+**V5 ist eine MAKER-Strategie.** Maker-Fee = 0%. Wir posten Limit-Orders UNTER dem Ask.
+Wir kontrollieren die Preise. Combined < 100¢. 0% Fee. Profit + Rebates.
 
 ---
 
 ## 1. Die Strategie in einem Absatz
 
-Der Bot überwacht auf Polymarket 5-Min BTC Up/Down-Märkten **beide Orderbücher gleichzeitig** via WebSocket. Er kauft **jede Seite NUR wenn sie gerade billig ist** — Up wenn BTC gerade gefallen ist (Up-Ask niedrig), Down wenn BTC gerade gestiegen ist (Down-Ask niedrig). Da BTC innerhalb von 5 Minuten oscilliert, treffen die Tiefpunkte beider Seiten zu **verschiedenen Zeitpunkten** ein. Über 2-4 Minuten sammelt der Bot die Dips beider Seiten ein. Der **gewichtete Durchschnittspreis** (Up + Down) über ALLE Orders landet unter 100¢ weil jede Seite nur bei ihrem Tiefpunkt gekauft wurde. Am Ende des Windows merged er alle matched Shares zu je $1 zurück. Profit = $1 × matched_shares − total_cost.
+Der Bot posted auf Polymarket 5-Min BTC Up/Down-Märkten **GTC Limit BUY Orders UNTER dem Ask** auf beiden Seiten (= Maker, 0% Fee). Er wählt die Preise so dass `upBid + dnBid < 100¢`. Wenn BTC oscilliert, sinkt der Ask einer Seite bis zu unserem Bid → Fill. Über 2-4 Minuten füllen sich beide Seiten. Am Ende des Windows merged er alle matched Shares zu je $1 zurück. Profit = $1 × matched_shares − total_cost. **Bei 0% Maker-Fee ist der gesamte Spread Profit.**
 
-**KEY INSIGHT:** Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt. Aber Up-Tiefpunkt ≠ Down-Tiefpunkt zeitlich. Die Tiefpunkte beider Seiten zu VERSCHIEDENEN Zeitpunkten einsammeln = Combined < 100¢.
-
----
-
-## 2. Was V3 FALSCH hatte (und V4 korrigiert)
-
-| V3 (FALSCH) | V4 (RICHTIG) |
-|-------------|--------------|
-| Blind alternierend Up→Down→Up→Down | Kaufe jede Seite NUR bei ihrem Dip |
-| Jedes Up+Down Paar = ~101¢ (gleicher Zeitpunkt) | Up-Dip und Down-Dip zu verschiedenen Zeitpunkten → Combined < 100¢ |
-| Fester 2s Takt: kaufe was auch immer dran ist | Monitor alle 500ms, kaufe NUR wenn günstig |
-| "Preisoszillation über viele Orders mittelt unter 100¢" | FALSCH — wenn du beide Seiten gleichzeitig kaufst, ist die Summe IMMER ~101¢ |
-| Kein Preisziel pro Seite | Target = Midpoint × DIP_THRESHOLD (z.B. 92% = 8% unter Durchschnitt) |
+**KEY INSIGHT:** Maker-Fee = 0%. Taker-Fee = 1-1.5%. DAS ist der Edge. Nicht Oscillation, nicht DCA, nicht Timing. Die 0% Fee allein macht den Unterschied zwischen Profit und Verlust.
 
 ---
 
-## 3. Was Stargate5 WIRKLICH macht (Re-Interpretation)
+## 2. Was V1-V4 FALSCH hatten (und V5 korrigiert)
 
-Die V3-Analyse sah blindes Alternieren — aber das ist NICHT der Edge. Der Edge kommt daher dass **jede Seite nur gekauft wird wenn sie gerade billig ist**:
+| V1-V4 (FALSCH) | V5 (RICHTIG) |
+|----------------|--------------|
+| **TAKER** — hitten den Ask | **MAKER** — posten Limit-Orders unter dem Ask |
+| Taker-Fee: 1-1.5% | Maker-Fee: **0%** + Rebates |
+| Preis = bestAsk + Slippage (teuer) | Preis = bestAsk - Offset (**wir wählen**) |
+| Combined ≥ 101¢ + Fee = ~102.5¢ | Combined < 100¢ (weil wir die Preise setzen) |
+| Oscillation/DCA/Dip-Detection | Unnötig — der Maker-Spread IST der Edge |
+| Sofortiger Fill (taker) | Warten auf Fill (maker) — BTC muss sich bewegen |
 
-### Beispiel: Oscillation-DCA in einem Window
+---
+
+## 3. Was Stargate5 WIRKLICH macht (Re-Interpretation #2)
+
+Stargate5 ist ein **MAKER**, nicht ein Taker. Er postet Limit-Orders IM Orderbuch und wartet auf Fills.
+
+### Beispiel: Maker Quoting in einem Window
 
 ```
-T+0:    BTC fällt stark → Up=15¢ (BILLIG!) Down=86¢ (teuer)
-        → BOT KAUFT UP bei 15¢              (Down wird NICHT gekauft)
+T+5s:   Up bestAsk=48¢, Down bestAsk=54¢
+        → Poste GTC BUY Up bei 46¢ (2¢ unter Ask = Maker)
+        → Poste GTC BUY Down bei 52¢ (2¢ unter Ask = Maker)
+        → Combined Bid: 46 + 52 = 98¢ → 2¢ Profit pro Share wenn filled
+        → Fee: 0% (Maker)
 
-T+30s:  BTC erholt sich → Up=45¢ (fair) Down=56¢ (fair)
-        → NICHTS KAUFEN (keine Seite ist billig genug)
+T+30s:  BTC fällt → Up bestAsk sinkt auf 45¢
+        → Up Ask (45¢) ≤ unserer Up Bid (46¢) → FILL! Up gekauft bei 46¢
+        → Down Ask steigt auf 57¢ → kein Fill (57¢ > 52¢)
+        → Cancel Down Bid, repost bei 55¢ (2¢ unter 57¢)
 
-T+60s:  BTC steigt weiter → Up=70¢ (teuer) Down=31¢ (BILLIG!)
-        → BOT KAUFT DOWN bei 31¢            (Up wird NICHT gekauft)
+T+90s:  BTC steigt zurück → Down bestAsk sinkt auf 53¢
+        → Down Ask (53¢) ≤ unserer Down Bid (55¢) → FILL! Down gekauft bei 55¢
+        → Repost neue Bids für nächsten Chunk
 
-T+90s:  BTC fällt wieder → Up=25¢ (BILLIG!) Down=76¢ (teuer)
-        → BOT KAUFT UP bei 25¢
+...über 2-4 Minuten akkumulieren sich Fills auf beiden Seiten...
 
-T+120s: BTC steigt → Up=65¢ (teuer) Down=36¢ (BILLIG!)
-        → BOT KAUFT DOWN bei 36¢
-
-...usw. über 2-4 Minuten...
-
-Ergebnis:
-  Up gekauft bei: 15¢, 25¢, 20¢, 18¢    → avg Up = ~19.5¢
-  Down gekauft bei: 31¢, 36¢, 28¢, 33¢  → avg Down = ~32¢
-  Combined: 19.5 + 32 = 51.5¢ ← WEIT UNTER 100¢!
-
-  Merge 720 shares × ($1.00 - $0.515) = ~$349 Profit
+T+280s: MERGE
+  Up gekauft bei: 46¢, 44¢, 47¢, 45¢     → avg Up = 45.5¢
+  Down gekauft bei: 55¢, 52¢, 53¢, 54¢   → avg Down = 53.5¢
+  Combined: 45.5 + 53.5 = 99¢ → 1¢ Profit pro Share
+  Fee: $0 (MAKER!)
+  Merged: 740 shares × 1¢ = $7.40 Profit + Rebates
 ```
 
 **WARUM das funktioniert:**
-- Up-Tiefpunkte (BTC fällt) und Down-Tiefpunkte (BTC steigt) passieren zu VERSCHIEDENEN Zeitpunkten
-- Wenn Up billig ist (15¢), ist Down teuer (86¢) → wir kaufen NUR Up
-- Wenn Down billig ist (31¢), ist Up teuer (70¢) → wir kaufen NUR Down
-- Über Zeit sammeln wir die TIEFPUNKTE beider Seiten ein
-- Combined = avg(Up-Tiefpunkte) + avg(Down-Tiefpunkte) < 100¢
+- Maker Fee = 0% (Taker wäre 1-1.5% → Verlust)
+- Wir WÄHLEN die Preise (bid unter Ask) → Combined < 100¢ garantiert
+- BTC Oscillation bringt den Ask zu unseren Bids → Fills passieren
+- Wenn BTC nicht oscilliert → keine Fills → kein Verlust (sicher)
 
-**WARUM V3 (blind alternierend) NICHT funktionierte:**
-- V3 kauft Up bei 15¢ dann SOFORT Down bei 86¢ → Paar = 101¢ → Verlust
-- Egal wie viele Paare: jedes Paar ist zum SELBEN Zeitpunkt → immer ~101¢
-
----
-
-## 4. Warum es funktioniert: Selektives Dip-Buying
-
-**FAKT: Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt.**
-
-Das heißt: Wenn du BEIDE Seiten zum gleichen Zeitpunkt kaufst, verlierst du IMMER ~1¢ pro Share (plus Fees).
-
-**Der Edge kommt aus ZEITLICHER TRENNUNG:**
-
-```
-Zeitpunkt 1 (BTC fällt):   Up=15¢ ←kaufen  Down=86¢ ←ignorieren
-Zeitpunkt 2 (BTC steigt):  Up=70¢ ←ignorieren  Down=31¢ ←kaufen
-```
-
-- Zeitpunkt 1: Wir kaufen EINE Seite (Up) bei 15¢
-- Zeitpunkt 2: Wir kaufen die ANDERE Seite (Down) bei 31¢
-- Unser Combined: 15 + 31 = 46¢ (WEIT unter 100¢!)
-
-**Warum funktioniert das nicht bei gleichzeitigem Kauf?**
-- Zeitpunkt 1: Up=15¢ + Down=86¢ = 101¢ → Verlust
-- Zeitpunkt 2: Up=70¢ + Down=31¢ = 101¢ → Verlust
-
-**Der Algorithmus:**
-1. Beobachte beide Orderbücher alle 500ms
-2. Berechne laufenden Durchschnittspreis (Midpoint) für jede Seite
-3. Kaufe eine Seite NUR wenn ihr Ask < Midpoint × 0.92 (8% unter Durchschnitt)
-4. Wenn keine Seite günstig ist → WARTEN (nicht kaufen!)
-5. Über 2-4 Minuten: BTC oscilliert, beide Seiten werden bei ihren Dips gekauft
-6. Am Ende: Combined aus Up-Dips + Down-Dips < 100¢ → Merge → Profit
+**WARUM V1-V4 (Taker) NICHT funktionierten:**
+- Taker hit den Ask → zahlt 1-1.5% Fee
+- Up+Down Asks = ~101¢ → Combined inkl. Fee = ~102.5¢ → Verlust
+- KEIN Taker-Ansatz kann profitabel sein bei 101¢ + Fee
 
 ---
 
-## 5. Definitive Parameter (V4)
+## 4. Warum es funktioniert: Maker vs Taker
 
-### 5.1 Orders pro Window
+**FAKT: Maker Fee = 0%. Taker Fee = 1-1.5%.**
 
-| Parameter | Wert | Quelle |
-|-----------|------|--------|
-| Min Orders | 4 (2 pro Seite) | Minimum für sinnvollen Durchschnitt |
-| Typisch | 10-20 | Abhängig von BTC-Volatilität |
-| Max Orders | 30 | Hard cap |
+Das ist der GESAMTE Unterschied:
 
-**WICHTIG:** Anders als V3 gibt es KEIN fixes Alternieren. Orders kommen opportunistisch wenn eine Seite billig ist. In ruhigen Phasen (keine Oscillation) kommen weniger Orders.
+```
+TAKER (V1-V4):
+  Hit Up Ask bei 48¢ → Fee: 48¢ × 1.56% = 0.75¢
+  Hit Dn Ask bei 54¢ → Fee: 54¢ × 0.88% = 0.47¢
+  Combined: 48 + 54 + 0.75 + 0.47 = 103.2¢ → VERLUST
 
-### 5.2 Chunk-Size
+MAKER (V5):
+  Post Up Bid bei 46¢ → Fee: 0¢
+  Post Dn Bid bei 52¢ → Fee: 0¢
+  Combined: 46 + 52 = 98¢ → PROFIT (2¢/share)
+```
 
-Wie V3 — ~180 Shares pro Order, berechnet aus Balance.
+**Warum Maker funktioniert:**
+1. **0% Fee** — kein Abzug vom Edge
+2. **Wir wählen die Preise** — bidding UNTER dem Ask garantiert Combined < 100¢
+3. **BTC Oscillation** — Preise bewegen sich, Ask sinkt zu unseren Bids → Fills
+4. **Rebates** — Tägliche USDC-Rebates obendrauf (funded by taker fees)
+5. **Sicher** — Wenn BTC nicht oscilliert, keine Fills → kein Verlust
 
-### 5.3 Timing
+**Trade-off:**
+- Maker: Weniger Fills (müssen warten), aber jeder Fill ist profitabel
+- Taker: Sofortige Fills, aber JEDER Fill ist ein Verlust
 
-| Parameter | Wert |
-|-----------|------|
-| Market Discovery | VOR Window-Open |
-| Monitor-Start | T+5s (ENTRY_DELAY) |
-| Monitor-Intervall | **500ms** (beide Bücher checken) |
-| Order-Intervall | 2s (nach erfolgtem Kauf, nicht pro Tick) |
-| Letzte Order | Spätestens T+260s |
-| Merge | T+270-290s |
+---
 
-### 5.4 Dip-Detection Parameter
+## 5. Definitive Parameter (V5 Maker)
+
+### 5.1 Maker-Spezifische Parameter
 
 | Parameter | Wert | Erklärung |
 |-----------|------|-----------|
-| DIP_THRESHOLD_PCT | 0.92 | Kaufe wenn Ask < Midpoint × 0.92 (8% unter Durchschnitt) |
-| MONITOR_INTERVAL_MS | 500 | Wie oft beide Bücher gecheckt werden |
-| Adaptive Relaxation | +0.2%/tick, max +5% | Wenn zu lange nichts gekauft wird, Threshold lockern |
+| MAKER_OFFSET_CENTS | 2 | Bid X¢ unter dem bestAsk (muss ≥1 für Maker-Status) |
+| QUOTE_UPDATE_MS | 1000 | Wie oft Quotes updaten und Fills checken |
 
 **Tuning:**
-- DIP_THRESHOLD_PCT zu niedrig (0.80) → zu wenige Orders, viel Imbalance
-- DIP_THRESHOLD_PCT zu hoch (0.98) → zu viele Orders, kauft quasi alles (wie V3)
-- Sweet Spot: 0.88-0.95, abhängig von BTC-Volatilität
+- MAKER_OFFSET_CENTS = 1 → Combined ~99¢, 1¢ Profit/share, mehr Fills (näher am Ask)
+- MAKER_OFFSET_CENTS = 2 → Combined ~97¢, 3¢ Profit/share, weniger Fills (default)
+- MAKER_OFFSET_CENTS = 3 → Combined ~95¢, 5¢ Profit/share, noch weniger Fills
+
+### 5.2 Chunk-Size & Timing
+
+| Parameter | Wert |
+|-----------|------|
+| Chunk-Size | ~180 Shares (berechnet aus Balance) |
+| Market Discovery | VOR Window-Open |
+| Quote-Start | T+5s (ENTRY_DELAY) |
+| Quote-Update | Jede 1s |
+| Cancel & Repost | Wenn Preis sich ≥2¢ bewegt hat |
+| Letzte Order | Spätestens T+260s |
+| Merge | T+270-290s |
 
 ### 5.5 Fees
 
@@ -190,7 +180,7 @@ Worst case pro Window bei 80%: ~2.5% der Balance (alle Paare bei 105¢).
 
 ---
 
-## 6. Core Loop (V4 — DEFINITIV)
+## 6. Core Loop (V5 Maker — DEFINITIV)
 
 ```
 STARTUP:
@@ -209,65 +199,66 @@ MAIN LOOP (alle 5 Minuten):
   - Warte auf Window-Open
 
   ═══════════════════════════════════════════════════
-  PHASE 1: ACCUMULATE — Oscillation DCA (T+5s bis T+260s)
+  PHASE 1: MAKER QUOTING (T+5s bis T+260s)
   ═══════════════════════════════════════════════════
 
-  filled_up = 0, filled_dn = 0
-  cost_up = 0, cost_dn = 0
-  up_price_history = [], dn_price_history = []
-  ticks_without_buy = 0
+  active_up_order = null
+  active_dn_order = null
 
   WHILE time < window_end - 40s AND budget > min_cost AND orders < max:
 
-    // === LESE BEIDE BÜCHER (Live WS, nicht REST!) ===
-    up_ask = get_ws_book(up_token).asks[0].price
-    dn_ask = get_ws_book(dn_token).asks[0].price
+    // === LESE BEIDE BÜCHER ===
+    up_ask = get_ws_book(up_token).bestAsk
+    dn_ask = get_ws_book(dn_token).bestAsk
 
-    up_price_history.push(up_ask)
-    dn_price_history.push(dn_ask)
+    // === BERECHNE MAKER BID PREISE ===
+    up_bid = up_ask - MAKER_OFFSET_CENTS/100  // z.B. 48¢ - 2¢ = 46¢
+    dn_bid = dn_ask - MAKER_OFFSET_CENTS/100  // z.B. 54¢ - 2¢ = 52¢
+    // Combined: 46 + 52 = 98¢ → 2¢ Profit pro Share, 0% Fee
 
-    // === BERECHNE LAUFENDEN MIDPOINT ===
-    up_mid = avg(up_price_history)
-    dn_mid = avg(dn_price_history)
+    // Ensure we're maker (strictly below ask)
+    if up_bid >= up_ask: up_bid = up_ask - 0.01
+    if dn_bid >= dn_ask: dn_bid = dn_ask - 0.01
 
-    // === DIP DETECTION ===
-    // Adaptive: wenn lange nichts gekauft, Threshold lockern
-    adaptive_relax = min(ticks_without_buy * 0.002, 0.05)
-    threshold = DIP_THRESHOLD_PCT + adaptive_relax
+    // === CHECK FILLS AUF AKTIVE ORDERS ===
+    if active_up_order AND up_ask <= active_up_order.price:
+      // Ask ist zu unserem Bid gesunken → FILL!
+      record_fill("Up", chunk_size, active_up_order.price, fee=0)
+      active_up_order = null
 
-    up_is_cheap = (up_ask < up_mid * threshold)
-    dn_is_cheap = (dn_ask < dn_mid * threshold)
+    if active_dn_order AND dn_ask <= active_dn_order.price:
+      record_fill("Down", chunk_size, active_dn_order.price, fee=0)
+      active_dn_order = null
 
-    // === ENTSCHEIDUNG ===
-    if up_is_cheap AND dn_is_cheap:
-      // Beide billig → kaufe die Seite mit weniger Shares (Balance)
-      side = filled_up <= filled_dn ? "Up" : "Down"
-    else if up_is_cheap:
-      side = "Up"
-    else if dn_is_cheap:
-      side = "Down"
-    else:
-      // KEINE Seite billig genug → WARTEN!
-      ticks_without_buy++
-      wait(MONITOR_INTERVAL_MS)  // 500ms
-      continue  // ← DAS IST DER ENTSCHEIDENDE UNTERSCHIED ZU V3!
+    // === POST/UPDATE MAKER BIDS ===
+    // Balance: nicht zu viel auf einer Seite akkumulieren
+    if !active_up_order AND filled_up <= filled_dn + chunk_size:
+      active_up_order = post_gtc_buy(up_token, chunk_size, up_bid)
 
-    // === KAUFEN ===
-    order = submit_buy(side, chunk_size, best_ask + SLIPPAGE_BUFFER)
-    if order.filled:
-      update_shares_and_costs(side, order)
-      ticks_without_buy = 0
-      wait(ORDER_INTERVAL_MS)  // 2s nach Kauf
-    else:
-      ticks_without_buy++
-      wait(MONITOR_INTERVAL_MS)  // 500ms bei Fehlschlag
+    if !active_dn_order AND filled_dn <= filled_up + chunk_size:
+      active_dn_order = post_gtc_buy(dn_token, chunk_size, dn_bid)
+
+    // === REQUOTE wenn Preis sich bewegt hat ===
+    if active_up_order AND |up_bid - active_up_order.price| >= 0.02:
+      cancel(active_up_order)
+      active_up_order = post_gtc_buy(up_token, chunk_size, up_bid)
+
+    if active_dn_order AND |dn_bid - active_dn_order.price| >= 0.02:
+      cancel(active_dn_order)
+      active_dn_order = post_gtc_buy(dn_token, chunk_size, dn_bid)
 
     // === MID-MERGE wenn Budget knapp ===
     if budget < chunk_size * 2 AND matched > MERGE_MIN_SIZE:
       merge(matched)
       budget += matched
 
+    wait(QUOTE_UPDATE_MS)  // 1s
+
   END WHILE
+
+  // Cancel remaining active orders
+  if active_up_order: cancel(active_up_order)
+  if active_dn_order: cancel(active_dn_order)
   
   ═══════════════════════════════════════════════════
   PHASE 2: MERGE (T+260-290s)
@@ -313,32 +304,28 @@ MAIN LOOP (alle 5 Minuten):
 
 ---
 
-## 7. CONFIG (V4 FINAL)
+## 7. CONFIG (V5 Maker FINAL)
 
 ```javascript
 const CONFIG = {
   // === CORE ===
-  EQUITY_PER_WINDOW: 0.80,         // 80% der Balance pro Window
-  CHUNK_SIZE_MIN: 20,              // Minimum Shares pro Order
-  CHUNK_SIZE_MAX: 200,             // Maximum (schützt Orderbuch)
-  MERGE_MIN_SIZE: 10,              // Min Shares für Merge
+  EQUITY_PER_WINDOW: 0.80,
+  CHUNK_SIZE_MIN: 20,
+  CHUNK_SIZE_MAX: 200,
+  MERGE_MIN_SIZE: 10,
 
-  // === V4: DIP DETECTION (NEU!) ===
-  DIP_THRESHOLD_PCT: 0.92,         // Kaufe wenn Ask < Midpoint × 0.92 (8% unter Durchschnitt)
-  MONITOR_INTERVAL_MS: 500,        // Beide Bücher alle 500ms checken
-  // Adaptive: wenn ticks_without_buy > 0, Threshold += 0.2%/tick (max +5%)
+  // === V5: MAKER STRATEGY ===
+  MAKER_OFFSET_CENTS: 2,           // Bid X¢ unter bestAsk (≥1 für Maker-Status)
+  QUOTE_UPDATE_MS: 1000,           // Quotes updaten / fills checken jede 1s
 
   // === TIMING ===
-  ENTRY_DELAY_MS: 5000,            // 5s nach Window-Open
-  ORDER_INTERVAL_MS: 2000,         // 2s nach erfolgtem Kauf (nicht pro Tick!)
-  STOP_BUYING_BEFORE_END_S: 40,    // Aufhören 40s vor Window-Ende
-  MERGE_BEFORE_END_S: 20,          // Merge 20s vor Window-Ende
+  ENTRY_DELAY_MS: 5000,
+  STOP_BUYING_BEFORE_END_S: 40,
+  MERGE_BEFORE_END_S: 20,
 
   // === ORDER TYPE ===
-  PRIMARY_ORDER_TYPE: 'GTC',
-  FALLBACK_ORDER_TYPE: 'FOK',
-  SLIPPAGE_BUFFER: 0.02,           // +2¢ über Ask
-  ORDER_TIMEOUT_MS: 3000,
+  PRIMARY_ORDER_TYPE: 'GTC',       // Resting limit orders = MAKER
+  // Kein FOK fallback — wir WOLLEN maker sein, nicht taker
 
   // === SAFETY NETS ===
   MAX_ORDERS_PER_WINDOW: 30,
@@ -346,9 +333,8 @@ const CONFIG = {
   MIN_BOOK_LEVELS: 3,
 
   // === FEES ===
-  FEE_MODEL: 'curve',              // NICHT flat!
-  FEE_RATE: 0.25,
-  FEE_EXPONENT: 2,
+  FEE_MODEL: 'maker',             // 0% maker fee!
+  // Taker fee existiert noch im Code für Referenz, wird aber nicht benutzt
 
   // === EXIT ===
   AUTO_MERGE_BEFORE_RESOLUTION: true,
@@ -487,29 +473,24 @@ SZENARIO: Bot crash / restart
 
 ## 12. Warum die vorherigen Versionen nicht funktioniert haben
 
-### Problem 0 (V3, FUNDAMENTAL): Blindes Alternieren = IMMER 101¢
-- **DER GRÖSSTE FEHLER:** V3 kaufte Up→Down→Up→Down blind abwechselnd
-- Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt
-- Egal wie viele Orders, egal welcher Preis — die Summe eines gleichzeitigen Paares ist IMMER ~101¢
-- V3 dachte "der Durchschnitt über viele Paare wird unter 100¢ landen" — FALSCH
-- Jedes einzelne Paar (Up bei T, Down bei T+2s) hat Combined ~101¢
-- Der Durchschnitt von lauter 101¢-Paaren ist... 101¢
+### DAS EINZIGE PROBLEM (V1-V4): TAKER-FEE
 
-### Problem 1: 3 Minuten zu spät (V1/V2)
-- Bot fand den Market WÄHREND des Windows statt VORHER
-- Billige Levels (7-20¢) waren schon weg
+**ALLE V1-V4 waren Taker.** Taker-Fee = 1-1.5%. Up+Down Asks = ~101¢.
+Combined als Taker: 101¢ + ~1.5¢ Fee = ~102.5¢ = **VERLUST. IMMER.**
 
-### Problem 2: Buy-Merge-Buy-Merge Cycle (V1/V2)
-- Bot merged nach jedem Paar statt einmal am Ende
+Kein Oscillation-Timing (V4), kein blindes Alternieren (V3), kein DCA, kein Dip-Detection
+kann das fixen. Solange wir den Ask HITTEN (Taker), verlieren wir die Fee.
 
-### Problem 3: Flat 2% Fee (V1/V2)
-- Echte Fee ist 0.2-1.5% (Kurve)
+| Version | Ansatz | Warum es scheiterte |
+|---------|--------|---------------------|
+| V1 | Buy-Merge-Buy-Merge | Taker + zu langsam + flat 2% fee |
+| V2 | Schnellere Paare | Taker + immer noch 101¢ + Fee |
+| V3 | Blind alternierend | Taker + jedes Paar = 101¢ + Fee |
+| V4 | Oscillation DCA | Taker + kaufte nur eine Seite (Dip-Detection broken) |
 
-### Problem 4: MAX_PAIRS = 5 (V1/V2)
-- Zu wenig Orders für sinnvolle Statistik
-
-### V4 Lösung
-**Nicht beide Seiten gleichzeitig kaufen.** Jede Seite NUR bei ihrem Tiefpunkt kaufen. Up und Down haben ihre Tiefpunkte zu VERSCHIEDENEN Zeitpunkten (weil BTC oscilliert). So wird Combined = avg(Up-Dips) + avg(Down-Dips) < 100¢.
+### V5 Lösung
+**Werde MAKER.** Poste Limit-Orders UNTER dem Ask. 0% Fee. Wähle die Preise.
+Combined < 100¢ weil WIR die Bid-Preise setzen. Profit + Rebates.
 
 ---
 
@@ -567,52 +548,56 @@ SZENARIO: Bot crash / restart
 ## 15. Quick Reference Card
 
 ```
-╔══════════════════════════════════════════════════════╗
-║          HOLYPOLY OSCILLATION-DCA BOT v4             ║
-╠══════════════════════════════════════════════════════╣
-║ WHAT:  Buy Up at its dip, Down at its dip, Merge    ║
-║ WHEN:  Every 5-min BTC window, monitor from T+5s    ║
-║ HOW:   Monitor both books every 500ms                ║
-║        Buy a side ONLY when its ask < mid × 0.92     ║
-║        Wait if nothing is cheap (DON'T buy blindly)  ║
-║        Merge ALL matched shares at T+280s            ║
-║ WHY:   Up dip ≠ Down dip in time → combined < 100¢  ║
-║ EDGE:  BTC oscillation → each side dips separately   ║
-║ RISK:  ~2-3% max per window (hedged position)        ║
-╠══════════════════════════════════════════════════════╣
-║ CRITICAL: NEVER buy both sides at the same time!     ║
-║ CRITICAL: Up + Down = ~101¢ always at any moment!    ║
-║ CRITICAL: Buy each side only at its CHEAPEST point!  ║
-║ CRITICAL: Wait for dips — patience is the edge!      ║
-╚══════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════╗
+║              HOLYPOLY MAKER BOT v5                       ║
+╠══════════════════════════════════════════════════════════╣
+║ WHAT:  Post limit bids on Up+Down, merge for $1         ║
+║ WHEN:  Every 5-min BTC window, quote from T+5s          ║
+║ HOW:   Post GTC BUY at bestAsk - 2¢ on BOTH sides       ║
+║        Combined bid < 100¢ (we choose the prices!)       ║
+║        Wait for fills — BTC oscillation crosses our bids ║
+║        Update quotes every 1s if price moved ≥2¢         ║
+║        Merge ALL matched shares at T+280s                ║
+║ WHY:   Maker fee = 0% (taker = 1-1.5% → killed V1-V4)  ║
+║ EDGE:  0% fee + we control prices + rebates              ║
+║ RISK:  ~2% max per window (hedged position)              ║
+╠══════════════════════════════════════════════════════════╣
+║ CRITICAL: MAKER not TAKER — post BELOW ask!              ║
+║ CRITICAL: Maker fee = 0%, taker fee = 1-1.5%!           ║
+║ CRITICAL: combined bid must be < 100¢!                   ║
+║ CRITICAL: Cancel + repost when price moves!              ║
+╚══════════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## 16. V4 Amendments (23. März 2026)
+## 16. V5 Amendments (23. März 2026)
 
-### 16.1 FUNDAMENTALE ÄNDERUNG: Von blindem Alternieren zu Oscillation-DCA
+### 16.1 FUNDAMENTALE ÄNDERUNG: Von Taker zu Maker
 
-V3 ging davon aus dass "der Durchschnitt über viele alternierend gekaufte Paare unter 100¢ landen wird".
-Das war FALSCH. Up + Down = ~101¢ zu jedem Zeitpunkt. Blind alternierend kaufen = jedes Paar ~101¢ = Verlust.
-
-V4 kauft jede Seite **NUR wenn sie billig ist** (Dip-Detection via Running Midpoint).
-Up und Down haben ihre Dips zu verschiedenen Zeitpunkten (BTC oscilliert).
-Combined aus Up-Dips + Down-Dips < 100¢.
+V1-V4 waren TAKER — hitten den Ask, zahlten 1-1.5% Fee, verloren IMMER.
+V5 ist MAKER — postet Limit-Orders unter dem Ask, 0% Fee, kontrolliert die Preise.
 
 ### 16.2 WebSocket Book Updates (price_change)
 
-`price_change` Events updaten jetzt die vollständigen `asks[]`/`bids[]` Arrays (nicht nur `bestBid`/`bestAsk`).
-Das ist kritisch damit `simulateFokBuy()` im DRY_RUN gegen das AKTUELLE Orderbuch simuliert.
+`price_change` Events updaten die vollständigen `asks[]`/`bids[]` Arrays.
+Kritisch für DRY_RUN: Maker-Fill wird erkannt wenn bestAsk ≤ unserer Bid-Preis.
 
-### 16.3 Mid-Merge Recycling
+### 16.3 DRY_RUN Maker Simulation
 
-Unverändert von V3: Nur wenn Budget knapp wird.
+- Virtuelle Bids werden gepostet (kein API call)
+- Jeder Tick: check ob bestAsk ≤ unser Bid → simulierter Fill
+- Fill-Preis = unser Bid-Preis (nicht der Ask)
+- Fee = $0 (Maker)
+- `recordMakerFill()` updatet virtuelle Balance/Shares
 
-### 16.4 BTC-Preisoszillation ist der KERN des Edge
+### 16.4 Risiko: Flat BTC
 
-Schon **0.1% BTC-Bewegung** reicht damit Up von 40¢ auf 60¢ springt und Down von 60¢
-auf 40¢ fällt. V4 WARTET auf diese Moves und kauft NUR bei den Dips.
+Wenn BTC nicht oscilliert → Asks sinken nicht zu unseren Bids → keine Fills → kein Trade.
+Das ist KORREKT und SICHER — kein Edge = kein Trade = kein Verlust.
 
-**Risiko: Flat BTC** — Wenn BTC 5 Minuten lang nicht oscilliert (Up=50¢, Down=51¢ die ganze Zeit),
-gibt es keine Dips zum Kaufen. Der Bot kauft wenig/nichts. Das ist KORREKT — kein Edge = kein Trade.
+### 16.5 Maker Rebates
+
+Polymarket verteilt täglich USDC Rebates an Maker (funded by taker fees).
+Top-Performer profitieren "von Rebates allein, nicht mal vom Spread."
+Rebates werden NICHT im DRY_RUN simuliert — das ist zusätzlicher Profit on top.

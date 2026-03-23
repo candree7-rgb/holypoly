@@ -133,6 +133,10 @@ export interface Config {
   dipThresholdPct: number;
   /** V4: How often (ms) to check both books for dip opportunities (fast polling, not order interval) */
   monitorIntervalMs: number;
+  /** V5 Maker: cents below best ask to post our bid (must be ≥1 to be maker, not taker) */
+  makerOffsetCents: number;
+  /** V5 Maker: how often (ms) to update quotes / check fills */
+  quoteUpdateMs: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -331,6 +335,8 @@ export const loadConfig = (): Config => {
   const mergeBeforeEndS = parseNumber("MERGE_BEFORE_END_S", 20);
   const dipThresholdPct = parseNumber("DIP_THRESHOLD_PCT", 0.92);
   const monitorIntervalMs = parseNumber("MONITOR_INTERVAL_MS", 500);
+  const makerOffsetCents = parseNumber("MAKER_OFFSET_CENTS", 2);
+  const quoteUpdateMs = parseNumber("QUOTE_UPDATE_MS", 1000);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -414,6 +420,8 @@ export const loadConfig = (): Config => {
     mergeBeforeEndS,
     dipThresholdPct,
     monitorIntervalMs,
+    makerOffsetCents,
+    quoteUpdateMs,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,
