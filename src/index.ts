@@ -1005,8 +1005,8 @@ const main = async () => {
       telegram,
     );
 
-    logger.info("=== Signal-Taker V7 Adaptive Strategy Active ===", {
-      btcMoveThreshold: `${(config.btcMoveThreshold * 100).toFixed(3)}%`,
+    logger.info("=== Signal-Taker V8 Momentum Strategy Active ===", {
+      reversalThreshold: "0.015%",
       cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
       targetCombined: `${config.targetCombinedCents}¢`,
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,

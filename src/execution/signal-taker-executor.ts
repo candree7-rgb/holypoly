@@ -17,16 +17,16 @@ import { DryRunEngine } from "./dry-run-engine.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
 /**
- * SignalTakerExecutor V7: Adaptive Accumulation Strategy.
+ * SignalTakerExecutor V8: Price-Momentum Accumulation Strategy.
  *
- * KEY INSIGHT: Buy both sides alternately, using BTC price EMAs for timing.
+ * KEY INSIGHT: Buy both sides alternately, timed by direct BTC price reversals.
  * Only buy when it IMPROVES the combined avg cost. Stop when target reached.
  *
+ * - First buy: immediate, pick cheaper side from orderbook (no signal needed)
  * - Strict alternation: never buy the same side twice in a row
- * - EMA crossover: buy each side when BTC moves favorably (dip/bounce)
+ * - Price momentum: track BTC rolling high/low, buy on reversals (dip→Up, bounce→Down)
  * - Projected combined check: only buy if it lowers or maintains combined cost
  * - Dynamic intervals: aggressive when far from target, cautious when close
- * - Trend detection: pause when BTC trends strongly (no oscillation = no edge)
  * - Rebalance: always buy short side at end, dynamic cap (breakeven + 3¢)
  * - Single TG message per window with P&L
  */
@@ -35,10 +35,9 @@ export class SignalTakerExecutor {
   private sessionChunkSize: number | null = null;
   private sessionChunkDate: string | null = null;
 
-  // EMA constants
-  private static readonly EMA_FAST_ALPHA = 2 / (10 + 1);   // ~5s lookback at 500ms
-  private static readonly EMA_SLOW_ALPHA = 2 / (60 + 1);   // ~30s lookback
-  private static readonly TREND_THRESHOLD = 0.0015;          // 0.15% EMA divergence = trend
+  // Price momentum: rolling window of BTC prices for reversal detection
+  private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
+  private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
 
   constructor(
@@ -117,11 +116,12 @@ export class SignalTakerExecutor {
     let lastBuyTime = 0;
     let combinedCents = Infinity;
 
-    // EMA state (initialized to current BTC price)
-    let emaFast = btcOpen;
-    let emaSlow = btcOpen;
+    // Price momentum state: rolling window of recent BTC prices
+    const priceHistory: number[] = [btcOpen];
+    let rollingHigh = btcOpen;
+    let rollingLow = btcOpen;
 
-    this.logger.info("=== V7 Adaptive Window Start ===", {
+    this.logger.info("=== V8 Momentum Window Start ===", {
       btc: `$${btcOpen.toFixed(0)}`,
       budget: `$${budget.toFixed(0)}`,
       chunk: chunkSize,
@@ -129,8 +129,8 @@ export class SignalTakerExecutor {
     });
 
     // ═══════════════════════════════════════════════════
-    // PHASE 1: ADAPTIVE ACCUMULATION
-    // Strict alternation, EMA-timed, combined-improving
+    // PHASE 1: MOMENTUM-BASED ACCUMULATION
+    // Strict alternation, price-reversal timed, combined-improving
     // ═══════════════════════════════════════════════════
     const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
     const windowStartTime = Date.now();
@@ -146,30 +146,30 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Update EMAs
-      emaFast += SignalTakerExecutor.EMA_FAST_ALPHA * (btcNow - emaFast);
-      emaSlow += SignalTakerExecutor.EMA_SLOW_ALPHA * (btcNow - emaSlow);
-
-      const emaCross = (emaFast - emaSlow) / emaSlow; // +ve = rising, -ve = falling
-
-      // Trend detection: if BTC moving strongly in one direction, pause
-      if (Math.abs(emaCross) > SignalTakerExecutor.TREND_THRESHOLD) {
-        this.logger.debug("Trend detected, pausing", {
-          emaCross: `${(emaCross * 100).toFixed(3)}%`,
-        });
-        await sleep(this.config.signalCheckIntervalMs);
-        continue;
+      // Update price history rolling window
+      priceHistory.push(btcNow);
+      if (priceHistory.length > SignalTakerExecutor.PRICE_HISTORY_SIZE) {
+        priceHistory.shift();
       }
+      rollingHigh = Math.max(...priceHistory);
+      rollingLow = Math.min(...priceHistory);
 
-      // Determine which side to buy (strict alternation + balance)
-      const nextSide = this.chooseNextSide(lastBuySide, filledUp, filledDn, emaCross);
+      // Momentum: how far has price moved from recent extremes?
+      const dipFromHigh = (rollingHigh - btcNow) / rollingHigh;   // +ve when falling
+      const bounceFromLow = (btcNow - rollingLow) / rollingLow;   // +ve when rising
+      const isFirstBuy = orderCount === 0;
+
+      // Determine which side to buy (strict alternation + balance + momentum)
+      const nextSide = this.chooseNextSide(
+        lastBuySide, filledUp, filledDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
+      );
       if (!nextSide) {
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
 
-      // Check if conditions are favorable for this side
-      if (!this.isGoodTimeToBuy(nextSide, emaCross)) {
+      // After first buy, check if price is moving favorably for this side
+      if (!isFirstBuy && !this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow)) {
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
@@ -264,7 +264,7 @@ export class SignalTakerExecutor {
           combinedCents = (avgUp + avgDn) * 100;
         }
 
-        this.logger.info("V7 fill", {
+        this.logger.info("V8 fill", {
           side: nextSide,
           price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
           size: fill.filledSize.toFixed(0),
@@ -409,7 +409,7 @@ export class SignalTakerExecutor {
     result.avgCombinedCents = finalCombined;
     result.takerFees = totalTakerFees;
 
-    this.logger.info("=== V7 Window Summary ===", {
+    this.logger.info("=== V8 Window Summary ===", {
       fills: orderCount,
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
@@ -434,17 +434,20 @@ export class SignalTakerExecutor {
     return result;
   }
 
-  // ─── ADAPTIVE HELPERS ───
+  // ─── MOMENTUM HELPERS ───
 
   /**
    * Choose which side to buy next.
-   * Priority: 1) side that's behind, 2) alternate from last, 3) EMA signal.
+   * Priority: 1) side behind, 2) alternate from last, 3) cheaper ask (first buy), 4) momentum.
    */
   private chooseNextSide(
     lastBuySide: TradeSide | null,
     filledUp: number,
     filledDn: number,
-    emaCross: number,
+    dipFromHigh: number,
+    bounceFromLow: number,
+    window: WindowInfo,
+    isFirstBuy: boolean,
   ): TradeSide | null {
     // If one side has fewer shares, must buy that side
     if (filledUp < filledDn) return "Up";
@@ -454,28 +457,35 @@ export class SignalTakerExecutor {
     if (lastBuySide === "Up") return "Down";
     if (lastBuySide === "Down") return "Up";
 
-    // First buy ever: use EMA signal
-    // BTC falling → Up is cheap → buy Up
-    // BTC rising → Down is cheap → buy Down
-    if (emaCross < -this.config.btcMoveThreshold) return "Up";
-    if (emaCross > this.config.btcMoveThreshold) return "Down";
+    // First buy ever: pick the cheaper side from the orderbook (no signal needed!)
+    if (isFirstBuy) {
+      const upBook = this.getBook(window.upTokenId);
+      const dnBook = this.getBook(window.downTokenId);
+      const upAsk = upBook?.asks?.[0]?.price ?? 1.0;
+      const dnAsk = dnBook?.asks?.[0]?.price ?? 1.0;
+      // Buy whichever side is cheaper — or Up if equal
+      return dnAsk < upAsk ? "Down" : "Up";
+    }
 
-    return null; // no signal yet
+    // Use momentum signal: buy the side that BTC is making cheaper
+    if (dipFromHigh > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Up";   // BTC falling → Up cheaper
+    if (bounceFromLow > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Down"; // BTC rising → Down cheaper
+
+    return null; // flat, wait for movement
   }
 
   /**
-   * Check if BTC is moving favorably for buying this side.
-   * Buy Up when BTC dips (Up getting cheaper).
-   * Buy Down when BTC rises (Down getting cheaper).
+   * Check if BTC price is moving favorably for buying this side.
+   * Uses direct price momentum instead of EMA crossover.
    */
-  private isGoodTimeToBuy(side: TradeSide, emaCross: number): boolean {
-    const threshold = this.config.btcMoveThreshold;
+  private isGoodTimeToBuy(side: TradeSide, dipFromHigh: number, bounceFromLow: number): boolean {
+    const threshold = SignalTakerExecutor.REVERSAL_THRESHOLD;
     if (side === "Up") {
-      // Up gets cheaper when BTC falls
-      return emaCross < -threshold;
+      // Up gets cheaper when BTC falls from recent high
+      return dipFromHigh > threshold;
     } else {
-      // Down gets cheaper when BTC rises
-      return emaCross > threshold;
+      // Down gets cheaper when BTC rises from recent low
+      return bounceFromLow > threshold;
     }
   }
 
@@ -485,7 +495,7 @@ export class SignalTakerExecutor {
    * Close to target → longer interval (selective).
    */
   private computeInterval(combinedCents: number): number {
-    if (combinedCents === Infinity) return 2000; // no data yet, use 2s base
+    if (combinedCents === Infinity) return 1500; // no data yet, use 1.5s base
 
     const target = this.config.targetCombinedCents;
     const dist = target - combinedCents; // positive = below target (good)
