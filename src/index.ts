@@ -910,19 +910,20 @@ const main = async () => {
         const result = await mergeArbExecutor.executeWindow(window, balance);
 
         // --- RECORD TO DB ---
-        if (!result.skipped && result.pairs.length > 0) {
+        const hadFills = !result.skipped && result.orderFills.length > 0;
+        if (hadFills) {
           await db.recordWindow({
             windowStart: result.windowStart,
             conditionId: result.conditionId,
             traded: true,
             primarySide: null,
-            orders: result.pairs.map(p => ({
-              side: "Up" as const,
-              tokenId: window.upTokenId,
-              price: p.combinedCents,
-              amount: p.upCost + p.dnCost,
+            orders: result.orderFills.map(f => ({
+              side: f.side,
+              tokenId: f.side === "Up" ? window.upTokenId : window.downTokenId,
+              price: f.avgPrice * 100,
+              amount: f.totalCost,
             })),
-            fillCount: result.pairs.length * 2,
+            fillCount: result.orderFills.length,
             pnl: result.totalMergeProfit,
             winner: null,
             balanceBefore: balance,

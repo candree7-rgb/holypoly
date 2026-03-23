@@ -195,10 +195,10 @@ export class MergeArbExecutor {
           });
         }
 
-        // --- MID-MERGE RECYCLING (V3 Spec 6: only when budget runs out) ---
+        // --- MID-MERGE RECYCLING (V3 Spec §16.3: only when budget runs out) ---
         const matched2 = Math.min(filledUpShares, filledDnShares);
         if (
-          availableBudget < chunkSize * 2 * 0.30 && // budget running low
+          availableBudget < chunkSize * 2 && // budget can't cover next pair
           matched2 >= this.config.mergeMinSize &&
           Date.now() < stopBuyingTime - 30_000 // enough time to keep buying after merge
         ) {
@@ -212,14 +212,15 @@ export class MergeArbExecutor {
           if (mergeResult) {
             merges.push(mergeResult);
             totalMergedInWindow += mergeResult.merged;
-            // Reduce shares proportionally
-            const upRatio = filledUpShares / (filledUpShares + filledDnShares);
+            // Save original shares for cost proportioning
+            const origUp = filledUpShares;
+            const origDn = filledDnShares;
             filledUpShares -= mergeResult.merged;
             filledDnShares -= mergeResult.merged;
             availableBudget += mergeResult.recovered;
-            // Proportionally reduce costs
-            totalUpCost = filledUpShares > 0 ? totalUpCost * (filledUpShares / (filledUpShares + mergeResult.merged)) : 0;
-            totalDnCost = filledDnShares > 0 ? totalDnCost * (filledDnShares / (filledDnShares + mergeResult.merged)) : 0;
+            // Proportionally reduce costs (remaining / original)
+            totalUpCost = origUp > 0 ? totalUpCost * (filledUpShares / origUp) : 0;
+            totalDnCost = origDn > 0 ? totalDnCost * (filledDnShares / origDn) : 0;
             this.logger.info("Mid-merge complete", {
               recovered: `$${mergeResult.recovered.toFixed(0)}`,
               budget: `$${availableBudget.toFixed(0)}`,
