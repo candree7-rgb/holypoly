@@ -331,35 +331,6 @@ export class MergeArbExecutor {
       }
     }
 
-    // --- PRE-RESOLUTION SELL: Sell if a side is at 95¢+ (Spec 8.3/4.2) ---
-    // If one side is near-certain winner (bid >= 95¢), sell for immediate capital
-    if (filledUpShares > 0 || filledDnShares > 0) {
-      const upBook = this.config.dryRun && this.dryRunEngine
-        ? this.dryRunEngine.getBook(window.upTokenId)
-        : this.clobWs.getBook(window.upTokenId);
-      const dnBook = this.config.dryRun && this.dryRunEngine
-        ? this.dryRunEngine.getBook(window.downTokenId)
-        : this.clobWs.getBook(window.downTokenId);
-
-      const upBid = upBook?.bestBid ?? 0;
-      const dnBid = dnBook?.bestBid ?? 0;
-
-      if (filledUpShares > 0 && upBid >= 0.95) {
-        this.logger.info("Pre-resolution sell: Up at 95¢+", {
-          upBid: `${(upBid * 100).toFixed(1)}¢`,
-          shares: filledUpShares.toFixed(1),
-        });
-        // Note: actual sell happens in main loop post-resolution cleanup
-        // Here we just log the opportunity — selling mid-window is risky
-      }
-      if (filledDnShares > 0 && dnBid >= 0.95) {
-        this.logger.info("Pre-resolution sell: Down at 95¢+", {
-          dnBid: `${(dnBid * 100).toFixed(1)}¢`,
-          shares: filledDnShares.toFixed(1),
-        });
-      }
-    }
-
     // --- BUILD RESULT ---
     const totalMerged = merges.reduce((s, m) => s + m.merged, 0);
     const totalMergeProfit = merges.reduce((s, m) => s + m.profit, 0);
@@ -463,22 +434,84 @@ export class MergeArbExecutor {
   }
 
   /**
-   * Check and recover from crash: detect open positions from a previous session.
-   * Returns remaining shares that need cleanup if any.
+   * Crash recovery: check for open positions from a previous session and clean up.
+   * Queries the Data API for current positions, merges what's mergeable,
+   * and marks the rest for redeem (Spec 9.11 Scenario 6).
    */
-  async checkOpenPositions(
-    conditionId: string,
-    upTokenId: string,
-    downTokenId: string,
-  ): Promise<{ hasOpen: boolean; upShares: number; dnShares: number }> {
-    // In DRY_RUN there can't be real open positions
+  async crashRecovery(
+    dataApi: import("../data/data-api.js").DataApiClient,
+    profileAddress: string,
+  ): Promise<void> {
     if (this.config.dryRun) {
-      return { hasOpen: false, upShares: 0, dnShares: 0 };
+      this.logger.info("DRY_RUN: Skipping crash recovery (no real positions)");
+      return;
     }
 
-    // TODO: Query actual on-chain token balances for these tokens
-    // For now, return no open positions (positions are tracked by main loop)
-    return { hasOpen: false, upShares: 0, dnShares: 0 };
+    this.logger.info("Checking for open positions from previous session...");
+
+    try {
+      const positions = await dataApi.getPositions(profileAddress);
+      if (positions.length === 0) {
+        this.logger.info("No open positions found — clean startup");
+        return;
+      }
+
+      // Group positions by conditionId
+      const byCondition: Map<string, { up: number; dn: number; conditionId: string; negRisk: boolean }> = new Map();
+      for (const pos of positions) {
+        if (pos.size <= 0) continue;
+        const key = pos.conditionId;
+        let group = byCondition.get(key);
+        if (!group) {
+          group = { up: 0, dn: 0, conditionId: key, negRisk: pos.negativeRisk ?? false };
+          byCondition.set(key, group);
+        }
+        if (pos.outcome === "Up" || pos.outcomeIndex === 0) {
+          group.up += pos.size;
+        } else {
+          group.dn += pos.size;
+        }
+      }
+
+      for (const [conditionId, group] of byCondition) {
+        const matched = Math.min(group.up, group.dn);
+
+        if (matched > 0 && this.redeem) {
+          // Merge what we can
+          this.logger.info("Crash recovery: merging leftover positions", {
+            conditionId: conditionId.slice(0, 12) + "...",
+            upShares: group.up.toFixed(1),
+            dnShares: group.dn.toFixed(1),
+            merging: matched.toFixed(1),
+          });
+
+          const txHash = await this.redeem.mergePositions(conditionId, matched, group.negRisk);
+          if (txHash) {
+            this.logger.info("Crash recovery: merge successful", { txHash });
+          } else {
+            this.logger.warn("Crash recovery: merge failed, will rely on redeemLoop");
+          }
+        }
+
+        const remainingUp = group.up - matched;
+        const remainingDn = group.dn - matched;
+        if (remainingUp > 0 || remainingDn > 0) {
+          this.logger.info("Crash recovery: remaining imbalance (redeemLoop will handle)", {
+            conditionId: conditionId.slice(0, 12) + "...",
+            remainingUp: remainingUp.toFixed(1),
+            remainingDn: remainingDn.toFixed(1),
+          });
+        }
+      }
+
+      this.telegram.send(
+        `Crash recovery: checked ${byCondition.size} markets, ` +
+        `merged what was possible. RedeemLoop handles the rest.`,
+      );
+    } catch (err) {
+      this.logger.error("Crash recovery failed", { error: (err as Error).message });
+      // Non-fatal — continue with normal operation
+    }
   }
 
   // ─── PRIVATE METHODS ───

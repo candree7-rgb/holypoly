@@ -60,25 +60,32 @@ const main = async () => {
     logger,
   );
 
-  logger.info("=== HolyPoly Bot Starting (Edge → Wait → Arb Strategy) ===");
-  logger.info("Mode", { dryRun: config.dryRun });
-  logger.info("Edge parameters", {
-    edgeThreshold: `${config.edgeThresholdCents}¢`,
-    edgeTiers: `${config.edgeTier2Cents}/${config.edgeTier3Cents}/${config.edgeTier4Cents}¢`,
-    entryDelay: `${config.entryDelaySeconds}s`,
-    scanInterval: `${config.scanIntervalMs}ms`,
-  });
-  logger.info("Arb completion parameters", {
-    minProfit: `${config.minProfitCents}¢/pair`,
-    maxRoundTrips: config.maxRoundTripsPerWindow,
-    arbTimeout: `${(config.arbCompletionTimeoutMs / 1000).toFixed(0)}s`,
-    strategy: "wait for market adjustment, then fill loser side via DCA",
-  });
+  logger.info(`=== HolyPoly Bot Starting [${config.strategyMode.toUpperCase()}] ===`);
+  logger.info("Mode", { strategy: config.strategyMode, dryRun: config.dryRun });
+
+  if (config.strategyMode === "merge-arb") {
+    logger.info("Merge-Arb parameters", {
+      equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
+      maxPairs: config.maxPairs,
+      mergeMinSize: config.mergeMinSize,
+      entryDelay: `${config.mergeEntryDelayMs}ms`,
+      orderInterval: `${config.orderIntervalMs}ms`,
+      slippage: `+${(config.slippageBuffer * 100).toFixed(0)}¢`,
+      maxCombinedEntry: `${(config.maxCombinedEntry * 100).toFixed(0)}¢`,
+      maxCombinedPair: `${(config.maxCombinedPair * 100).toFixed(0)}¢`,
+      takerFee: `${(config.takerFeeRate * 100).toFixed(0)}%`,
+    });
+  } else {
+    logger.info("Edge parameters", {
+      edgeThreshold: `${config.edgeThresholdCents}¢`,
+      entryDelay: `${config.entryDelaySeconds}s`,
+      scanInterval: `${config.scanIntervalMs}ms`,
+    });
+  }
   logger.info("Risk", {
-    buyAmountPct: `${config.buyAmountPct}%`,
     dailyLossLimit: `${config.dailyLossLimitPct}%`,
     weeklyLossLimit: `${config.weeklyLossLimitPct}%`,
-    maxWindowExposure: `${config.maxWindowExposurePct}%`,
+    minBalance: `$${config.minBalanceFloorUsd}`,
   });
 
   // CLOB service
@@ -829,6 +836,9 @@ const main = async () => {
       logger,
       telegram,
     );
+
+    // --- CRASH RECOVERY (Spec 9.11 Scenario 6) ---
+    await mergeArbExecutor.crashRecovery(dataApi, config.profileAddress);
 
     logger.info("=== Merge-Arb Strategy Active ===", {
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
