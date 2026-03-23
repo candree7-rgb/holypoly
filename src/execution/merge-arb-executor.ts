@@ -231,21 +231,28 @@ export class MergeArbExecutor {
         }
 
         // Post/update virtual bids (balance: don't over-accumulate one side)
+        // CRITICAL: Only requote DOWNWARD (cheaper). Never chase the ask upward!
+        // If ask goes up → our old bid is further from ask → keep it (it's cheaper).
+        // If ask goes down → requote to stay at ask-offset (tighter, still maker).
         if (!activeUpOrderId && filledUpShares <= filledDnShares + chunkSize) {
           activeUpOrderId = `dry-up-${Date.now()}`;
           activeUpPrice = upBid;
-        } else if (activeUpOrderId && Math.abs(upBid - activeUpPrice) >= 0.02) {
+        } else if (activeUpOrderId && upBid < activeUpPrice - 0.005) {
+          // Ask went DOWN → our bid should also go down (stay cheap)
           activeUpOrderId = `dry-up-${Date.now()}`;
           activeUpPrice = upBid;
         }
+        // If upBid > activeUpPrice: ask went UP → DON'T requote up (keep cheap bid)
 
         if (!activeDnOrderId && filledDnShares <= filledUpShares + chunkSize) {
           activeDnOrderId = `dry-dn-${Date.now()}`;
           activeDnPrice = dnBid;
-        } else if (activeDnOrderId && Math.abs(dnBid - activeDnPrice) >= 0.02) {
+        } else if (activeDnOrderId && dnBid < activeDnPrice - 0.005) {
+          // Ask went DOWN → requote down
           activeDnOrderId = `dry-dn-${Date.now()}`;
           activeDnPrice = dnBid;
         }
+        // If dnBid > activeDnPrice: ask went UP → DON'T requote up
       } else {
         // === LIVE MODE: Manage real GTC maker orders ===
 
@@ -269,8 +276,8 @@ export class MergeArbExecutor {
             await this.clob.cancelOrder(activeUpOrderId); // cancel remainder
             activeUpOrderId = null;
             activeUpPrice = 0;
-          } else if (Math.abs(upBid - activeUpPrice) >= 0.02) {
-            // Price moved — cancel and repost
+          } else if (upBid < activeUpPrice - 0.005) {
+            // Ask went DOWN → requote down (stay cheap). Never up!
             await this.clob.cancelOrder(activeUpOrderId);
             activeUpOrderId = null;
           }
@@ -295,13 +302,16 @@ export class MergeArbExecutor {
             await this.clob.cancelOrder(activeDnOrderId);
             activeDnOrderId = null;
             activeDnPrice = 0;
-          } else if (Math.abs(dnBid - activeDnPrice) >= 0.02) {
+          } else if (dnBid < activeDnPrice - 0.005) {
+            // Ask went DOWN → requote down. Never up!
             await this.clob.cancelOrder(activeDnOrderId);
             activeDnOrderId = null;
           }
         }
 
         // Post new maker bids where needed (balance both sides)
+        // CRITICAL: Only requote DOWNWARD. Never chase the ask upward!
+        // Post new bids where needed
         if (!activeUpOrderId && filledUpShares <= filledDnShares + chunkSize) {
           const result = await this.clob.placeBatchOrders(
             [{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }],
@@ -312,7 +322,21 @@ export class MergeArbExecutor {
             activeUpPrice = upBid;
             this.logger.debug("Posted Up maker bid", { price: `${(upBid * 100).toFixed(1)}¢` });
           }
+        } else if (activeUpOrderId && upBid < activeUpPrice - 0.005) {
+          // Ask went DOWN → requote our bid down (stay cheap)
+          await this.clob.cancelOrder(activeUpOrderId);
+          const result = await this.clob.placeBatchOrders(
+            [{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }],
+            OrderType.GTC,
+          );
+          if (result.placed > 0 && result.orderIds.length > 0) {
+            activeUpOrderId = result.orderIds[0];
+            activeUpPrice = upBid;
+          } else {
+            activeUpOrderId = null;
+          }
         }
+        // If upBid > activeUpPrice: ask went UP → keep old cheap bid
 
         if (!activeDnOrderId && filledDnShares <= filledUpShares + chunkSize) {
           const result = await this.clob.placeBatchOrders(
@@ -324,7 +348,21 @@ export class MergeArbExecutor {
             activeDnPrice = dnBid;
             this.logger.debug("Posted Dn maker bid", { price: `${(dnBid * 100).toFixed(1)}¢` });
           }
+        } else if (activeDnOrderId && dnBid < activeDnPrice - 0.005) {
+          // Ask went DOWN → requote our bid down
+          await this.clob.cancelOrder(activeDnOrderId);
+          const result = await this.clob.placeBatchOrders(
+            [{ tokenId: window.downTokenId, side: Side.BUY, price: dnBid, size: chunkSize }],
+            OrderType.GTC,
+          );
+          if (result.placed > 0 && result.orderIds.length > 0) {
+            activeDnOrderId = result.orderIds[0];
+            activeDnPrice = dnBid;
+          } else {
+            activeDnOrderId = null;
+          }
         }
+        // If dnBid > activeDnPrice: ask went UP → keep old cheap bid
       }
 
       // --- RUNNING STATS ---
