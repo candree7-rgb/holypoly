@@ -228,21 +228,18 @@ export class SignalTakerExecutor {
       const longCost = shortSide === "Up" ? totalDnCost : totalUpCost;
       const avgLongPrice = longShares > 0 ? longCost / longShares : 0.50;
       const dynamicMaxPrice = (1.00 - avgLongPrice) - 0.01;
-      // Also respect the hard cap from config
-      const effectiveMaxPrice = Math.min(dynamicMaxPrice, this.config.rebalanceMaxPrice);
 
       this.logger.info("Phase 2: Taker rebalance", {
         imbalance: imbalance.toFixed(0),
         shortSide,
         avgLongPrice: `${(avgLongPrice * 100).toFixed(1)}¢`,
         dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
-        effectiveCap: `${(effectiveMaxPrice * 100).toFixed(1)}¢`,
       });
 
       const book = this.getBook(shortToken);
       const bestAsk = book?.asks?.[0]?.price ?? 1.0;
 
-      if (bestAsk <= effectiveMaxPrice) {
+      if (bestAsk <= dynamicMaxPrice) {
         const rebalancePrice = bestAsk + this.config.slippageBuffer;
         const fill = await this.buyOrder(shortToken, imbalance, rebalancePrice, shortSide);
 
@@ -285,10 +282,9 @@ export class SignalTakerExecutor {
           shortSide,
           bestAsk: `${(bestAsk * 100).toFixed(1)}¢`,
           dynamicCap: `${(dynamicMaxPrice * 100).toFixed(1)}¢`,
-          effectiveCap: `${(effectiveMaxPrice * 100).toFixed(1)}¢`,
         });
         this.telegram.send(
-          `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > cap ${(effectiveMaxPrice * 100).toFixed(1)}¢`,
+          `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > dynamic cap ${(dynamicMaxPrice * 100).toFixed(1)}¢`,
         );
       }
     }

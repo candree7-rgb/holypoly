@@ -42,7 +42,6 @@ Bei 50¢: 1.56% → 50.78¢ (worst case)
 - CHEAP_THRESHOLD: 0.45 (only buy when ask < 45¢)
 - SIGNAL_CHECK_INTERVAL_MS: 500 (check Binance every 500ms)
 - MAX_IMBALANCE_CHUNKS: 3 (max chunks more on one side)
-- REBALANCE_MAX_PRICE: 0.55 (hard cap for rebalance, dynamic cap is tighter)
 - EQUITY_PER_WINDOW: 30% (conservative start, scale up later)
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares
