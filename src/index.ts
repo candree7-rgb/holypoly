@@ -993,7 +993,7 @@ const main = async () => {
     }
   };
 
-  // === SIGNAL-TAKER V6 STRATEGY LOOP ===
+  // === SIGNAL-TAKER V7 STRATEGY LOOP ===
   const signalTakerLoop = async () => {
     const executor = new SignalTakerExecutor(
       clob,
@@ -1054,7 +1054,7 @@ const main = async () => {
         clobWs.subscribe([window.upTokenId, window.downTokenId]);
         await sleep(1000);
 
-        // Execute V6
+        // Execute V7
         const result = await executor.executeWindow(window, balance);
 
         // Record to DB
