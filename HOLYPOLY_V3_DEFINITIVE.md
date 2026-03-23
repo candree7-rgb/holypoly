@@ -1,179 +1,148 @@
-# HolyPoly v3 — DEFINITIVE Strategy Spec
+# HolyPoly v4 — DEFINITIVE Strategy Spec (Oscillation DCA)
 
-## DIESES DOKUMENT ERSETZT ALLE VORHERIGEN SPECS
+## DIESES DOKUMENT ERSETZT ALLE VORHERIGEN SPECS (inkl. V3)
 
-Basierend auf: 295.911 API-Einträge + Live-Screenshot-Analyse der aktuellen Stargate5-Activity (23. März 2026).
+Basierend auf: 295.911 API-Einträge + Live-Screenshot-Analyse der aktuellen Stargate5-Activity (23. März 2026) + V3 DRY_RUN-Ergebnisse die IMMER ~101¢ Combined zeigten.
 
-Die vorherigen Specs hatten fundamentale Fehler im Execution-Modell. Dieses Dokument korrigiert sie.
+V3 hatte einen **fundamentalen Fehler**: blindes Alternieren Up→Down→Up→Down kauft jedes Paar zum selben Zeitpunkt, und Up+Down = ~101¢ zu JEDEM Zeitpunkt. Ergebnis: garantierter Verlust.
 
 ---
 
 ## 1. Die Strategie in einem Absatz
 
-Der Bot kauft auf Polymarket 5-Min BTC Up/Down-Märkten **beide Seiten** über die gesamte Window-Dauer mit vielen kleinen Orders (~180 Shares). Er alterniert Up-Down-Up-Down, nimmt was das Orderbuch gerade hergibt, über 2-4 Minuten verteilt. Die Preise schwanken innerhalb des Windows weil sich der BTC-Preis bewegt — manchmal ist Up billig (10-30¢), manchmal Down billig (10-30¢). Über 10-25 Orders akkumuliert er gleiche Mengen auf beiden Seiten. Der **gewichtete Durchschnittspreis** (Up + Down) über ALLE Orders landet unter 100¢. Am Ende des Windows merged er alle matched Shares zu je $1 zurück. Profit = $1 × matched_shares − total_cost.
+Der Bot überwacht auf Polymarket 5-Min BTC Up/Down-Märkten **beide Orderbücher gleichzeitig** via WebSocket. Er kauft **jede Seite NUR wenn sie gerade billig ist** — Up wenn BTC gerade gefallen ist (Up-Ask niedrig), Down wenn BTC gerade gestiegen ist (Down-Ask niedrig). Da BTC innerhalb von 5 Minuten oscilliert, treffen die Tiefpunkte beider Seiten zu **verschiedenen Zeitpunkten** ein. Über 2-4 Minuten sammelt der Bot die Dips beider Seiten ein. Der **gewichtete Durchschnittspreis** (Up + Down) über ALLE Orders landet unter 100¢ weil jede Seite nur bei ihrem Tiefpunkt gekauft wurde. Am Ende des Windows merged er alle matched Shares zu je $1 zurück. Profit = $1 × matched_shares − total_cost.
+
+**KEY INSIGHT:** Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt. Aber Up-Tiefpunkt ≠ Down-Tiefpunkt zeitlich. Die Tiefpunkte beider Seiten zu VERSCHIEDENEN Zeitpunkten einsammeln = Combined < 100¢.
 
 ---
 
-## 2. Was die vorherigen Specs FALSCH hatten
+## 2. Was V3 FALSCH hatte (und V4 korrigiert)
 
-| Vorher (FALSCH) | Jetzt (RICHTIG) |
-|-----------------|-----------------|
-| Buy pair → merge → buy pair → merge (interleaved) | Buy 10-25 Orders → merge EINMAL am Ende |
-| MAX_PAIRS = 5 (10 Orders) | 10-25+ Orders pro Window |
-| Merge nach jedem Batch | Merge am Schluss (T+240-280s) |
-| Erste Fills sind die profitabelsten | Profit kommt aus dem DURCHSCHNITT über viele Preise |
-| Combined <100¢ pro Einzelpaar nötig | Einzelpaare KÖNNEN über 100¢ sein, Gesamtdurchschnitt zählt |
-| Pre-trade combined check pro Paar | Kein Per-Pair-Check, einfach kaufen |
-| Flat 2% Fee | Kurven-Fee: ~0.3-1.5% je nach Preis |
-| Entry nach 3-5s | Entry MUSS innerhalb 5-10s passieren |
+| V3 (FALSCH) | V4 (RICHTIG) |
+|-------------|--------------|
+| Blind alternierend Up→Down→Up→Down | Kaufe jede Seite NUR bei ihrem Dip |
+| Jedes Up+Down Paar = ~101¢ (gleicher Zeitpunkt) | Up-Dip und Down-Dip zu verschiedenen Zeitpunkten → Combined < 100¢ |
+| Fester 2s Takt: kaufe was auch immer dran ist | Monitor alle 500ms, kaufe NUR wenn günstig |
+| "Preisoszillation über viele Orders mittelt unter 100¢" | FALSCH — wenn du beide Seiten gleichzeitig kaufst, ist die Summe IMMER ~101¢ |
+| Kein Preisziel pro Seite | Target = Midpoint × DIP_THRESHOLD (z.B. 92% = 8% unter Durchschnitt) |
 
 ---
 
-## 3. Stargate5's exakter Flow (aus Live-Screenshots verifiziert)
+## 3. Was Stargate5 WIRKLICH macht (Re-Interpretation)
 
-### Window 5:30-5:35 AM ET (stark biased, Up billig)
+Die V3-Analyse sah blindes Alternieren — aber das ist NICHT der Edge. Der Edge kommt daher dass **jede Seite nur gekauft wird wenn sie gerade billig ist**:
 
-```
-T+5s   Buy Up    7¢  × 179.1sh   $12.37
-T+7s   Buy Down 75¢  × 177.7sh   $134.80
-T+10s  Buy Up   27¢  × 177.6sh   $48.51
-T+12s  Buy Down 65¢  × 177.0sh   $116.50
-T+15s  Buy Up   40¢  × 176.7sh   $71.48
-T+17s  Buy Down 63¢  × 176.9sh   $112.96
-T+20s  Buy Up   34¢  × 177.0sh   $60.96
-T+22s  Buy Down 75¢  × 177.7sh   $134.66
-T+25s  Buy Up   30¢  × 177.3sh   $53.51
-T+27s  Buy Down 71¢  × 177.4sh   $127.30
-T+30s  Buy Up   34¢  × 177.0sh   $60.96
-T+32s  Buy Down 61¢  × 176.8sh   $109.17
-T+35s  Buy Up   45¢  × 176.6sh   $80.69
-T+37s  Buy Down 50¢  × 176.5sh   $89.65
-... (insgesamt 14-20 Orders)
-T+280s MERGE 1,240 shares         → $1,240 returned
-
-Up avg:  ~35¢ (über 7-10 Orders)
-Down avg: ~63¢ (über 7-10 Orders)
-Combined avg: ~98¢
-Profit: ~$25 auf 1,240 shares (2¢ × 1,240)
-```
-
-### Window 5:15-5:20 AM ET (noch stärker biased)
+### Beispiel: Oscillation-DCA in einem Window
 
 ```
-Up prices: 14¢, 16¢, 9¢, 23¢, 25¢, 35¢, 41¢, 45¢, 55¢, 81¢, 88¢, 89¢
-Down prices: 87¢, 90¢, 90¢, 75¢, 71¢, 66¢, 65¢, 54¢, 47¢, 17¢, 16¢, 13¢
+T+0:    BTC fällt stark → Up=15¢ (BILLIG!) Down=86¢ (teuer)
+        → BOT KAUFT UP bei 15¢              (Down wird NICHT gekauft)
 
-Up avg: ~43¢
-Down avg: ~56¢
-Combined avg: ~99¢
-Shares: ~1,446 (merged)
+T+30s:  BTC erholt sich → Up=45¢ (fair) Down=56¢ (fair)
+        → NICHTS KAUFEN (keine Seite ist billig genug)
+
+T+60s:  BTC steigt weiter → Up=70¢ (teuer) Down=31¢ (BILLIG!)
+        → BOT KAUFT DOWN bei 31¢            (Up wird NICHT gekauft)
+
+T+90s:  BTC fällt wieder → Up=25¢ (BILLIG!) Down=76¢ (teuer)
+        → BOT KAUFT UP bei 25¢
+
+T+120s: BTC steigt → Up=65¢ (teuer) Down=36¢ (BILLIG!)
+        → BOT KAUFT DOWN bei 36¢
+
+...usw. über 2-4 Minuten...
+
+Ergebnis:
+  Up gekauft bei: 15¢, 25¢, 20¢, 18¢    → avg Up = ~19.5¢
+  Down gekauft bei: 31¢, 36¢, 28¢, 33¢  → avg Down = ~32¢
+  Combined: 19.5 + 32 = 51.5¢ ← WEIT UNTER 100¢!
+
+  Merge 720 shares × ($1.00 - $0.515) = ~$349 Profit
 ```
 
-### Window 5:10-5:15 AM ET (wenige Orders, kleines Window)
+**WARUM das funktioniert:**
+- Up-Tiefpunkte (BTC fällt) und Down-Tiefpunkte (BTC steigt) passieren zu VERSCHIEDENEN Zeitpunkten
+- Wenn Up billig ist (15¢), ist Down teuer (86¢) → wir kaufen NUR Up
+- Wenn Down billig ist (31¢), ist Up teuer (70¢) → wir kaufen NUR Down
+- Über Zeit sammeln wir die TIEFPUNKTE beider Seiten ein
+- Combined = avg(Up-Tiefpunkte) + avg(Down-Tiefpunkte) < 100¢
 
-```
-Nur 3 Orders:
-  Buy Up   14¢ × 181.5sh
-  Buy Down 87¢ × 181.6sh
-  Buy Up   16¢ × 181.4sh
-MERGE 544.8 shares
-
-Combined: (14+87)/2 ≈ 50.5¢ per side → 101¢
-Aber: der dritte Buy (Up 16¢) hat keinen Down-Partner
-→ kleineres Window, weniger Tiefe
-```
-
-### Key Observations aus den Screenshots
-
-1. **Er kauft VIELE Orders** (10-25 pro Window, nicht 5)
-2. **Die Preise variieren extrem** (Up von 7¢ bis 89¢ im selben Window)
-3. **Er merged EINMAL am Ende**, nicht zwischendurch
-4. **Merge-Size = Gesamtmenge matched Shares** (716, 1240, 1446, 1621, 1800, 1968 Shares)
-5. **Er alterniert strikt Up-Down-Up-Down**
-6. **Chunk-Size ist quasi konstant** pro Window (~179-182 Shares)
-7. **Er startet sofort nach Window-Open** und kauft bis ca. T+240-280s
-8. **Manchmal 2 Merges pro Window** (ein großer + ein kleiner für Rest)
+**WARUM V3 (blind alternierend) NICHT funktionierte:**
+- V3 kauft Up bei 15¢ dann SOFORT Down bei 86¢ → Paar = 101¢ → Verlust
+- Egal wie viele Paare: jedes Paar ist zum SELBEN Zeitpunkt → immer ~101¢
 
 ---
 
-## 4. Warum es funktioniert: Die Preisoszillation
+## 4. Warum es funktioniert: Selektives Dip-Buying
 
-Das Orderbuch für BTC Up/Down spiegelt den aktuellen BTC-Preis wider. Innerhalb von 5 Minuten bewegt sich BTC → die Preise oscillieren:
+**FAKT: Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt.**
+
+Das heißt: Wenn du BEIDE Seiten zum gleichen Zeitpunkt kaufst, verlierst du IMMER ~1¢ pro Share (plus Fees).
+
+**Der Edge kommt aus ZEITLICHER TRENNUNG:**
 
 ```
-Sekunde 0:   BTC steigt → Up=70¢ (teuer), Down=25¢ (billig)
-Sekunde 30:  BTC fällt  → Up=30¢ (billig), Down=65¢ (teuer)  
-Sekunde 60:  BTC steigt → Up=80¢ (teuer), Down=15¢ (billig)
-Sekunde 90:  BTC flat   → Up=50¢ (fair),  Down=50¢ (fair)
-Sekunde 120: BTC fällt  → Up=25¢ (billig), Down=70¢ (teuer)
+Zeitpunkt 1 (BTC fällt):   Up=15¢ ←kaufen  Down=86¢ ←ignorieren
+Zeitpunkt 2 (BTC steigt):  Up=70¢ ←ignorieren  Down=31¢ ←kaufen
 ```
 
-Wenn du zu jedem dieser Zeitpunkte Up+Down kaufst:
-- Sek 0: 70+25 = 95¢ ✓
-- Sek 30: 30+65 = 95¢ ✓
-- Sek 60: 80+15 = 95¢ ✓
-- Sek 90: 50+50 = 100¢ ✗
-- Sek 120: 25+70 = 95¢ ✓
+- Zeitpunkt 1: Wir kaufen EINE Seite (Up) bei 15¢
+- Zeitpunkt 2: Wir kaufen die ANDERE Seite (Down) bei 31¢
+- Unser Combined: 15 + 31 = 46¢ (WEIT unter 100¢!)
 
-Durchschnitt: ~96¢ → 4¢ Profit pro Share!
+**Warum funktioniert das nicht bei gleichzeitigem Kauf?**
+- Zeitpunkt 1: Up=15¢ + Down=86¢ = 101¢ → Verlust
+- Zeitpunkt 2: Up=70¢ + Down=31¢ = 101¢ → Verlust
 
-**Der Edge entsteht weil das Orderbuch NICHT perfekt effizient ist.** An den Extremen (wenn eine Seite sehr billig ist, 5-20¢) ist die Summe am niedrigsten. In der Mitte (50/50) ist sie am höchsten. Über viele Orders mittelt sich das unter 100¢.
+**Der Algorithmus:**
+1. Beobachte beide Orderbücher alle 500ms
+2. Berechne laufenden Durchschnittspreis (Midpoint) für jede Seite
+3. Kaufe eine Seite NUR wenn ihr Ask < Midpoint × 0.92 (8% unter Durchschnitt)
+4. Wenn keine Seite günstig ist → WARTEN (nicht kaufen!)
+5. Über 2-4 Minuten: BTC oscilliert, beide Seiten werden bei ihren Dips gekauft
+6. Am Ende: Combined aus Up-Dips + Down-Dips < 100¢ → Merge → Profit
 
 ---
 
-## 5. Definitive Parameter
+## 5. Definitive Parameter (V4)
 
 ### 5.1 Orders pro Window
 
 | Parameter | Wert | Quelle |
 |-----------|------|--------|
-| Min Orders | 4 (2 Paare) | Kleinste Windows in Daten |
-| Typisch | 16-24 (8-12 Paare) | Median aus 295k Einträgen |
-| Max Orders | 40+ | Vereinzelt bei sehr tiefen Büchern |
+| Min Orders | 4 (2 pro Seite) | Minimum für sinnvollen Durchschnitt |
+| Typisch | 10-20 | Abhängig von BTC-Volatilität |
+| Max Orders | 30 | Hard cap |
 
-**KEIN MAX_PAIRS Limit.** Kaufe so viele Paare wie das Orderbuch hergibt und das Budget erlaubt, bis ca. T+260s (40 Sekunden vor Window-Ende).
+**WICHTIG:** Anders als V3 gibt es KEIN fixes Alternieren. Orders kommen opportunistisch wenn eine Seite billig ist. In ruhigen Phasen (keine Oscillation) kommen weniger Orders.
 
 ### 5.2 Chunk-Size
 
-| Parameter | Wert |
-|-----------|------|
-| Pro Order | ~180 Shares (Stargate5 aktuell) |
-| Innerhalb eines Windows | Quasi konstant (Std: <3 Shares) |
-| Zwischen Tagen | Variiert mit Bankroll (36-193 Shares) |
-| MAX_CHUNK_SIZE | 200 (um Orderbuch nicht zu sprengen) |
-
-Berechnung:
-```javascript
-function calculateChunkSize(balance, equityPerWindow) {
-  const budget = balance * equityPerWindow;
-  // Budget für ca. 10 Paare (20 Orders), avg price ~50¢
-  const estimatedPairs = 10;
-  const estimatedAvgPrice = 0.50;
-  const rawChunk = Math.floor(budget / (estimatedPairs * 2 * estimatedAvgPrice));
-  return Math.min(Math.max(rawChunk, 20), 200); // min 20, max 200
-}
-```
+Wie V3 — ~180 Shares pro Order, berechnet aus Balance.
 
 ### 5.3 Timing
 
 | Parameter | Wert |
 |-----------|------|
-| Market Discovery | VOR Window-Open (während vorheriges Window läuft) |
-| Erster Buy nach Window-Open | 5-10 Sekunden (KRITISCH!) |
-| Intervall zwischen Orders | 2-4 Sekunden |
-| Letzte Order | Spätestens T+260s (40s vor Resolution) |
-| Merge | T+270-290s (10-30s vor Resolution) |
+| Market Discovery | VOR Window-Open |
+| Monitor-Start | T+5s (ENTRY_DELAY) |
+| Monitor-Intervall | **500ms** (beide Bücher checken) |
+| Order-Intervall | 2s (nach erfolgtem Kauf, nicht pro Tick) |
+| Letzte Order | Spätestens T+260s |
+| Merge | T+270-290s |
 
-### 5.4 Entry-Timing ist ALLES
+### 5.4 Dip-Detection Parameter
 
-**Die billigsten Levels existieren nur in den ersten 30 Sekunden.**
+| Parameter | Wert | Erklärung |
+|-----------|------|-----------|
+| DIP_THRESHOLD_PCT | 0.92 | Kaufe wenn Ask < Midpoint × 0.92 (8% unter Durchschnitt) |
+| MONITOR_INTERVAL_MS | 500 | Wie oft beide Bücher gecheckt werden |
+| Adaptive Relaxation | +0.2%/tick, max +5% | Wenn zu lange nichts gekauft wird, Threshold lockern |
 
-Aus den Daten (Window 5:30-5:35):
-- T+5s: Up 7¢ (combined ~82¢ → 18¢ Profit)
-- T+120s: Up 45¢ (combined ~95¢ → 5¢ Profit)
-- T+240s: Up 55¢ (combined ~102¢ → Verlust)
-
-**Wenn du nach 3 Minuten einsteigst, sind nur noch die 100¢+ Levels übrig. Game over.**
+**Tuning:**
+- DIP_THRESHOLD_PCT zu niedrig (0.80) → zu wenige Orders, viel Imbalance
+- DIP_THRESHOLD_PCT zu hoch (0.98) → zu viele Orders, kauft quasi alles (wie V3)
+- Sweet Spot: 0.88-0.95, abhängig von BTC-Volatilität
 
 ### 5.5 Fees
 
@@ -221,116 +190,83 @@ Worst case pro Window bei 80%: ~2.5% der Balance (alle Paare bei 105¢).
 
 ---
 
-## 6. Core Loop (DEFINITIV)
+## 6. Core Loop (V4 — DEFINITIV)
 
 ```
 STARTUP:
   Connect to Polymarket CLOB WebSocket
-  Connect to Binance WS (für BTC-Preis Monitoring, optional)
   Discover current + next 5-min BTC market
 
 MAIN LOOP (alle 5 Minuten):
-  
+
   ═══════════════════════════════════════════════════
   PHASE 0: PRE-WINDOW (T-30s bis T+0)
   ═══════════════════════════════════════════════════
-  
+
   - Discovery: Finde conditionId + tokenIds für NÄCHSTES Window
   - Berechne chunk_size aus aktueller Balance
   - Subscribe to orderbook WebSocket für beide tokens
   - Warte auf Window-Open
-  
+
   ═══════════════════════════════════════════════════
-  PHASE 1: ACCUMULATE (T+5s bis T+260s)
+  PHASE 1: ACCUMULATE — Oscillation DCA (T+5s bis T+260s)
   ═══════════════════════════════════════════════════
-  
-  filled_up_shares = 0
-  filled_dn_shares = 0
-  total_up_cost = 0
-  total_dn_cost = 0
-  order_count = 0
-  
-  WHILE time < window_end - 40s AND budget_remaining > min_order_cost:
-    
-    // Entscheide welche Seite zuerst (alternierend)
-    if order_count is even:
-      first_side = "Up"
-      second_side = "Down"
+
+  filled_up = 0, filled_dn = 0
+  cost_up = 0, cost_dn = 0
+  up_price_history = [], dn_price_history = []
+  ticks_without_buy = 0
+
+  WHILE time < window_end - 40s AND budget > min_cost AND orders < max:
+
+    // === LESE BEIDE BÜCHER (Live WS, nicht REST!) ===
+    up_ask = get_ws_book(up_token).asks[0].price
+    dn_ask = get_ws_book(dn_token).asks[0].price
+
+    up_price_history.push(up_ask)
+    dn_price_history.push(dn_ask)
+
+    // === BERECHNE LAUFENDEN MIDPOINT ===
+    up_mid = avg(up_price_history)
+    dn_mid = avg(dn_price_history)
+
+    // === DIP DETECTION ===
+    // Adaptive: wenn lange nichts gekauft, Threshold lockern
+    adaptive_relax = min(ticks_without_buy * 0.002, 0.05)
+    threshold = DIP_THRESHOLD_PCT + adaptive_relax
+
+    up_is_cheap = (up_ask < up_mid * threshold)
+    dn_is_cheap = (dn_ask < dn_mid * threshold)
+
+    // === ENTSCHEIDUNG ===
+    if up_is_cheap AND dn_is_cheap:
+      // Beide billig → kaufe die Seite mit weniger Shares (Balance)
+      side = filled_up <= filled_dn ? "Up" : "Down"
+    else if up_is_cheap:
+      side = "Up"
+    else if dn_is_cheap:
+      side = "Down"
     else:
-      first_side = "Down" 
-      second_side = "Up"
-    
-    // === BUY FIRST SIDE ===
-    book = get_orderbook(first_side)
-    best_ask = book.asks[0].price
-    
-    order = submit_buy(
-      token: first_side_token,
-      size: chunk_size,
-      price: best_ask + SLIPPAGE_BUFFER,
-      type: "GTC"  // oder "FOK"
-    )
-    
-    wait_for_fill(order, timeout: 5s)
-    
+      // KEINE Seite billig genug → WARTEN!
+      ticks_without_buy++
+      wait(MONITOR_INTERVAL_MS)  // 500ms
+      continue  // ← DAS IST DER ENTSCHEIDENDE UNTERSCHIED ZU V3!
+
+    // === KAUFEN ===
+    order = submit_buy(side, chunk_size, best_ask + SLIPPAGE_BUFFER)
     if order.filled:
-      if first_side == "Up":
-        filled_up_shares += order.filled_size
-        total_up_cost += order.filled_cost + fee
-      else:
-        filled_dn_shares += order.filled_size
-        total_dn_cost += order.filled_cost + fee
-      order_count++
+      update_shares_and_costs(side, order)
+      ticks_without_buy = 0
+      wait(ORDER_INTERVAL_MS)  // 2s nach Kauf
     else:
-      cancel(order)
-      // Retry einmal oder skip
-    
-    // === BUY SECOND SIDE ===
-    book = get_orderbook(second_side)
-    best_ask = book.asks[0].price
-    
-    order = submit_buy(
-      token: second_side_token,
-      size: chunk_size,  // GLEICHE Size wie first side
-      price: best_ask + SLIPPAGE_BUFFER,
-      type: "GTC"
-    )
-    
-    wait_for_fill(order, timeout: 5s)
-    
-    if order.filled:
-      if second_side == "Up":
-        filled_up_shares += order.filled_size
-        total_up_cost += order.filled_cost + fee
-      else:
-        filled_dn_shares += order.filled_size
-        total_dn_cost += order.filled_cost + fee
-      order_count++
-    else:
-      cancel(order)
-    
-    // === RUNNING STATS (nur logging, kein Stop) ===
-    matched = min(filled_up_shares, filled_dn_shares)
-    if matched > 0:
-      running_combined = (total_up_cost + total_dn_cost) / matched
-      log("Orders: ${order_count}, Matched: ${matched}sh, Avg combined: ${running_combined}")
-    
-    // === OPTIONAL: ZWISCHEN-MERGE (für Kapital-Recycling) ===
-    // NUR wenn Budget knapp wird UND genug matched ist
-    if budget_remaining < chunk_size * 2 AND matched > MERGE_MIN_SIZE:
-      submit_merge(matched)
-      budget_remaining += matched  // $1 per share zurück
-      filled_up_shares -= matched
-      filled_dn_shares -= matched
-      // Proportional costs reduzieren
-      cost_ratio = total_up_cost / (total_up_cost + total_dn_cost)
-      total_up_cost -= matched * running_combined * cost_ratio
-      total_dn_cost -= matched * running_combined * (1 - cost_ratio)
-      log("MID-MERGE: ${matched}sh, freed $${matched}")
-    
-    // === PACING ===
-    wait(ORDER_INTERVAL_MS)  // 2-4 Sekunden
-  
+      ticks_without_buy++
+      wait(MONITOR_INTERVAL_MS)  // 500ms bei Fehlschlag
+
+    // === MID-MERGE wenn Budget knapp ===
+    if budget < chunk_size * 2 AND matched > MERGE_MIN_SIZE:
+      merge(matched)
+      budget += matched
+
   END WHILE
   
   ═══════════════════════════════════════════════════
@@ -377,7 +313,7 @@ MAIN LOOP (alle 5 Minuten):
 
 ---
 
-## 7. CONFIG (FINAL)
+## 7. CONFIG (V4 FINAL)
 
 ```javascript
 const CONFIG = {
@@ -386,37 +322,34 @@ const CONFIG = {
   CHUNK_SIZE_MIN: 20,              // Minimum Shares pro Order
   CHUNK_SIZE_MAX: 200,             // Maximum (schützt Orderbuch)
   MERGE_MIN_SIZE: 10,              // Min Shares für Merge
-  
-  // === TIMING (KRITISCH) ===
-  ENTRY_DELAY_MS: 5000,            // 5s nach Window-Open (Stargate5: 5-9s)
-  ORDER_INTERVAL_MS: 2000,         // 2s zwischen Orders
+
+  // === V4: DIP DETECTION (NEU!) ===
+  DIP_THRESHOLD_PCT: 0.92,         // Kaufe wenn Ask < Midpoint × 0.92 (8% unter Durchschnitt)
+  MONITOR_INTERVAL_MS: 500,        // Beide Bücher alle 500ms checken
+  // Adaptive: wenn ticks_without_buy > 0, Threshold += 0.2%/tick (max +5%)
+
+  // === TIMING ===
+  ENTRY_DELAY_MS: 5000,            // 5s nach Window-Open
+  ORDER_INTERVAL_MS: 2000,         // 2s nach erfolgtem Kauf (nicht pro Tick!)
   STOP_BUYING_BEFORE_END_S: 40,    // Aufhören 40s vor Window-Ende
   MERGE_BEFORE_END_S: 20,          // Merge 20s vor Window-Ende
-  
+
   // === ORDER TYPE ===
-  PRIMARY_ORDER_TYPE: 'GTC',       // GTC mit aggressivem Preis
-  FALLBACK_ORDER_TYPE: 'FOK',      // FOK als Alternative
+  PRIMARY_ORDER_TYPE: 'GTC',
+  FALLBACK_ORDER_TYPE: 'FOK',
   SLIPPAGE_BUFFER: 0.02,           // +2¢ über Ask
-  ORDER_TIMEOUT_MS: 3000,          // Cancel nach 3s wenn nicht gefüllt (Tempo > perfekte Fills)
-  
-  // === SAFETY NETS (sehr locker) ===
-  MAX_ORDERS_PER_WINDOW: 30,       // Hard stop (Stargate5 macht 10-25)
-  SKIP_IF_BEST_COMBINED_GT: 1.10,  // Skip nur wenn KOMPLETT kaputtes Buch
-  MIN_BOOK_LEVELS: 3,              // Skip wenn Buch quasi leer
-  
-  // === KEIN STOP LOSS PRO PAAR ===
-  // Einzelpaare KÖNNEN über 100¢ sein
-  // Der GESAMTDURCHSCHNITT muss unter 100¢ liegen
-  // Das passiert automatisch über viele Orders bei verschiedenen Preisen
-  
+  ORDER_TIMEOUT_MS: 3000,
+
+  // === SAFETY NETS ===
+  MAX_ORDERS_PER_WINDOW: 30,
+  SKIP_IF_BEST_COMBINED_GT: 1.10,
+  MIN_BOOK_LEVELS: 3,
+
   // === FEES ===
   FEE_MODEL: 'curve',              // NICHT flat!
-  FEE_RATE: 0.25,                  // Polymarket crypto fee rate
-  FEE_EXPONENT: 2,                 // Polymarket crypto fee exponent
-  
-  // === MARKET ===
-  MARKET_TYPE: 'btc-updown-5m',
-  
+  FEE_RATE: 0.25,
+  FEE_EXPONENT: 2,
+
   // === EXIT ===
   AUTO_MERGE_BEFORE_RESOLUTION: true,
   AUTO_REDEEM_AFTER_RESOLUTION: true,
@@ -552,32 +485,31 @@ SZENARIO: Bot crash / restart
 
 ---
 
-## 12. Warum unser vorheriger Bot nicht funktioniert hat
+## 12. Warum die vorherigen Versionen nicht funktioniert haben
 
-### Problem 1: 3 Minuten zu spät
+### Problem 0 (V3, FUNDAMENTAL): Blindes Alternieren = IMMER 101¢
+- **DER GRÖSSTE FEHLER:** V3 kaufte Up→Down→Up→Down blind abwechselnd
+- Up + Down = ~101¢ zu JEDEM einzelnen Zeitpunkt
+- Egal wie viele Orders, egal welcher Preis — die Summe eines gleichzeitigen Paares ist IMMER ~101¢
+- V3 dachte "der Durchschnitt über viele Paare wird unter 100¢ landen" — FALSCH
+- Jedes einzelne Paar (Up bei T, Down bei T+2s) hat Combined ~101¢
+- Der Durchschnitt von lauter 101¢-Paaren ist... 101¢
+
+### Problem 1: 3 Minuten zu spät (V1/V2)
 - Bot fand den Market WÄHREND des Windows statt VORHER
 - Billige Levels (7-20¢) waren schon weg
-- Nur noch teure Levels (40-80¢) übrig → Combined >100¢
 
-### Problem 2: Buy-Merge-Buy-Merge Cycle
-- Bot merged nach jedem Paar
-- Das kostet Zeit (Merge TX, Confirmation)
-- Und es ist nicht was Stargate5 macht
+### Problem 2: Buy-Merge-Buy-Merge Cycle (V1/V2)
+- Bot merged nach jedem Paar statt einmal am Ende
 
-### Problem 3: Flat 2% Fee
+### Problem 3: Flat 2% Fee (V1/V2)
 - Echte Fee ist 0.2-1.5% (Kurve)
-- Flat 2% machte JEDES Paar unprofitabel in der Simulation
-- Dry-Run zeigte nur Verluste → falsche Conclusion
 
-### Problem 4: MAX_PAIRS = 5
-- Zu wenig Orders
-- Der Edge kommt aus dem Durchschnitt über VIELE Orders
-- 5 Paare reichen nicht um die Preisoszillation auszunutzen
+### Problem 4: MAX_PAIRS = 5 (V1/V2)
+- Zu wenig Orders für sinnvolle Statistik
 
-### Problem 5: Per-Pair Combined Check (97¢, dann 103¢)
-- Einzelne Paare DÜRFEN über 100¢ sein
-- Der Gesamtdurchschnitt zählt, nicht das Einzelpaar
-- Ein Check pro Paar stoppt den Bot zu früh
+### V4 Lösung
+**Nicht beide Seiten gleichzeitig kaufen.** Jede Seite NUR bei ihrem Tiefpunkt kaufen. Up und Down haben ihre Tiefpunkte zu VERSCHIEDENEN Zeitpunkten (weil BTC oscilliert). So wird Combined = avg(Up-Dips) + avg(Down-Dips) < 100¢.
 
 ---
 
@@ -635,64 +567,52 @@ SZENARIO: Bot crash / restart
 ## 15. Quick Reference Card
 
 ```
-╔══════════════════════════════════════════════════╗
-║          HOLYPOLY MERGE-ARB BOT v3               ║
-╠══════════════════════════════════════════════════╣
-║ WHAT:  Buy Up + Down, Merge for $1               ║
-║ WHEN:  Every 5-min BTC window, start at T+5s     ║
-║ HOW:   Alternate Up/Down, ~180sh per order        ║
-║        10-25 orders over 2-4 minutes              ║
-║        Merge ALL matched shares at T+280s         ║
-║ WHY:   Avg combined < 100¢ over many orders       ║
-║ EDGE:  Price oscillation + extreme price levels   ║
-║ RISK:  ~2-3% max per window (hedged position)     ║
-╠══════════════════════════════════════════════════╣
-║ CRITICAL: Start within 5-10s of window open!      ║
-║ CRITICAL: Fee is CURVE not flat 2%!               ║
-║ CRITICAL: NO per-pair combined check!             ║
-║ CRITICAL: Discover market BEFORE window opens!    ║
-╚══════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════╗
+║          HOLYPOLY OSCILLATION-DCA BOT v4             ║
+╠══════════════════════════════════════════════════════╣
+║ WHAT:  Buy Up at its dip, Down at its dip, Merge    ║
+║ WHEN:  Every 5-min BTC window, monitor from T+5s    ║
+║ HOW:   Monitor both books every 500ms                ║
+║        Buy a side ONLY when its ask < mid × 0.92     ║
+║        Wait if nothing is cheap (DON'T buy blindly)  ║
+║        Merge ALL matched shares at T+280s            ║
+║ WHY:   Up dip ≠ Down dip in time → combined < 100¢  ║
+║ EDGE:  BTC oscillation → each side dips separately   ║
+║ RISK:  ~2-3% max per window (hedged position)        ║
+╠══════════════════════════════════════════════════════╣
+║ CRITICAL: NEVER buy both sides at the same time!     ║
+║ CRITICAL: Up + Down = ~101¢ always at any moment!    ║
+║ CRITICAL: Buy each side only at its CHEAPEST point!  ║
+║ CRITICAL: Wait for dips — patience is the edge!      ║
+╚══════════════════════════════════════════════════════╝
 ```
 
 ---
 
-## 16. Amendments (23. März 2026)
+## 16. V4 Amendments (23. März 2026)
 
-### 16.1 ORDER_TIMEOUT: 3s statt 5s
+### 16.1 FUNDAMENTALE ÄNDERUNG: Von blindem Alternieren zu Oscillation-DCA
 
-Wenn ein GTC-Order nach **3 Sekunden** nicht gefüllt ist → Cancel → nächste Order sofort.
-Tempo ist wichtiger als perfekte Fills. Nicht retrien auf dem gleichen Level — der Preis
-hat sich bewegt, nächster Order ist bei neuem Best Ask.
+V3 ging davon aus dass "der Durchschnitt über viele alternierend gekaufte Paare unter 100¢ landen wird".
+Das war FALSCH. Up + Down = ~101¢ zu jedem Zeitpunkt. Blind alternierend kaufen = jedes Paar ~101¢ = Verlust.
 
-### 16.2 Competition & Market Maker Replenishment
+V4 kauft jede Seite **NUR wenn sie billig ist** (Dip-Detection via Running Midpoint).
+Up und Down haben ihre Dips zu verschiedenen Zeitpunkten (BTC oscilliert).
+Combined aus Up-Dips + Down-Dips < 100¢.
 
-Das Orderbuch wird von Market Makern **kontinuierlich nachgefüllt**. Wir müssen nicht
-der Erste sein (Stargate5 und andere Bots fressen die 7¢-Levels), nur **schnell genug**
-(<10s Entry). Selbst wenn die billigsten Levels weg sind:
-- 15-25¢ Levels sind immer noch profitabel (Combined ~90-95¢)
-- Market Maker stellen nach Sekunden neue Orders rein
-- Je mehr Preise wir über das Window samplen, desto besser der Durchschnitt
+### 16.2 WebSocket Book Updates (price_change)
 
-### 16.3 Mid-Merge Recycling: Präzise Trigger
+`price_change` Events updaten jetzt die vollständigen `asks[]`/`bids[]` Arrays (nicht nur `bestBid`/`bestAsk`).
+Das ist kritisch damit `simulateFokBuy()` im DRY_RUN gegen das AKTUELLE Orderbuch simuliert.
 
-Mid-Merge ist die **Ausnahme**, nicht die Regel:
-```
-IF budget_remaining < chunk_size * 2   // Budget reicht nicht für nächstes Paar
-   AND matched > merge_min_size         // Genug Shares zum Mergen
-   AND time_remaining > 30s             // Genug Zeit um weiterzukaufen
-THEN:
-   merge(matched)
-   budget += matched  // $1/share zurück
-   → weiter kaufen mit recyceltem Kapital
-ELSE:
-   → weiter kaufen (Merge am Ende)
-```
+### 16.3 Mid-Merge Recycling
 
-**Wenn Budget noch da ist → NICHT mergen, weiterkaufen.** Merge am Ende bleibt der Normalfall.
+Unverändert von V3: Nur wenn Budget knapp wird.
 
-### 16.4 BTC-Preisoszillation
+### 16.4 BTC-Preisoszillation ist der KERN des Edge
 
 Schon **0.1% BTC-Bewegung** reicht damit Up von 40¢ auf 60¢ springt und Down von 60¢
-auf 40¢ fällt. Das passiert innerhalb von 5 Minuten **ständig**. Nur bei absolut flachem
-BTC (selten) bleibt es bei 50/50 = 100¢. Die Strategie profitiert von Volatilität —
-und BTC 5-min Markets sind ultra-volatil.
+auf 40¢ fällt. V4 WARTET auf diese Moves und kauft NUR bei den Dips.
+
+**Risiko: Flat BTC** — Wenn BTC 5 Minuten lang nicht oscilliert (Up=50¢, Down=51¢ die ganze Zeit),
+gibt es keine Dips zum Kaufen. Der Bot kauft wenig/nichts. Das ist KORREKT — kein Edge = kein Trade.

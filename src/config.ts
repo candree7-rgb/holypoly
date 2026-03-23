@@ -129,6 +129,10 @@ export interface Config {
   stopBuyingBeforeEndS: number;
   /** Merge this many seconds before window end */
   mergeBeforeEndS: number;
+  /** V4: Dip threshold — buy a side when its ask < midpoint × this (e.g. 0.90 = 10% below mid) */
+  dipThresholdPct: number;
+  /** V4: How often (ms) to check both books for dip opportunities (fast polling, not order interval) */
+  monitorIntervalMs: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -325,6 +329,8 @@ export const loadConfig = (): Config => {
   const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 200);
   const stopBuyingBeforeEndS = parseNumber("STOP_BUYING_BEFORE_END_S", 40);
   const mergeBeforeEndS = parseNumber("MERGE_BEFORE_END_S", 20);
+  const dipThresholdPct = parseNumber("DIP_THRESHOLD_PCT", 0.92);
+  const monitorIntervalMs = parseNumber("MONITOR_INTERVAL_MS", 500);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -406,6 +412,8 @@ export const loadConfig = (): Config => {
     maxChunkSize,
     stopBuyingBeforeEndS,
     mergeBeforeEndS,
+    dipThresholdPct,
+    monitorIntervalMs,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,

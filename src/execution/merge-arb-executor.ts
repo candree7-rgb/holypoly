@@ -17,14 +17,23 @@ import { DryRunEngine } from "./dry-run-engine.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
 /**
- * MergeArbExecutor V3: Accumulate-then-merge strategy.
+ * MergeArbExecutor V4: Oscillation DCA — buy each side at its dip.
  *
- * Flow per 5-min window (from HOLYPOLY_V3_DEFINITIVE.md):
- * 1. Pre-flight: orderbook depth + sanity check (skip only if book totally broken)
- * 2. ACCUMULATE: alternate Up/Down buys over 2-4 minutes, many small orders (~180sh)
- *    - No per-pair combined check — individual pairs CAN be >100¢
- *    - Edge comes from AVERAGE over many orders at different prices
- *    - Mid-merge recycling ONLY when budget runs out
+ * KEY INSIGHT: Up + Down = ~101¢ at ANY single moment.
+ * Buying both sides simultaneously = guaranteed loss.
+ *
+ * V4 Strategy: Monitor both orderbooks continuously via WebSocket.
+ * Buy Up ONLY when Up is cheap (BTC just dropped → Up ask < target).
+ * Buy Down ONLY when Down is cheap (BTC just rose → Down ask < target).
+ * Over 2-4 minutes, BTC oscillates → both sides hit their dips at DIFFERENT times.
+ * Accumulated combined avg < 100¢ → merge for profit.
+ *
+ * Flow per 5-min window:
+ * 1. Pre-flight: orderbook depth + sanity check
+ * 2. ACCUMULATE: monitor both books every 500ms, buy the cheap side
+ *    - Track running midpoint for each side
+ *    - Buy when ask < midpoint × DIP_THRESHOLD (e.g. 0.90 = 10% below mid)
+ *    - Balance both sides: prefer the side with fewer accumulated shares
  * 3. MERGE: once at end (T+260-280s), merge all matched shares
  * 4. CLEANUP: redeem remaining imbalance after resolution
  */
@@ -113,7 +122,10 @@ export class MergeArbExecutor {
     );
 
     // ═══════════════════════════════════════════════════
-    // PHASE 1: ACCUMULATE (T+5s to T+260s)
+    // PHASE 1: ACCUMULATE — Oscillation DCA (V4)
+    // Buy each side ONLY when it's at a dip (cheap).
+    // Up+Down = ~101¢ at any moment, so never buy both simultaneously.
+    // BTC oscillation makes each side cheap at DIFFERENT times.
     // ═══════════════════════════════════════════════════
     let filledUpShares = 0;
     let filledDnShares = 0;
@@ -128,42 +140,99 @@ export class MergeArbExecutor {
     const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
     const minOrderCost = chunkSize * 0.10; // even at 10¢ per share
 
+    // Track price history for each side to compute running midpoint
+    const upPriceHistory: number[] = [];
+    const dnPriceHistory: number[] = [];
+    // How many consecutive ticks with no buy (for adaptive threshold)
+    let ticksWithoutBuy = 0;
+
     while (
       orderCount < this.config.maxOrdersPerWindow &&
       availableBudget > minOrderCost &&
       Date.now() < stopBuyingTime
     ) {
-      // --- DETERMINE SIDE (alternating Up/Down/Up/Down) ---
-      const side: TradeSide = orderCount % 2 === 0 ? "Up" : "Down";
-      const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
+      // --- READ BOTH BOOKS (live WS data) ---
+      const upBook = this.config.dryRun && this.dryRunEngine
+        ? this.dryRunEngine.getBookView(window.upTokenId)
+        : this.clobWs.getBook(window.upTokenId);
+      const dnBook = this.config.dryRun && this.dryRunEngine
+        ? this.dryRunEngine.getBookView(window.downTokenId)
+        : this.clobWs.getBook(window.downTokenId);
 
-      // --- GET CURRENT BEST ASK ---
-      const book = this.config.dryRun && this.dryRunEngine
-        ? this.dryRunEngine.getBookView(tokenId)
-        : this.clobWs.getBook(tokenId);
-
-      if (!book || !book.asks || book.asks.length === 0) {
-        this.logger.debug("No asks available, skipping", { side });
+      if (!upBook?.asks?.length || !dnBook?.asks?.length) {
         this.consecutiveFailures++;
-        if (this.consecutiveFailures >= 5) {
-          this.logger.warn("Too many consecutive failures, stopping accumulation");
+        if (this.consecutiveFailures >= 10) {
+          this.logger.warn("Too many consecutive no-book ticks, stopping");
           break;
         }
-        await sleep(this.config.orderIntervalMs);
+        await sleep(this.config.monitorIntervalMs);
         continue;
       }
 
-      const bestAsk = book.asks[0].price;
+      const upAsk = upBook.asks[0].price;
+      const dnAsk = dnBook.asks[0].price;
+
+      // Record price observations
+      upPriceHistory.push(upAsk);
+      dnPriceHistory.push(dnAsk);
+
+      // --- COMPUTE RUNNING MIDPOINT (rolling average of observed asks) ---
+      const upMid = upPriceHistory.reduce((a, b) => a + b, 0) / upPriceHistory.length;
+      const dnMid = dnPriceHistory.reduce((a, b) => a + b, 0) / dnPriceHistory.length;
+
+      // --- DIP DETECTION ---
+      // A side is "cheap" when its current ask is below threshold × its running midpoint.
+      // Adaptive: if we haven't bought in a while, relax the threshold slightly
+      // to avoid missing the window entirely.
+      const adaptiveRelax = Math.min(ticksWithoutBuy * 0.002, 0.05); // max +5% relaxation
+      const dipThreshold = this.config.dipThresholdPct + adaptiveRelax;
+
+      const upIsCheap = upAsk < upMid * dipThreshold;
+      const dnIsCheap = dnAsk < dnMid * dipThreshold;
+
+      // --- DECIDE WHICH SIDE TO BUY ---
+      // Priority: the cheaper side (relative to its mid), but also balance shares.
+      // If both are cheap, buy the side we have fewer shares of.
+      // If neither is cheap, skip this tick.
+      let sideToBuy: TradeSide | null = null;
+
+      if (upIsCheap && dnIsCheap) {
+        // Both cheap — buy the side with fewer accumulated shares (balance)
+        sideToBuy = filledUpShares <= filledDnShares ? "Up" : "Down";
+      } else if (upIsCheap) {
+        sideToBuy = "Up";
+      } else if (dnIsCheap) {
+        sideToBuy = "Down";
+      } else {
+        // Neither side is cheap enough — wait for oscillation
+        ticksWithoutBuy++;
+        if (ticksWithoutBuy % 20 === 0) {
+          this.logger.debug("Waiting for dip", {
+            upAsk: `${(upAsk * 100).toFixed(1)}¢`,
+            dnAsk: `${(dnAsk * 100).toFixed(1)}¢`,
+            upMid: `${(upMid * 100).toFixed(1)}¢`,
+            dnMid: `${(dnMid * 100).toFixed(1)}¢`,
+            threshold: `${(dipThreshold * 100).toFixed(1)}%`,
+            ticksWaiting: ticksWithoutBuy,
+          });
+        }
+        await sleep(this.config.monitorIntervalMs);
+        continue;
+      }
+
+      // --- EXECUTE BUY ---
+      const tokenId = sideToBuy === "Up" ? window.upTokenId : window.downTokenId;
+      const bestAsk = sideToBuy === "Up" ? upAsk : dnAsk;
       const orderPrice = bestAsk + this.config.slippageBuffer;
 
-      // --- SUBMIT BUY ORDER ---
-      const fill = await this.buyOrder(tokenId, chunkSize, orderPrice, side);
+      const fill = await this.buyOrder(tokenId, chunkSize, orderPrice, sideToBuy);
 
       if (fill.filled) {
         this.consecutiveFailures = 0;
+        ticksWithoutBuy = 0;
         const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
 
-        if (side === "Up") {
+        if (sideToBuy === "Up") {
           filledUpShares += fill.filledSize;
           totalUpCost += fill.totalCost;
         } else {
@@ -174,7 +243,7 @@ export class MergeArbExecutor {
 
         orderFills.push({
           orderNum: orderCount,
-          side,
+          side: sideToBuy,
           filledSize: fill.filledSize,
           avgPrice: fill.avgPrice,
           totalCost: fill.totalCost,
@@ -183,7 +252,16 @@ export class MergeArbExecutor {
         });
         orderCount++;
 
-        // --- RUNNING STATS (logging only, NO stop condition) ---
+        this.logger.info("V4 dip buy", {
+          side: sideToBuy,
+          price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+          mid: `${((sideToBuy === "Up" ? upMid : dnMid) * 100).toFixed(1)}¢`,
+          discount: `${(((sideToBuy === "Up" ? upMid : dnMid) - fill.avgPrice) * 100).toFixed(1)}¢`,
+          upShares: filledUpShares.toFixed(0),
+          dnShares: filledDnShares.toFixed(0),
+        });
+
+        // --- RUNNING STATS ---
         const matched = Math.min(filledUpShares, filledDnShares);
         if (matched > 0 && orderCount % 4 === 0) {
           const runningCombined = ((totalUpCost + totalDnCost) / matched) * 100;
@@ -195,12 +273,12 @@ export class MergeArbExecutor {
           });
         }
 
-        // --- MID-MERGE RECYCLING (V3 Spec §16.3: only when budget runs out) ---
+        // --- MID-MERGE RECYCLING (only when budget runs out) ---
         const matched2 = Math.min(filledUpShares, filledDnShares);
         if (
-          availableBudget < chunkSize * 2 && // budget can't cover next pair
+          availableBudget < chunkSize * 2 &&
           matched2 >= this.config.mergeMinSize &&
-          Date.now() < stopBuyingTime - 30_000 // enough time to keep buying after merge
+          Date.now() < stopBuyingTime - 30_000
         ) {
           this.logger.info("Mid-merge recycling: budget low", {
             budget: `$${availableBudget.toFixed(0)}`,
@@ -212,13 +290,11 @@ export class MergeArbExecutor {
           if (mergeResult) {
             merges.push(mergeResult);
             totalMergedInWindow += mergeResult.merged;
-            // Save original shares for cost proportioning
             const origUp = filledUpShares;
             const origDn = filledDnShares;
             filledUpShares -= mergeResult.merged;
             filledDnShares -= mergeResult.merged;
             availableBudget += mergeResult.recovered;
-            // Proportionally reduce costs (remaining / original)
             totalUpCost = origUp > 0 ? totalUpCost * (filledUpShares / origUp) : 0;
             totalDnCost = origDn > 0 ? totalDnCost * (filledDnShares / origDn) : 0;
             this.logger.info("Mid-merge complete", {
@@ -227,16 +303,18 @@ export class MergeArbExecutor {
             });
           }
         }
+
+        // After buying, wait ORDER_INTERVAL before next buy
+        await sleep(this.config.orderIntervalMs);
       } else {
         this.consecutiveFailures++;
-        if (this.consecutiveFailures >= 5) {
+        ticksWithoutBuy++;
+        if (this.consecutiveFailures >= 10) {
           this.logger.warn("Too many consecutive failures, stopping accumulation");
           break;
         }
+        await sleep(this.config.monitorIntervalMs);
       }
-
-      // --- PACING (V3 Spec 5.3: 2-4s between orders) ---
-      await sleep(this.config.orderIntervalMs);
     }
 
     // ═══════════════════════════════════════════════════
