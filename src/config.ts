@@ -344,7 +344,7 @@ export const loadConfig = (): Config => {
   const btcMoveThreshold = parseNumber("BTC_MOVE_THRESHOLD", 0.0005);
   const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.45);
   const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
-  const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 3);
+  const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 0);
   const sameSideCooldownMs = parseNumber("SAME_SIDE_COOLDOWN_MS", 10000);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.55);
