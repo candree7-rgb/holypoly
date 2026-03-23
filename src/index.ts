@@ -1005,11 +1005,10 @@ const main = async () => {
       telegram,
     );
 
-    logger.info("=== Signal-Taker V6 Strategy Active ===", {
+    logger.info("=== Signal-Taker V7 Adaptive Strategy Active ===", {
       btcMoveThreshold: `${(config.btcMoveThreshold * 100).toFixed(3)}%`,
       cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
-      checkInterval: `${config.signalCheckIntervalMs}ms`,
-      maxImbalanceChunks: config.maxImbalanceChunks,
+      targetCombined: `${config.targetCombinedCents}¢`,
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
       dryRun: config.dryRun,
     });

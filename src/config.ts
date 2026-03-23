@@ -102,20 +102,18 @@ export interface Config {
   /** "merge-arb" = V5 maker, "signal-taker" = V6 Binance signal, "edge" = edge-detection, "webhook" = TradingView signals */
   strategyMode: "merge-arb" | "signal-taker" | "edge" | "webhook";
 
-  // V6 Signal-Taker parameters
+  // V7 Adaptive Signal-Taker parameters
   /** BTC % move threshold to trigger buy (e.g. 0.0005 = 0.05%) */
   btcMoveThreshold: number;
-  /** Only buy when ask < this price (e.g. 0.45 = 45¢) */
+  /** Only buy when ask < this price — safety cap (e.g. 0.55 = 55¢) */
   cheapThreshold: number;
   /** How often (ms) to check Binance price and evaluate signal */
   signalCheckIntervalMs: number;
-  /** Max chunks more on one side before pausing that side */
-  maxImbalanceChunks: number;
-  /** Min ms between orders on the SAME side (other side can buy immediately) */
-  sameSideCooldownMs: number;
+  /** Target combined cost in cents — stop accumulating when reached (e.g. 97 = 97¢) */
+  targetCombinedCents: number;
   /** Max fraction of budget on one side before other side has ≥1 fill (e.g. 0.50 = 50%) */
   budgetReservePct: number;
-  /** Fixed max price for rebalance taker buy (e.g. 0.55 = 55¢) */
+  /** Hard safety cap for rebalance (e.g. 0.99 = 99¢) */
   rebalanceMaxPrice: number;
 
   // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
@@ -340,12 +338,11 @@ export const loadConfig = (): Config => {
     : strategyModeRaw === "signal-taker" ? "signal-taker"
     : "merge-arb" as const;
 
-  // V6 Signal-Taker parameters
+  // V7 Adaptive Signal-Taker parameters
   const btcMoveThreshold = parseNumber("BTC_MOVE_THRESHOLD", 0.0005);
-  const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.45);
+  const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.55);
   const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
-  const maxImbalanceChunks = parseNumber("MAX_IMBALANCE_CHUNKS", 0);
-  const sameSideCooldownMs = parseNumber("SAME_SIDE_COOLDOWN_MS", 10000);
+  const targetCombinedCents = parseNumber("TARGET_COMBINED_CENTS", 97);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
 
@@ -440,8 +437,7 @@ export const loadConfig = (): Config => {
     btcMoveThreshold,
     cheapThreshold,
     signalCheckIntervalMs,
-    maxImbalanceChunks,
-    sameSideCooldownMs,
+    targetCombinedCents,
     budgetReservePct,
     rebalanceMaxPrice,
     equityPerWindow,

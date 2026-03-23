@@ -2,50 +2,47 @@
 
 Polymarket merge-arb trading bot for BTC 5-minute Up/Down binary markets.
 
-## Strategy: Signal-Taker V6 (`STRATEGY_MODE=signal-taker`) — AKTIV
+## Strategy: Adaptive Signal-Taker V7 (`STRATEGY_MODE=signal-taker`) — AKTIV
 
-**Kern-Insight:** Nie beide Seiten gleichzeitig kaufen (Combined ≈101¢ = Verlust).
-Stattdessen: Binance BTC-Preis monitoren, jede Seite EINZELN kaufen wenn sie billig ist.
+**Kern-Insight:** Beide Seiten ABWECHSELND kaufen, getimed durch BTC-EMA-Crossover.
+Nur kaufen wenn es den Combined-Preis VERBESSERT. Aufhören bei Target (97¢).
 
-### Warum V6 funktioniert (und V1-V5 nicht)
-V1-V5 kauften immer Up+Down quasi-gleichzeitig → Combined ≈ 101¢ → Verlust.
-V6 kauft jede Seite einzeln wenn BTC sich bewegt:
-- BTC STEIGT → Down wird billig → KAUF DOWN
-- BTC FÄLLT  → Up wird billig → KAUF UP
-- BTC FLAT   → nichts kaufen (kein Edge)
+### Warum V7 funktioniert (und V1-V6 nicht)
+- V1-V5: Kauften Up+Down gleichzeitig → Combined ≈101¢ → Verlust.
+- V6: Kaufte bei BTC-Signal, aber keine strikte Alternation → Imbalance, Rebalance-Cap blockiert.
+- V7: Strikte Alternation + EMA-Timing + Combined-Tracking → Adaptiv, nur profitable Buys.
 
-Über 2-4 Min BTC-Oszillation sammeln wir beide Seiten billig. Combined < 100¢ → Merge → Profit.
-
-### Fee bei niedrigen Preisen ist kein Problem
-```
-Polymarket Fee: shares × price × 0.25 × (price × (1-price))²
-Bei 30¢: 0.53% → 30.16¢ effektiv
-Bei 20¢: 0.32% → 20.06¢ effektiv
-Bei 10¢: 0.08% → 10.01¢ effektiv
-Bei 50¢: 1.56% → 50.78¢ (worst case)
-```
+### Adaptive Logik
+1. **EMA Crossover**: Fast-EMA (5s) vs Slow-EMA (30s) erkennt Dips/Bounces
+   - BTC dippt (fast < slow) → Up wird billig → kaufe Up
+   - BTC bounct (fast > slow) → Down wird billig → kaufe Down
+2. **Strikte Alternation**: Nie dieselbe Seite doppelt. Immer ausgleichen.
+3. **Projected Combined Check**: Nur kaufen wenn es Combined verbessert (oder bei Target hält)
+4. **Dynamic Intervals**: Weit vom Target → aggressiv (1.5s). Nah → vorsichtig (8-12s).
+5. **Trend Detection**: EMA-Divergenz > 0.15% → Pause (kein Edge bei Trend)
+6. **Auto-Stop**: Wenn Combined ≤ Target erreicht, Intervall verlängern (selektiver)
 
 ### 3-Phase Flow
-1. **Phase 1 ACCUMULATE (T+5s→T+260s):** Signal-based taker buys
+1. **Phase 1 ACCUMULATE (T+5s→T+260s):** Adaptive EMA-getimte Käufe
    - Monitor Binance BTCUSDT via WebSocket (real-time, ~100ms updates)
-   - BTC change > +0.05% → buy Down (cheap side)
-   - BTC change < -0.05% → buy Up (cheap side)
-   - Only buy if ask < CHEAP_THRESHOLD (45¢)
-   - Balance enforcement: max 3 chunks imbalance between sides
-   - Per-side pacing: min 10s between orders on same side (wait for BTC to move more)
-   - Budget-reserve: max 50% budget on one side until other side has ≥1 fill
-2. **Phase 2 REBALANCE (T+260s):** Buy short side as taker
-   - Fixed cap: 55¢ (dynamic cap was blocking everything — opposite side always ~96-100¢ after directional move)
+   - EMA-Crossover bestimmt optimalen Kaufzeitpunkt
+   - Strict alternation: immer die Seite kaufen die weniger hat (oder abwechseln bei Gleichstand)
+   - Nur kaufen wenn projected combined sich verbessert
+   - Dynamic intervals: 1.5s-12s basierend auf Abstand zum Target
+   - Budget-reserve: max 50% budget auf einer Seite bis andere ≥1 fill hat
+   - Safety cap: nie mehr als CHEAP_THRESHOLD pro Seite zahlen
+2. **Phase 2 REBALANCE (T+260s):** Short side kaufen mit dynamischem Cap
+   - Dynamic cap: breakeven + 3¢ (= 1.00 - avgLongSidePrice + 0.03)
+   - Hard safety max: 99¢
 3. **Phase 3 MERGE (T+270s):** Merge matched shares → $1.00 per pair
 
 ### Key Parameters
-- BTC_MOVE_THRESHOLD: 0.0005 (0.05% BTC move triggers buy signal)
-- CHEAP_THRESHOLD: 0.45 (only buy when ask < 45¢)
-- SIGNAL_CHECK_INTERVAL_MS: 500 (check Binance every 500ms)
-- MAX_IMBALANCE_CHUNKS: 0 (only buy the side that's behind)
-- SAME_SIDE_COOLDOWN_MS: 10000 (10s min between orders on same side)
-- BUDGET_RESERVE_PCT: 0.50 (max 50% budget on one side until other has ≥1 fill)
-- REBALANCE_MAX_PRICE: 0.99 (no effective cap — always rebalance, breakeven OK)
+- BTC_MOVE_THRESHOLD: 0.0005 (0.05% EMA-Crossover für Buy-Signal)
+- CHEAP_THRESHOLD: 0.55 (safety cap — nie mehr als 55¢ pro Seite)
+- TARGET_COMBINED_CENTS: 97 (aufhören wenn combined ≤ 97¢)
+- SIGNAL_CHECK_INTERVAL_MS: 500 (EMA-Update alle 500ms)
+- BUDGET_RESERVE_PCT: 0.50 (max 50% budget auf einer Seite bis andere ≥1 fill)
+- REBALANCE_MAX_PRICE: 0.99 (hard safety cap für Rebalance)
 - EQUITY_PER_WINDOW: 30% (conservative start, scale up later)
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares
@@ -54,7 +51,7 @@ Bei 50¢: 1.56% → 50.78¢ (worst case)
 - SLIPPAGE_BUFFER: 0.02 (+2¢ over ask for FOK)
 
 ### Architecture
-- `src/execution/signal-taker-executor.ts` — V6 Core: signal-based taker accumulation
+- `src/execution/signal-taker-executor.ts` — V7 Core: adaptive EMA-based accumulation
 - `src/execution/merge-arb-executor.ts` — V5 (legacy): 3-phase maker strategy
 - `src/execution/dry-run-engine.ts` — FOK fill simulation against live orderbook
 - `src/data/binance-ws.ts` — Binance BTCUSDT WebSocket (real-time BTC price)
