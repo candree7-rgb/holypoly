@@ -29,7 +29,7 @@ export class DryRunEngine {
     size: number;
     avgPrice: number;
     cost: number;
-    type: "FOK";
+    type: "FOK" | "GTC";
   }> = [];
   private mergeLog: Array<{
     timestamp: number;
@@ -326,7 +326,7 @@ export class DryRunEngine {
       size: filledSize,
       avgPrice,
       cost: totalWithFee,
-      type: "FOK", // logged as FOK for consistency (it's still a taker fill)
+      type: "GTC",
     });
 
     this.logger.info("DRY_RUN: GTC filled (partial ok)", {

@@ -162,8 +162,8 @@ export class MergeArbExecutor {
 
       if (!firstFill.filled) {
         this.logger.warn(`${firstSide} buy failed after retries`);
-        // >2 consecutive failures → abort window (Spec 9.11)
-        if (this.consecutiveFokFailures > 2) {
+        // >=2 consecutive failures → abort window (Spec 9.11 / Changelog §6)
+        if (this.consecutiveFokFailures >= 2) {
           this.logger.warn("Too many consecutive failures, aborting window");
           break;
         }
@@ -200,14 +200,37 @@ export class MergeArbExecutor {
         }
         availableBudget -= secondFill.totalCost;
       } else {
-        this.logger.warn(`${secondSide} buy failed — naked ${firstSide} exposure`, {
+        // Naked exposure: first side filled but second side failed (Changelog §6)
+        // Retry the second side once more with wider slippage
+        this.logger.warn(`${secondSide} buy failed — naked ${firstSide} exposure, retrying`, {
           naked: firstFill.filledSize.toFixed(1),
         });
+        await sleep(500);
+        const nakedRetry = await this.buyWithFallback(
+          secondTokenId,
+          firstFill.filledSize,
+          secondAsk + this.config.slippageBuffer * 3, // even wider slippage
+          secondSide,
+        );
+        tradeCount++;
+        if (nakedRetry.filled) {
+          if (secondSide === "Up") {
+            filledUpShares += nakedRetry.filledSize;
+            totalUpCost += nakedRetry.totalCost;
+          } else {
+            filledDnShares += nakedRetry.filledSize;
+            totalDnCost += nakedRetry.totalCost;
+          }
+          availableBudget -= nakedRetry.totalCost;
+        } else {
+          // Still failed — accept naked exposure, will be handled post-resolution
+          this.logger.warn(`${secondSide} retry also failed, holding naked ${firstSide} for resolution`);
+        }
       }
 
       // --- IMBALANCE REBALANCING (Spec 9.5) ---
       const imbalance = Math.abs(filledUpShares - filledDnShares);
-      if (imbalance > this.config.maxImbalanceShares && secondFill.filled) {
+      if (imbalance > this.config.maxImbalanceShares) {
         const shortSide: TradeSide = filledUpShares > filledDnShares ? "Down" : "Up";
         const shortTokenId = shortSide === "Up" ? window.upTokenId : window.downTokenId;
         const shortAsk = shortSide === "Up" ? upAsk : dnAsk;
@@ -346,9 +369,11 @@ export class MergeArbExecutor {
       ? completePairs.reduce((s, p) => s + p.combinedCents, 0) / completePairs.length
       : 0;
 
+    // totalCost from pairs already includes fees (buyFok returns cost+fee),
+    // so extract the fee portion: fee = totalWithFee - totalWithFee/(1+rate)
     const takerFees = this.config.dryRun && this.dryRunEngine
       ? this.dryRunEngine.fees
-      : totalCost * this.config.takerFeeRate;
+      : totalCost - (totalCost / (1 + this.config.takerFeeRate));
 
     Object.assign(result, {
       pairs,
@@ -557,8 +582,9 @@ export class MergeArbExecutor {
     side: TradeSide,
   ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
     if (this.config.dryRun && this.dryRunEngine) {
-      // For DRY_RUN, GTC fallback still simulates against current book
-      // but we're more lenient — simulate partial fill if possible
+      // Simulate the same timeout wait as LIVE to keep timing realistic
+      await sleep(this.config.orderTimeoutMs);
+      // GTC fallback simulates partial fill against current book
       return this.dryRunEngine.simulateGtcFill(tokenId, size, maxPrice, side);
     }
 
@@ -618,20 +644,16 @@ export class MergeArbExecutor {
     let upBook: BookSnapshot | null;
     let dnBook: BookSnapshot | null;
 
-    if (this.config.dryRun && this.dryRunEngine) {
-      upBook = this.dryRunEngine.getBook(window.upTokenId);
-      dnBook = this.dryRunEngine.getBook(window.downTokenId);
-    } else {
-      // Use WS book (should be populated by now after subscribe + 1s wait)
-      upBook = this.clobWs.getBook(window.upTokenId);
-      dnBook = this.clobWs.getBook(window.downTokenId);
-      // Fallback to REST if WS book not ready
-      if (!upBook || !dnBook) {
-        const upOb = await this.clob.getOrderbook(window.upTokenId);
-        const dnOb = await this.clob.getOrderbook(window.downTokenId);
-        upBook = { assetId: window.upTokenId, bids: [], asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
-        dnBook = { assetId: window.downTokenId, bids: [], asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
-      }
+    // Use WS book first (both DRY_RUN and LIVE)
+    upBook = this.clobWs.getBook(window.upTokenId);
+    dnBook = this.clobWs.getBook(window.downTokenId);
+
+    // Fallback to REST if WS book not ready (works in both modes — orderbook REST needs no auth)
+    if (!upBook || !dnBook) {
+      const upOb = await this.clob.getOrderbook(window.upTokenId);
+      const dnOb = await this.clob.getOrderbook(window.downTokenId);
+      upBook = { assetId: window.upTokenId, bids: [], asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
+      dnBook = { assetId: window.downTokenId, bids: [], asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
     }
 
     if (!upBook || !dnBook) {
@@ -804,9 +826,11 @@ export class MergeArbExecutor {
 
     const budget = balance * this.config.equityPerWindow;
     const estimatedAvgPrice = 0.50;
-    // Budget covers MAX_PAIRS pairs (each pair = 2 orders × chunkSize × avgPrice)
+    // Budget needs to cover ~3 pairs before first merge recycles capital (Changelog §2).
+    // After merge, recycled capital funds further pairs. So divide by pairsBeforeMerge=3, not maxPairs=5.
+    const pairsBeforeMerge = 3;
     const chunkSize = Math.max(
-      Math.floor(budget / (this.config.maxPairs * 2 * estimatedAvgPrice)),
+      Math.floor(budget / (pairsBeforeMerge * 2 * estimatedAvgPrice)),
       20,
     );
 
