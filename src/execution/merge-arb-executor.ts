@@ -89,6 +89,9 @@ export class MergeArbExecutor {
       result.skipped = true;
       result.skipReason = preflight.reason;
       this.logger.info("Window skipped", { reason: preflight.reason });
+      this.telegram.send(
+        `⏭️ Window skipped: ${preflight.reason}`,
+      );
       return result;
     }
 
@@ -138,6 +141,9 @@ export class MergeArbExecutor {
       const pairCheck = this.shouldBuyNextPair(window, chunkSize, pairCount);
       if (!pairCheck.buy) {
         this.logger.info("Stopping buy cycle", { reason: pairCheck.reason });
+        if (pairCount === 0) {
+          this.telegram.send(`⏭️ 0 pairs — pair gate: ${pairCheck.reason}`);
+        }
         break;
       }
 
@@ -693,29 +699,44 @@ export class MergeArbExecutor {
     }
 
     if (!upBook || !dnBook) {
-      return { pass: false, reason: "Orderbook not available" };
+      return { pass: false, reason: "No orderbook (WS not connected or no data yet)" };
     }
+
+    // --- ORDERBOOK SNAPSHOT LOG (top 5 asks each side) ---
+    const top5Up = (upBook.asks ?? []).slice(0, 5);
+    const top5Dn = (dnBook.asks ?? []).slice(0, 5);
+    const formatLevels = (levels: { price: number; size: number }[]) =>
+      levels.map(l => `${(l.price * 100).toFixed(1)}¢×${l.size}`).join(" | ");
+    this.logger.info("📊 Orderbook snapshot", {
+      upAsks: formatLevels(top5Up),
+      dnAsks: formatLevels(top5Dn),
+      upLevels: upBook.asks?.length ?? 0,
+      dnLevels: dnBook.asks?.length ?? 0,
+    });
+    this.telegram.send(
+      `📊 Book: Up[${formatLevels(top5Up.slice(0, 3))}] Dn[${formatLevels(top5Dn.slice(0, 3))}]`,
+    );
 
     const upLevels = upBook.asks?.length ?? 0;
     const dnLevels = dnBook.asks?.length ?? 0;
     if (upLevels < this.config.minBookLevels || dnLevels < this.config.minBookLevels) {
       return {
         pass: false,
-        reason: `Insufficient depth: Up=${upLevels}, Down=${dnLevels} (min=${this.config.minBookLevels})`,
+        reason: `Insufficient depth: Up=${upLevels} asks, Down=${dnLevels} asks (min=${this.config.minBookLevels})`,
       };
     }
 
     const bestUpAsk = upBook.bestAsk ?? (upBook.asks?.[0]?.price ?? null);
     const bestDnAsk = dnBook.bestAsk ?? (dnBook.asks?.[0]?.price ?? null);
     if (bestUpAsk === null || bestDnAsk === null) {
-      return { pass: false, reason: "No asks available" };
+      return { pass: false, reason: "No asks available on one or both sides" };
     }
 
     const combined = bestUpAsk + bestDnAsk;
     if (combined > this.config.maxCombinedEntry) {
       return {
         pass: false,
-        reason: `Combined too expensive: ${(combined * 100).toFixed(1)}¢ > ${(this.config.maxCombinedEntry * 100).toFixed(0)}¢`,
+        reason: `Combined entry ${(combined * 100).toFixed(1)}¢ > gate ${(this.config.maxCombinedEntry * 100).toFixed(0)}¢`,
       };
     }
 
@@ -876,9 +897,10 @@ export class MergeArbExecutor {
     // Budget needs to cover ~3 pairs before first merge recycles capital (Changelog §2).
     // After merge, recycled capital funds further pairs. So divide by pairsBeforeMerge=3, not maxPairs=5.
     const pairsBeforeMerge = 3;
-    const chunkSize = Math.max(
-      Math.floor(budget / (pairsBeforeMerge * 2 * estimatedAvgPrice)),
-      20,
+    const rawChunk = Math.floor(budget / (pairsBeforeMerge * 2 * estimatedAvgPrice));
+    const chunkSize = Math.min(
+      Math.max(rawChunk, 20),
+      this.config.maxChunkSize,
     );
 
     this.sessionChunkSize = chunkSize;
@@ -886,7 +908,9 @@ export class MergeArbExecutor {
     this.logger.info("Session chunk size calculated", {
       date: today,
       balance: `$${balance.toFixed(2)}`,
+      rawChunk,
       chunkSize,
+      capped: rawChunk > this.config.maxChunkSize,
     });
 
     return chunkSize;

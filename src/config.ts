@@ -131,6 +131,8 @@ export interface Config {
   maxTradesPerWindow: number;
   /** Merge immediately when shares are balanced */
   autoMerge: boolean;
+  /** Hard cap on shares per order (orderbooks are thin on 5-min markets) */
+  maxChunkSize: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -328,6 +330,7 @@ export const loadConfig = (): Config => {
   const maxRetriesPerOrder = parseNumber("MAX_RETRIES_PER_ORDER", 1);
   const maxTradesPerWindow = parseNumber("MAX_TRADES_PER_WINDOW", 12);
   const autoMerge = parseBoolean("AUTO_MERGE", true);
+  const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 150);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -410,6 +413,7 @@ export const loadConfig = (): Config => {
     maxRetriesPerOrder,
     maxTradesPerWindow,
     autoMerge,
+    maxChunkSize,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,
