@@ -318,7 +318,7 @@ export const loadConfig = (): Config => {
   const mergeEntryDelayMs = parseNumber("MERGE_ENTRY_DELAY_MS", 5000);
   const orderIntervalMs = parseNumber("ORDER_INTERVAL_MS", 2000);
   const slippageBuffer = parseNumber("SLIPPAGE_BUFFER", 0.02);
-  const orderTimeoutMs = parseNumber("ORDER_TIMEOUT_MS", 5000);
+  const orderTimeoutMs = parseNumber("ORDER_TIMEOUT_MS", 3000);
   const skipIfBestCombinedGt = parseNumber("SKIP_IF_BEST_COMBINED_GT", 1.10);
   const minBookLevels = parseNumber("MIN_BOOK_LEVELS", 3);
   const maxRetriesPerOrder = parseNumber("MAX_RETRIES_PER_ORDER", 1);

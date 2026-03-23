@@ -397,7 +397,7 @@ const CONFIG = {
   PRIMARY_ORDER_TYPE: 'GTC',       // GTC mit aggressivem Preis
   FALLBACK_ORDER_TYPE: 'FOK',      // FOK als Alternative
   SLIPPAGE_BUFFER: 0.02,           // +2¢ über Ask
-  ORDER_TIMEOUT_MS: 5000,          // Cancel nach 5s wenn nicht gefüllt
+  ORDER_TIMEOUT_MS: 3000,          // Cancel nach 3s wenn nicht gefüllt (Tempo > perfekte Fills)
   
   // === SAFETY NETS (sehr locker) ===
   MAX_ORDERS_PER_WINDOW: 30,       // Hard stop (Stargate5 macht 10-25)
@@ -653,3 +653,46 @@ SZENARIO: Bot crash / restart
 ║ CRITICAL: Discover market BEFORE window opens!    ║
 ╚══════════════════════════════════════════════════╝
 ```
+
+---
+
+## 16. Amendments (23. März 2026)
+
+### 16.1 ORDER_TIMEOUT: 3s statt 5s
+
+Wenn ein GTC-Order nach **3 Sekunden** nicht gefüllt ist → Cancel → nächste Order sofort.
+Tempo ist wichtiger als perfekte Fills. Nicht retrien auf dem gleichen Level — der Preis
+hat sich bewegt, nächster Order ist bei neuem Best Ask.
+
+### 16.2 Competition & Market Maker Replenishment
+
+Das Orderbuch wird von Market Makern **kontinuierlich nachgefüllt**. Wir müssen nicht
+der Erste sein (Stargate5 und andere Bots fressen die 7¢-Levels), nur **schnell genug**
+(<10s Entry). Selbst wenn die billigsten Levels weg sind:
+- 15-25¢ Levels sind immer noch profitabel (Combined ~90-95¢)
+- Market Maker stellen nach Sekunden neue Orders rein
+- Je mehr Preise wir über das Window samplen, desto besser der Durchschnitt
+
+### 16.3 Mid-Merge Recycling: Präzise Trigger
+
+Mid-Merge ist die **Ausnahme**, nicht die Regel:
+```
+IF budget_remaining < chunk_size * 2   // Budget reicht nicht für nächstes Paar
+   AND matched > merge_min_size         // Genug Shares zum Mergen
+   AND time_remaining > 30s             // Genug Zeit um weiterzukaufen
+THEN:
+   merge(matched)
+   budget += matched  // $1/share zurück
+   → weiter kaufen mit recyceltem Kapital
+ELSE:
+   → weiter kaufen (Merge am Ende)
+```
+
+**Wenn Budget noch da ist → NICHT mergen, weiterkaufen.** Merge am Ende bleibt der Normalfall.
+
+### 16.4 BTC-Preisoszillation
+
+Schon **0.1% BTC-Bewegung** reicht damit Up von 40¢ auf 60¢ springt und Down von 60¢
+auf 40¢ fällt. Das passiert innerhalb von 5 Minuten **ständig**. Nur bei absolut flachem
+BTC (selten) bleibt es bei 50/50 = 100¢. Die Strategie profitiert von Volatilität —
+und BTC 5-min Markets sind ultra-volatil.
