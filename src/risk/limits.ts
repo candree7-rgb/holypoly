@@ -103,46 +103,51 @@ export class RiskManager {
       return noTrade(`Balance $${balance.toFixed(2)} below floor $${this.config.minBalanceFloorUsd}`);
     }
 
-    // Check pause (from losing streak)
-    const pauseUntil = await this.db.getPauseUntil();
-    if (pauseUntil > Date.now()) {
-      const remaining = Math.ceil((pauseUntil - Date.now()) / 60000);
-      return noTrade(`Paused for ${remaining} more minutes (losing streak)`);
-    }
-    // Pause served → reset streak so bot can trade normally again
-    if (pauseUntil > 0) {
-      this.logger.info("Losing streak pause served, resetting streak counter");
-      await this.db.setLosingStreak(0);
-      await this.db.setPauseUntil(0);
-    }
-
-    // Daily loss limit (%-based)
-    const today = dayKeyUtc();
-    const daily = await this.db.ensureDailySnapshot(today, balance);
-    const dailyLossLimit = daily.startingBalance * (this.config.dailyLossLimitPct / 100);
-    if (daily.totalPnl <= -dailyLossLimit) {
-      return noTrade(
-        `Daily loss limit: $${daily.totalPnl.toFixed(2)} <= -$${dailyLossLimit.toFixed(2)} (${this.config.dailyLossLimitPct}% of $${daily.startingBalance.toFixed(2)})`
-      );
+    // Check pause (from losing streak) — skip in DRY_RUN
+    if (!this.config.dryRun) {
+      const pauseUntil = await this.db.getPauseUntil();
+      if (pauseUntil > Date.now()) {
+        const remaining = Math.ceil((pauseUntil - Date.now()) / 60000);
+        return noTrade(`Paused for ${remaining} more minutes (losing streak)`);
+      }
+      // Pause served → reset streak so bot can trade normally again
+      if (pauseUntil > 0) {
+        this.logger.info("Losing streak pause served, resetting streak counter");
+        await this.db.setLosingStreak(0);
+        await this.db.setPauseUntil(0);
+      }
     }
 
-    // Weekly loss limit (%-based)
-    const week = weekKeyUtc();
-    const weekly = await this.db.ensureWeeklySnapshot(week, balance);
-    const weeklyLossLimit = weekly.startingBalance * (this.config.weeklyLossLimitPct / 100);
-    if (weekly.totalPnl <= -weeklyLossLimit) {
-      return noTrade(
-        `Weekly loss limit: $${weekly.totalPnl.toFixed(2)} <= -$${weeklyLossLimit.toFixed(2)} (${this.config.weeklyLossLimitPct}%)`
-      );
+    // Daily/weekly loss limits — skip in DRY_RUN (simulated P&L shouldn't block)
+    if (!this.config.dryRun) {
+      const today = dayKeyUtc();
+      const daily = await this.db.ensureDailySnapshot(today, balance);
+      const dailyLossLimit = daily.startingBalance * (this.config.dailyLossLimitPct / 100);
+      if (daily.totalPnl <= -dailyLossLimit) {
+        return noTrade(
+          `Daily loss limit: $${daily.totalPnl.toFixed(2)} <= -$${dailyLossLimit.toFixed(2)} (${this.config.dailyLossLimitPct}% of $${daily.startingBalance.toFixed(2)})`
+        );
+      }
+
+      const week = weekKeyUtc();
+      const weekly = await this.db.ensureWeeklySnapshot(week, balance);
+      const weeklyLossLimit = weekly.startingBalance * (this.config.weeklyLossLimitPct / 100);
+      if (weekly.totalPnl <= -weeklyLossLimit) {
+        return noTrade(
+          `Weekly loss limit: $${weekly.totalPnl.toFixed(2)} <= -$${weeklyLossLimit.toFixed(2)} (${this.config.weeklyLossLimitPct}%)`
+        );
+      }
     }
 
-    // Losing streak
-    const losingStreak = await this.db.getLosingStreak();
-    if (losingStreak >= this.config.losingStreakPause) {
-      const pauseMinutes = losingStreak >= 10 ? 120 : 30;
-      await this.db.setPauseUntil(Date.now() + pauseMinutes * 60 * 1000);
-      this.logger.warn("Losing streak pause triggered", { streak: losingStreak, pauseMinutes });
-      return noTrade(`Losing streak (${losingStreak} consecutive) — pausing ${pauseMinutes} min`);
+    // Losing streak — skip in DRY_RUN (simulated losses shouldn't pause the bot)
+    if (!this.config.dryRun) {
+      const losingStreak = await this.db.getLosingStreak();
+      if (losingStreak >= this.config.losingStreakPause) {
+        const pauseMinutes = losingStreak >= 10 ? 120 : 30;
+        await this.db.setPauseUntil(Date.now() + pauseMinutes * 60 * 1000);
+        this.logger.warn("Losing streak pause triggered", { streak: losingStreak, pauseMinutes });
+        return noTrade(`Losing streak (${losingStreak} consecutive) — pausing ${pauseMinutes} min`);
+      }
     }
 
     return {
