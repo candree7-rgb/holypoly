@@ -99,8 +99,38 @@ export interface Config {
   telegramChatId?: string;
 
   // Strategy mode
-  /** "edge" = original edge-detection strategy, "webhook" = TradingView webhook signals */
-  strategyMode: "edge" | "webhook";
+  /** "merge-arb" = Stargate5-style merge arb, "edge" = edge-detection, "webhook" = TradingView signals */
+  strategyMode: "merge-arb" | "edge" | "webhook";
+
+  // Merge-Arb Strategy parameters (merge-arb mode)
+  /** Fraction of balance to allocate per window (e.g. 0.20 = 20%) */
+  equityPerWindow: number;
+  /** Maximum number of Up+Down pairs per window */
+  maxPairs: number;
+  /** Minimum matched shares before triggering merge */
+  mergeMinSize: number;
+  /** Milliseconds to wait after window opens before first order */
+  mergeEntryDelayMs: number;
+  /** Milliseconds between orders within a pair cycle */
+  orderIntervalMs: number;
+  /** Extra cents above best ask for FOK price (e.g. 0.02 = +2¢) */
+  slippageBuffer: number;
+  /** Milliseconds to wait for FOK fill confirmation */
+  orderTimeoutMs: number;
+  /** Max combined ask (Up+Down) to enter a window (e.g. 1.05 = 105¢) */
+  maxCombinedEntry: number;
+  /** Max combined ask per pair to continue buying (e.g. 1.03 = 103¢) */
+  maxCombinedPair: number;
+  /** Minimum orderbook levels on each side to proceed */
+  minBookLevels: number;
+  /** Max acceptable share imbalance before rebalancing */
+  maxImbalanceShares: number;
+  /** Number of retries per failed order */
+  maxRetriesPerOrder: number;
+  /** Hard limit on total trades per window (pairs + retries) */
+  maxTradesPerWindow: number;
+  /** Merge immediately when shares are balanced */
+  autoMerge: boolean;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -278,8 +308,26 @@ export const loadConfig = (): Config => {
   const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
 
   // Strategy mode
-  const strategyModeRaw = getEnv("STRATEGY_MODE") ?? "edge";
-  const strategyMode = strategyModeRaw === "webhook" ? "webhook" : "edge" as const;
+  const strategyModeRaw = getEnv("STRATEGY_MODE") ?? "merge-arb";
+  const strategyMode = strategyModeRaw === "webhook" ? "webhook"
+    : strategyModeRaw === "edge" ? "edge"
+    : "merge-arb" as const;
+
+  // Merge-Arb Strategy parameters
+  const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.20);
+  const maxPairs = parseNumber("MAX_PAIRS", 5);
+  const mergeMinSize = parseNumber("MERGE_MIN_SIZE", 10);
+  const mergeEntryDelayMs = parseNumber("MERGE_ENTRY_DELAY_MS", 3000);
+  const orderIntervalMs = parseNumber("ORDER_INTERVAL_MS", 2000);
+  const slippageBuffer = parseNumber("SLIPPAGE_BUFFER", 0.02);
+  const orderTimeoutMs = parseNumber("ORDER_TIMEOUT_MS", 5000);
+  const maxCombinedEntry = parseNumber("MAX_COMBINED_ENTRY", 1.05);
+  const maxCombinedPair = parseNumber("MAX_COMBINED_PAIR", 1.03);
+  const minBookLevels = parseNumber("MIN_BOOK_LEVELS", 3);
+  const maxImbalanceShares = parseNumber("MAX_IMBALANCE_SHARES", 5);
+  const maxRetriesPerOrder = parseNumber("MAX_RETRIES_PER_ORDER", 1);
+  const maxTradesPerWindow = parseNumber("MAX_TRADES_PER_WINDOW", 12);
+  const autoMerge = parseBoolean("AUTO_MERGE", true);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -348,6 +396,20 @@ export const loadConfig = (): Config => {
     telegramBotToken,
     telegramChatId,
     strategyMode,
+    equityPerWindow,
+    maxPairs,
+    mergeMinSize,
+    mergeEntryDelayMs,
+    orderIntervalMs,
+    slippageBuffer,
+    orderTimeoutMs,
+    maxCombinedEntry,
+    maxCombinedPair,
+    minBookLevels,
+    maxImbalanceShares,
+    maxRetriesPerOrder,
+    maxTradesPerWindow,
+    autoMerge,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,

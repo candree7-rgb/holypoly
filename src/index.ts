@@ -19,6 +19,7 @@ import { ArbManager } from "./execution/arb-manager.js";
 import { ArbCompletionMonitor } from "./execution/arb-completion.js";
 import { WindowManager } from "./execution/window-manager.js";
 import { SignalExecutor } from "./execution/signal-executor.js";
+import { MergeArbExecutor } from "./execution/merge-arb-executor.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
 import { createWebhookServer } from "./webhook.js";
@@ -818,6 +819,128 @@ const main = async () => {
     }
   };
 
+  // === MERGE-ARB STRATEGY LOOP ===
+  const mergeArbLoop = async () => {
+    const mergeArbExecutor = new MergeArbExecutor(
+      clob,
+      clobWs,
+      redeemService,
+      config,
+      logger,
+      telegram,
+    );
+
+    logger.info("=== Merge-Arb Strategy Active ===", {
+      equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
+      maxPairs: config.maxPairs,
+      mergeMinSize: config.mergeMinSize,
+      entryDelay: `${config.mergeEntryDelayMs}ms`,
+      orderInterval: `${config.orderIntervalMs}ms`,
+      slippage: `+${(config.slippageBuffer * 100).toFixed(0)}¢`,
+      maxCombinedEntry: `${(config.maxCombinedEntry * 100).toFixed(0)}¢`,
+      maxCombinedPair: `${(config.maxCombinedPair * 100).toFixed(0)}¢`,
+      takerFee: `${config.takerFeeRate * 100}%`,
+      dryRun: config.dryRun,
+    });
+
+    while (true) {
+      try {
+        // --- DISCOVER NEXT WINDOW ---
+        const balance = await riskManager.getBalance();
+        const riskCheck = await riskManager.check();
+        if (!riskCheck.allowed) {
+          logger.warn("Risk blocked", { reason: riskCheck.reason });
+          await sleep(5000);
+          continue;
+        }
+
+        const window = await discovery.findActive5MinBtcMarket();
+        if (!window) {
+          await sleep(5000);
+          continue;
+        }
+
+        // --- WAIT FOR WINDOW OPEN + ENTRY DELAY ---
+        const now = Date.now();
+        const windowStart = window.startTime;
+        const entryTime = windowStart + config.mergeEntryDelayMs;
+
+        if (now < entryTime) {
+          // Subscribe to WS before window opens (get orderbook ready)
+          clobWs.subscribe([window.upTokenId, window.downTokenId]);
+          const waitMs = entryTime - now;
+          if (waitMs > 60_000) {
+            // Too early, keep polling
+            await sleep(5000);
+            continue;
+          }
+          logger.info("Waiting for entry time", {
+            window: new Date(windowStart).toISOString().slice(11, 19),
+            waitMs,
+          });
+          await sleep(waitMs);
+        }
+
+        // Don't enter if window is almost over (<30s remaining)
+        const timeRemaining = window.endTime - Date.now();
+        if (timeRemaining < 30_000) {
+          logger.debug("Window too close to end, waiting for next");
+          clobWs.clear();
+          await sleep(5000);
+          continue;
+        }
+
+        // --- SUBSCRIBE ORDERBOOK WS ---
+        clobWs.subscribe([window.upTokenId, window.downTokenId]);
+        // Brief wait for orderbook snapshot to arrive
+        await sleep(1000);
+
+        // --- EXECUTE ---
+        const result = await mergeArbExecutor.executeWindow(window, balance);
+
+        // --- RECORD TO DB ---
+        if (!result.skipped && result.pairs.length > 0) {
+          await db.recordWindow({
+            windowStart: result.windowStart,
+            conditionId: result.conditionId,
+            traded: true,
+            primarySide: null,
+            orders: result.pairs.map(p => ({
+              side: "Up" as const,
+              tokenId: window.upTokenId,
+              price: p.combinedCents,
+              amount: p.upCost + p.dnCost,
+            })),
+            fillCount: result.pairs.length * 2,
+            pnl: result.totalMergeProfit,
+            winner: null,
+            balanceBefore: balance,
+            balanceAfter: config.dryRun ? balance + result.totalMergeProfit : null,
+          });
+
+          // Update risk manager
+          if (result.totalMergeProfit !== 0) {
+            await riskManager.recordResult(result.totalMergeProfit);
+            riskManager.invalidateBalanceCache();
+          }
+        }
+
+        // --- CLEANUP ---
+        clobWs.clear();
+
+        // Wait for next window (remaining time + buffer)
+        const sleepUntilNext = Math.max(0, window.endTime - Date.now()) + 2000;
+        if (sleepUntilNext > 0 && sleepUntilNext < 600_000) {
+          await sleep(sleepUntilNext);
+        }
+      } catch (err) {
+        logger.error("Merge-arb loop error", { error: (err as Error).message });
+        telegram.alertError((err as Error).message);
+        await sleep(5000);
+      }
+    }
+  };
+
   // === REDEEM LOOP ===
   const redeemLoop = async () => {
     if (!redeemService) return;
@@ -861,9 +984,11 @@ const main = async () => {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
-  const strategyLoop = config.strategyMode === "webhook"
-    ? webhookSignalLoop
-    : hybridLoop;
+  const strategyLoop = config.strategyMode === "merge-arb"
+    ? mergeArbLoop
+    : config.strategyMode === "webhook"
+      ? webhookSignalLoop
+      : hybridLoop;
 
   logger.info("Strategy mode", { mode: config.strategyMode });
   await Promise.all([strategyLoop(), redeemLoop()]);

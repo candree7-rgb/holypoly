@@ -1,36 +1,57 @@
 # HolyPoly
 
-Polymarket trading bot for BTC/ETH 5-minute Up/Down binary markets.
+Polymarket merge-arb trading bot for BTC 5-minute Up/Down binary markets.
 
-## Current Strategy: Webhook Mode (`STRATEGY_MODE=webhook`)
+## Strategy: Merge-Arb (`STRATEGY_MODE=merge-arb`)
 
-**NOT using the old arb/edge-detection strategy anymore.**
+Stargate5-style richtungsneutrale Arbitrage:
+1. Bot kauft **beide Seiten** (Up UND Down) alternierend mit FOK Orders
+2. Sobald Shares balanced → **Merge** zu $1/Share (sofortiger Profit wenn Combined < $1)
+3. Recyceltes Kapital wird für weitere Paare verwendet
+4. MAX_PAIRS = 5 ist der Hauptfilter (erste Fills = profitabelste)
+5. Nach Resolution: Redeem übrige Imbalance
 
-The active strategy is signal-based directional trading:
-1. TradingView webhook sends UP/DOWN signal for BTC or ETH
-2. Bot targets the CURRENT 5-min window if >60s remaining, otherwise NEXT
-3. Places GTC limit ladder at 49-51¢ (maker = 0% fee)
-4. Monitors fills for ~4 minutes
-5. FOK fallback at 52¢ for unfilled remainder at T+4:00
-6. Holds naked position until settlement — no hedge/arb completion
-
-This is similar to trader "beboule" on Polymarket who also buys at 50-51¢ based on directional signals.
+### Kern-Edge
+Die Polymarket CLOB-Orderbücher für 5-min-BTC-Märkte haben eine strukturelle Ineffizienz:
+Die Summe der Ask-Preise (Up + Down) liegt im Durchschnitt unter $1.00. Die ersten
+Fills sweepen die billigsten Levels wo Combined oft 85-95¢ ist.
 
 ### Key Parameters
-- Ladder: 49¢ (25%), 50¢ (40%), 51¢ (35%)
-- Fallback: 52¢ FOK after 4 min
-- Size: 4% of balance per signal
-- Maker fee: 0%, Taker fee: 2%
-- Entry at ~50¢ → Win = +48-50¢/share, Loss = -50-52¢/share
+- EQUITY_PER_WINDOW: 20% (Start), bis 80% nach Validierung
+- MAX_PAIRS: 5 (hard stop, DER Filter)
+- MERGE_MIN_SIZE: 10 shares
+- ENTRY_DELAY: 3s nach Window-Open
+- ORDER_INTERVAL: 2s zwischen Orders
+- SLIPPAGE_BUFFER: +2¢ über Best Ask
+- MAX_COMBINED_ENTRY: 105¢ (Window-Gate, selten)
+- MAX_COMBINED_PAIR: 103¢ (Pair-Gate, selten)
+- Taker Fee: 2% (alle Orders sind FOK/Taker)
 
 ### Architecture
-- `src/webhook.ts` — Express server receiving TradingView alerts
-- `src/execution/signal-executor.ts` — GTC ladder + FOK fallback logic
-- `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, connects only when tokens subscribed)
+- `src/execution/merge-arb-executor.ts` — Core strategy: FOK buy cycle + dynamic merge
+- `src/execution/dry-run-engine.ts` — Realistic orderbook-based fill simulation
+- `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, PING/PONG every 5s)
+- `src/data/clob.ts` — CLOB REST API (orders, fills, balance)
+- `src/data/redeem.ts` — CTF merge + redeem via relayer
+- `src/data/gamma.ts` — Market discovery (slug-based)
 - `src/config.ts` — All configuration parameters
+- `src/index.ts` — Main loop (merge-arb / edge / webhook modes)
+
+### DRY_RUN Mode
+`DRY_RUN=true` (default) runs the **identical strategy code** but:
+- CLOB WebSocket connects normally (no auth needed) → real orderbook data
+- FOK fills are simulated against live ask depth (DryRunEngine)
+- Consumed liquidity is tracked (subsequent orders see less depth)
+- Merges are simulated with correct P&L math
+- Taker fees (2%) applied to all simulated fills
+- Virtual balance, positions, and P&L tracked throughout
 
 ### WebSocket Notes
-- Polymarket CLOB WS requires subscription message immediately after connect, otherwise server disconnects after ~10s
-- CLOB WS only connects when `subscribe()` is called with tokens (not on `start()`)
-- Market/User channels: client sends `PING` every 5s, server responds `PONG`
-- Sports channels: server sends `ping`, client must respond `pong` within 10s
+- Polymarket CLOB WS requires subscription message immediately after connect
+- CLOB WS only connects when `subscribe()` is called with tokens
+- Market channel: client sends `PING` every 5s, server responds `PONG`
+- No auth required for market channel (orderbook data)
+
+### Specs
+- `HOLYPOLY_STRATEGY_SPEC.md` — Full strategy specification (Stargate5 analysis)
+- `HOLYPOLY_CHANGELOG.md` — Additions & updates (takes precedence on conflicts)

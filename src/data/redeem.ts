@@ -41,9 +41,50 @@ const nrAdapterRedeemAbi = [
   },
 ] as const;
 
+const ctfMergeAbi = [
+  {
+    constant: false,
+    inputs: [
+      { name: "collateralToken", type: "address" },
+      { name: "parentCollectionId", type: "bytes32" },
+      { name: "conditionId", type: "bytes32" },
+      { name: "partition", type: "uint256[]" },
+      { name: "amount", type: "uint256" },
+    ],
+    name: "mergePositions",
+    outputs: [],
+    payable: false,
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+] as const;
+
+const nrAdapterMergeAbi = [
+  {
+    inputs: [
+      { internalType: "bytes32", name: "_conditionId", type: "bytes32" },
+      { internalType: "uint256", name: "_amount", type: "uint256" },
+    ],
+    name: "mergePositions",
+    outputs: [],
+    stateMutability: "nonpayable",
+    type: "function",
+  },
+] as const;
+
 const ctfRedeemFn = prepareEncodeFunctionData({
   abi: ctfRedeemAbi,
   functionName: "redeemPositions",
+});
+
+const ctfMergeFn = prepareEncodeFunctionData({
+  abi: ctfMergeAbi,
+  functionName: "mergePositions",
+});
+
+const nrMergeFn = prepareEncodeFunctionData({
+  abi: nrAdapterMergeAbi,
+  functionName: "mergePositions",
 });
 
 const nrRedeemFn = prepareEncodeFunctionData({
@@ -149,6 +190,39 @@ export class RedeemService {
       }
     }
     return txHashes;
+  }
+
+  /**
+   * Merge equal amounts of Up+Down shares back into USDC collateral.
+   * Burns `amount` shares from each outcome → returns `amount` × $1.00 USDC.
+   */
+  async mergePositions(conditionId: string, amount: number, negRisk: boolean): Promise<string | null> {
+    const amountBase = toBaseUnits(amount, 6);
+    const tx = negRisk
+      ? this.createNegRiskMerge(conditionId, amountBase)
+      : this.createCtfMerge(conditionId, amountBase);
+
+    const txHash = await this.execute(tx, "merge positions");
+    if (txHash) {
+      this.logger.info("Merge executed", { conditionId, amount, txHash });
+    }
+    return txHash;
+  }
+
+  private createCtfMerge(conditionId: string, amount: bigint): Transaction {
+    const calldata = encodeFunctionData({
+      ...ctfMergeFn,
+      args: [USDC_ADDRESS as Hex, zeroHash, conditionId as Hex, [1n, 2n], amount],
+    });
+    return { to: CTF_ADDRESS, data: calldata, value: "0" };
+  }
+
+  private createNegRiskMerge(conditionId: string, amount: bigint): Transaction {
+    const calldata = encodeFunctionData({
+      ...nrMergeFn,
+      args: [conditionId as Hex, amount],
+    });
+    return { to: NEG_RISK_ADAPTER, data: calldata, value: "0" };
   }
 
   private buildNegRiskAmounts(group: Position[]): bigint[] {
