@@ -2,7 +2,7 @@ import { Side, OrderType } from "@polymarket/clob-client";
 import type { Logger } from "../logger.js";
 import type { TelegramNotifier } from "../telegram.js";
 import type { ClobService } from "../data/clob.js";
-import type { ClobWsClient } from "../data/clob-ws.js";
+import type { ClobWsClient, BookSnapshot } from "../data/clob-ws.js";
 import type { RedeemService } from "../data/redeem.js";
 import type { Config } from "../config.js";
 import type {
@@ -10,6 +10,7 @@ import type {
   PairResult,
   MergeResult,
   WindowExecutionResult,
+  TradeSide,
 } from "../types.js";
 import { DryRunEngine } from "./dry-run-engine.js";
 import { sleep } from "../utils.js";
@@ -17,15 +18,23 @@ import { sleep } from "../utils.js";
 /**
  * MergeArbExecutor: Stargate5-style merge arbitrage.
  *
- * Flow per 5-min window:
+ * Flow per 5-min window (from HOLYPOLY_STRATEGY_SPEC.md):
  * 1. Pre-flight: orderbook depth + combined cost check
- * 2. Calculate chunk_size from balance × EQUITY_PER_WINDOW
- * 3. Alternating FOK Buy Up → FOK Buy Down (max MAX_PAIRS pairs)
- * 4. Dynamic merge when shares balanced (recycle capital)
- * 5. Final merge + schedule cleanup for post-resolution
+ * 2. Determine which side is more expensive → buy that first (Spec 2.4)
+ * 3. Alternating FOK buys, Down size matched to actual Up fill (Spec 9.5)
+ * 4. FOK preferred, GTC fallback if FOK fails >2x (Changelog §1)
+ * 5. Dynamic merge when shares balanced (Spec 3.2)
+ * 6. Imbalance rebalancing: buy short side if gap > MAX_IMBALANCE (Spec 9.5)
+ * 7. Final merge + remaining imbalance tracked for cleanup
  */
 export class MergeArbExecutor {
   private dryRunEngine: DryRunEngine | null = null;
+  /** Session-level chunk size (calculated once per session/day, not per window) */
+  private sessionChunkSize: number | null = null;
+  private sessionChunkDate: string | null = null;
+  /** Track consecutive FOK failures to trigger GTC fallback */
+  private consecutiveFokFailures = 0;
+  private readonly FOK_FAILURE_THRESHOLD = 2;
 
   constructor(
     private clob: ClobService,
@@ -34,13 +43,10 @@ export class MergeArbExecutor {
     private config: Config,
     private logger: Logger,
     private telegram: TelegramNotifier,
-  ) {
-    // DryRunEngine is initialized per-window with current balance
-  }
+  ) {}
 
   /**
    * Execute the merge-arb strategy for one 5-minute window.
-   * This is the main entry point called by the main loop.
    */
   async executeWindow(window: WindowInfo, balance: number): Promise<WindowExecutionResult> {
     const result: WindowExecutionResult = {
@@ -74,6 +80,9 @@ export class MergeArbExecutor {
       );
     }
 
+    // Reset FOK failure counter per window
+    this.consecutiveFokFailures = 0;
+
     // --- PRE-FLIGHT CHECK ---
     const preflight = await this.preFlightCheck(window);
     if (!preflight.pass) {
@@ -83,14 +92,10 @@ export class MergeArbExecutor {
       return result;
     }
 
-    // --- CALCULATE CHUNK SIZE ---
-    const budget = balance * this.config.equityPerWindow;
-    const estimatedAvgPrice = 0.50;
-    const chunkSize = Math.max(
-      Math.floor(budget / (this.config.maxPairs * 2 * estimatedAvgPrice)),
-      20, // minimum 20 shares
-    );
+    // --- CALCULATE CHUNK SIZE (session-level, Spec 2.5) ---
+    const chunkSize = this.getSessionChunkSize(balance);
 
+    const budget = balance * this.config.equityPerWindow;
     this.logger.info("Starting merge-arb execution", {
       window: new Date(window.startTime).toISOString(),
       balance: `$${balance.toFixed(2)}`,
@@ -121,7 +126,7 @@ export class MergeArbExecutor {
     while (
       pairCount < this.config.maxPairs &&
       tradeCount < this.config.maxTradesPerWindow &&
-      availableBudget > chunkSize * estimatedAvgPrice
+      availableBudget > chunkSize * 0.30 // conservative: even a 30¢ share costs budget
     ) {
       const timeRemaining = window.endTime - Date.now();
       if (timeRemaining < 30_000) {
@@ -136,142 +141,199 @@ export class MergeArbExecutor {
         break;
       }
 
-      // --- BUY UP ---
-      const upFill = await this.buyFok(
-        window.upTokenId,
+      // --- DETERMINE ORDER: expensive side first (Spec 2.4) ---
+      const upAsk = pairCheck.upPrice ?? 0.50;
+      const dnAsk = pairCheck.dnPrice ?? 0.50;
+      const firstSide: TradeSide = upAsk >= dnAsk ? "Up" : "Down";
+      const secondSide: TradeSide = firstSide === "Up" ? "Down" : "Up";
+      const firstTokenId = firstSide === "Up" ? window.upTokenId : window.downTokenId;
+      const secondTokenId = secondSide === "Up" ? window.upTokenId : window.downTokenId;
+      const firstAsk = firstSide === "Up" ? upAsk : dnAsk;
+      const secondAsk = secondSide === "Up" ? upAsk : dnAsk;
+
+      // --- BUY FIRST SIDE (expensive) ---
+      const firstFill = await this.buyWithFallback(
+        firstTokenId,
         chunkSize,
-        (pairCheck.upPrice ?? 0.50) + this.config.slippageBuffer,
-        "Up",
+        firstAsk + this.config.slippageBuffer,
+        firstSide,
       );
       tradeCount++;
 
-      if (!upFill.filled) {
-        this.logger.warn("Up FOK failed, skipping pair");
-        if (this.config.maxRetriesPerOrder > 0) {
-          await sleep(500);
-          const retry = await this.buyFok(
-            window.upTokenId,
-            chunkSize,
-            (pairCheck.upPrice ?? 0.50) + this.config.slippageBuffer * 2,
-            "Up",
-          );
-          tradeCount++;
-          if (!retry.filled) {
-            this.logger.warn("Up retry also failed, aborting");
-            break;
-          }
-          filledUpShares += retry.filledSize;
-          totalUpCost += retry.totalCost;
-          availableBudget -= retry.totalCost;
-        } else {
-          continue;
+      if (!firstFill.filled) {
+        this.logger.warn(`${firstSide} buy failed after retries`);
+        // >2 consecutive failures → abort window (Spec 9.11)
+        if (this.consecutiveFokFailures > 2) {
+          this.logger.warn("Too many consecutive failures, aborting window");
+          break;
         }
+        continue;
+      }
+      this.consecutiveFokFailures = 0;
+
+      if (firstSide === "Up") {
+        filledUpShares += firstFill.filledSize;
+        totalUpCost += firstFill.totalCost;
       } else {
-        filledUpShares += upFill.filledSize;
-        totalUpCost += upFill.totalCost;
-        availableBudget -= upFill.totalCost;
+        filledDnShares += firstFill.filledSize;
+        totalDnCost += firstFill.totalCost;
+      }
+      availableBudget -= firstFill.totalCost;
+
+      // --- BUY SECOND SIDE (matched to actual first fill, Spec 9.5) ---
+      const secondTargetSize = firstFill.filledSize;
+      const secondFill = await this.buyWithFallback(
+        secondTokenId,
+        secondTargetSize,
+        secondAsk + this.config.slippageBuffer,
+        secondSide,
+      );
+      tradeCount++;
+
+      if (secondFill.filled) {
+        if (secondSide === "Up") {
+          filledUpShares += secondFill.filledSize;
+          totalUpCost += secondFill.totalCost;
+        } else {
+          filledDnShares += secondFill.filledSize;
+          totalDnCost += secondFill.totalCost;
+        }
+        availableBudget -= secondFill.totalCost;
+      } else {
+        this.logger.warn(`${secondSide} buy failed — naked ${firstSide} exposure`, {
+          naked: firstFill.filledSize.toFixed(1),
+        });
       }
 
-      const actualUpFilled = upFill.filled ? upFill.filledSize : chunkSize;
+      // --- IMBALANCE REBALANCING (Spec 9.5) ---
+      const imbalance = Math.abs(filledUpShares - filledDnShares);
+      if (imbalance > this.config.maxImbalanceShares && secondFill.filled) {
+        const shortSide: TradeSide = filledUpShares > filledDnShares ? "Down" : "Up";
+        const shortTokenId = shortSide === "Up" ? window.upTokenId : window.downTokenId;
+        const shortAsk = shortSide === "Up" ? upAsk : dnAsk;
+        this.logger.info("Rebalancing imbalance", { shortSide, imbalance: imbalance.toFixed(1) });
 
-      // --- BUY DOWN (matched to actual Up fill) ---
-      const dnTargetSize = actualUpFilled;
-      const dnFill = await this.buyFok(
-        window.downTokenId,
-        dnTargetSize,
-        (pairCheck.dnPrice ?? 0.50) + this.config.slippageBuffer,
-        "Down",
-      );
-      tradeCount++;
+        const rebalanceFill = await this.buyWithFallback(
+          shortTokenId,
+          imbalance,
+          shortAsk + this.config.slippageBuffer,
+          shortSide,
+        );
+        tradeCount++;
 
-      if (!dnFill.filled) {
-        this.logger.warn("Down FOK failed", { nakedUp: actualUpFilled });
-        // Retry once
-        if (this.config.maxRetriesPerOrder > 0) {
-          await sleep(500);
-          const retry = await this.buyFok(
-            window.downTokenId,
-            dnTargetSize,
-            (pairCheck.dnPrice ?? 0.50) + this.config.slippageBuffer * 2,
-            "Down",
-          );
-          tradeCount++;
-          if (retry.filled) {
-            filledDnShares += retry.filledSize;
-            totalDnCost += retry.totalCost;
-            availableBudget -= retry.totalCost;
+        if (rebalanceFill.filled) {
+          if (shortSide === "Up") {
+            filledUpShares += rebalanceFill.filledSize;
+            totalUpCost += rebalanceFill.totalCost;
           } else {
-            this.logger.warn("Down retry also failed, naked Up exposure");
-            // Accept imbalance, continue
+            filledDnShares += rebalanceFill.filledSize;
+            totalDnCost += rebalanceFill.totalCost;
           }
+          availableBudget -= rebalanceFill.totalCost;
         }
-      } else {
-        filledDnShares += dnFill.filledSize;
-        totalDnCost += dnFill.totalCost;
-        availableBudget -= dnFill.totalCost;
       }
 
       // --- RECORD PAIR ---
-      const upPrice = upFill.filled ? upFill.avgPrice : 0;
-      const dnPrice = dnFill.filled ? dnFill.avgPrice : 0;
       const pair: PairResult = {
         pairNum: pairCount,
-        upFilled: upFill.filled ? upFill.filledSize : 0,
-        upCost: upFill.filled ? upFill.totalCost : 0,
-        upPrice,
-        dnFilled: dnFill.filled ? dnFill.filledSize : 0,
-        dnCost: dnFill.filled ? dnFill.totalCost : 0,
-        dnPrice,
-        combinedCents: (upPrice + dnPrice) * 100,
-        imbalance: Math.abs(
-          (upFill.filled ? upFill.filledSize : 0) -
-          (dnFill.filled ? dnFill.filledSize : 0),
-        ),
+        upFilled: firstSide === "Up" ? firstFill.filledSize : (secondFill.filled ? secondFill.filledSize : 0),
+        upCost: firstSide === "Up" ? firstFill.totalCost : (secondFill.filled ? secondFill.totalCost : 0),
+        upPrice: firstSide === "Up" ? firstFill.avgPrice : (secondFill.filled ? secondFill.avgPrice : 0),
+        dnFilled: firstSide === "Down" ? firstFill.filledSize : (secondFill.filled ? secondFill.filledSize : 0),
+        dnCost: firstSide === "Down" ? firstFill.totalCost : (secondFill.filled ? secondFill.totalCost : 0),
+        dnPrice: firstSide === "Down" ? firstFill.avgPrice : (secondFill.filled ? secondFill.avgPrice : 0),
+        combinedCents: 0,
+        imbalance: Math.abs(filledUpShares - filledDnShares),
       };
+      pair.combinedCents = (pair.upPrice + pair.dnPrice) * 100;
       pairs.push(pair);
       pairCount++;
 
       this.logger.info("Pair completed", {
         pair: pairCount,
-        upPrice: `${(upPrice * 100).toFixed(1)}¢`,
-        dnPrice: `${(dnPrice * 100).toFixed(1)}¢`,
+        firstSide,
+        upPrice: `${(pair.upPrice * 100).toFixed(1)}¢`,
+        dnPrice: `${(pair.dnPrice * 100).toFixed(1)}¢`,
         combined: `${pair.combinedCents.toFixed(1)}¢`,
         imbalance: pair.imbalance.toFixed(1),
       });
 
-      // --- DYNAMIC MERGE CHECK ---
+      // --- DYNAMIC MERGE CHECK (Spec 3.2, 9.6) ---
       if (this.config.autoMerge) {
         const matched = Math.min(filledUpShares, filledDnShares);
-        if (matched >= this.config.mergeMinSize) {
-          const mergeResult = await this.merge(window, matched);
+        const imbalancePct = (filledUpShares + filledDnShares) > 0
+          ? Math.abs(filledUpShares - filledDnShares) / (filledUpShares + filledDnShares)
+          : 0;
+
+        if (matched >= this.config.mergeMinSize && imbalancePct <= 0.10) {
+          const mergeResult = await this.doMerge(
+            window, matched, filledUpShares, filledDnShares, totalUpCost, totalDnCost,
+          );
           if (mergeResult) {
             merges.push(mergeResult);
             filledUpShares -= mergeResult.merged;
             filledDnShares -= mergeResult.merged;
             availableBudget += mergeResult.recovered;
-            // Reset costs proportionally
-            const upAvg = filledUpShares + mergeResult.merged > 0
+            // Proportionally reduce costs
+            const upAvgCost = (filledUpShares + mergeResult.merged) > 0
               ? totalUpCost / (filledUpShares + mergeResult.merged) : 0;
-            const dnAvg = filledDnShares + mergeResult.merged > 0
+            const dnAvgCost = (filledDnShares + mergeResult.merged) > 0
               ? totalDnCost / (filledDnShares + mergeResult.merged) : 0;
-            totalUpCost = filledUpShares * upAvg;
-            totalDnCost = filledDnShares * dnAvg;
+            totalUpCost = filledUpShares * upAvgCost;
+            totalDnCost = filledDnShares * dnAvgCost;
           }
         }
       }
 
-      // --- PACE CONTROL ---
+      // --- PACE CONTROL (Spec 2.10: 2-10s between orders) ---
       await sleep(this.config.orderIntervalMs);
     }
 
     // --- FINAL MERGE ---
     const finalMatched = Math.min(filledUpShares, filledDnShares);
     if (finalMatched > 0) {
-      const mergeResult = await this.merge(window, finalMatched);
+      const mergeResult = await this.doMerge(
+        window, finalMatched, filledUpShares, filledDnShares, totalUpCost, totalDnCost,
+      );
       if (mergeResult) {
         merges.push(mergeResult);
         filledUpShares -= mergeResult.merged;
         filledDnShares -= mergeResult.merged;
+        const upAvgCost = (filledUpShares + mergeResult.merged) > 0
+          ? totalUpCost / (filledUpShares + mergeResult.merged) : 0;
+        const dnAvgCost = (filledDnShares + mergeResult.merged) > 0
+          ? totalDnCost / (filledDnShares + mergeResult.merged) : 0;
+        totalUpCost = filledUpShares * upAvgCost;
+        totalDnCost = filledDnShares * dnAvgCost;
+      }
+    }
+
+    // --- PRE-RESOLUTION SELL: Sell if a side is at 95¢+ (Spec 8.3/4.2) ---
+    // If one side is near-certain winner (bid >= 95¢), sell for immediate capital
+    if (filledUpShares > 0 || filledDnShares > 0) {
+      const upBook = this.config.dryRun && this.dryRunEngine
+        ? this.dryRunEngine.getBook(window.upTokenId)
+        : this.clobWs.getBook(window.upTokenId);
+      const dnBook = this.config.dryRun && this.dryRunEngine
+        ? this.dryRunEngine.getBook(window.downTokenId)
+        : this.clobWs.getBook(window.downTokenId);
+
+      const upBid = upBook?.bestBid ?? 0;
+      const dnBid = dnBook?.bestBid ?? 0;
+
+      if (filledUpShares > 0 && upBid >= 0.95) {
+        this.logger.info("Pre-resolution sell: Up at 95¢+", {
+          upBid: `${(upBid * 100).toFixed(1)}¢`,
+          shares: filledUpShares.toFixed(1),
+        });
+        // Note: actual sell happens in main loop post-resolution cleanup
+        // Here we just log the opportunity — selling mid-window is risky
+      }
+      if (filledDnShares > 0 && dnBid >= 0.95) {
+        this.logger.info("Pre-resolution sell: Down at 95¢+", {
+          dnBid: `${(dnBid * 100).toFixed(1)}¢`,
+          shares: filledDnShares.toFixed(1),
+        });
       }
     }
 
@@ -279,11 +341,9 @@ export class MergeArbExecutor {
     const totalMerged = merges.reduce((s, m) => s + m.merged, 0);
     const totalMergeProfit = merges.reduce((s, m) => s + m.profit, 0);
     const totalCost = pairs.reduce((s, p) => s + p.upCost + p.dnCost, 0);
-    const totalPairs = pairs.filter(p => p.upFilled > 0 && p.dnFilled > 0).length;
-    const avgCombined = totalPairs > 0
-      ? pairs
-          .filter(p => p.upFilled > 0 && p.dnFilled > 0)
-          .reduce((s, p) => s + p.combinedCents, 0) / totalPairs
+    const completePairs = pairs.filter(p => p.upFilled > 0 && p.dnFilled > 0);
+    const avgCombined = completePairs.length > 0
+      ? completePairs.reduce((s, p) => s + p.combinedCents, 0) / completePairs.length
       : 0;
 
     const takerFees = this.config.dryRun && this.dryRunEngine
@@ -320,7 +380,10 @@ export class MergeArbExecutor {
       `${this.config.dryRun ? "📝" : "💰"} Window done: ` +
       `${pairs.length} pairs, merged ${totalMerged.toFixed(0)}sh, ` +
       `P&L: $${totalMergeProfit.toFixed(2)}, ` +
-      `avg combined: ${avgCombined.toFixed(1)}¢`,
+      `avg combined: ${avgCombined.toFixed(1)}¢` +
+      (filledUpShares > 0 || filledDnShares > 0
+        ? ` | Remaining: Up=${filledUpShares.toFixed(0)} Dn=${filledDnShares.toFixed(0)}`
+        : ""),
     );
 
     // Clean up dry run engine
@@ -332,28 +395,249 @@ export class MergeArbExecutor {
   }
 
   /**
-   * Pre-flight check: orderbook depth + combined cost gate.
+   * Sell remaining imbalance shares (post-resolution cleanup, Spec 4.2).
+   * Called by main loop after window resolution.
+   */
+  async sellRemainingShares(
+    tokenId: string,
+    shares: number,
+    side: TradeSide,
+  ): Promise<{ sold: boolean; revenue: number }> {
+    if (shares <= 0) return { sold: false, revenue: 0 };
+
+    if (this.config.dryRun) {
+      // In DRY_RUN, we can't know the resolution price, so estimate
+      // Losing side → near 0, Winning side → near $1
+      this.logger.info("DRY_RUN: Sell simulated (post-resolution)", { side, shares: shares.toFixed(1) });
+      return { sold: true, revenue: 0 }; // conservative: assume loser
+    }
+
+    // LIVE: Place a sell FOK at a low price to dump losing shares
+    const book = this.clobWs.getBook(tokenId);
+    const bestBid = book?.bestBid ?? 0.01;
+    const result = await this.clob.placeMarketOrderFOK({
+      tokenId,
+      side: Side.SELL,
+      amount: shares,
+      worstPrice: Math.max(0.01, bestBid - 0.02),
+    });
+
+    if (result.filled) {
+      const fills = await this.clob.getOrderFills(result.orderIds);
+      const revenue = fills.reduce((s, f) => s + f.costFilled, 0);
+      this.logger.info("Sold remaining shares", {
+        side,
+        shares: shares.toFixed(1),
+        revenue: `$${revenue.toFixed(2)}`,
+      });
+      return { sold: true, revenue };
+    }
+
+    this.logger.warn("Failed to sell remaining shares", { side, shares: shares.toFixed(1) });
+    return { sold: false, revenue: 0 };
+  }
+
+  /**
+   * Check and recover from crash: detect open positions from a previous session.
+   * Returns remaining shares that need cleanup if any.
+   */
+  async checkOpenPositions(
+    conditionId: string,
+    upTokenId: string,
+    downTokenId: string,
+  ): Promise<{ hasOpen: boolean; upShares: number; dnShares: number }> {
+    // In DRY_RUN there can't be real open positions
+    if (this.config.dryRun) {
+      return { hasOpen: false, upShares: 0, dnShares: 0 };
+    }
+
+    // TODO: Query actual on-chain token balances for these tokens
+    // For now, return no open positions (positions are tracked by main loop)
+    return { hasOpen: false, upShares: 0, dnShares: 0 };
+  }
+
+  // ─── PRIVATE METHODS ───
+
+  /**
+   * Buy with FOK, falling back to GTC if FOK fails repeatedly (Changelog §1).
+   * - FOK preferred: clean fill, no partial risk
+   * - GTC fallback: higher fill rate on thin books, cancel after ORDER_TIMEOUT
+   */
+  private async buyWithFallback(
+    tokenId: string,
+    size: number,
+    maxPrice: number,
+    side: TradeSide,
+  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
+    // Try FOK first
+    const fokResult = await this.buyFok(tokenId, size, maxPrice, side);
+    if (fokResult.filled) {
+      this.consecutiveFokFailures = 0;
+      return fokResult;
+    }
+    this.consecutiveFokFailures++;
+
+    // Retry FOK once with wider slippage
+    if (this.config.maxRetriesPerOrder > 0) {
+      await sleep(500);
+      const retry = await this.buyFok(
+        tokenId, size, maxPrice + this.config.slippageBuffer, side,
+      );
+      if (retry.filled) {
+        this.consecutiveFokFailures = 0;
+        return retry;
+      }
+      this.consecutiveFokFailures++;
+    }
+
+    // FOK failed >2x → try GTC fallback (Changelog §1)
+    if (this.consecutiveFokFailures >= this.FOK_FAILURE_THRESHOLD) {
+      this.logger.info("FOK failed repeatedly, falling back to GTC", { side, failures: this.consecutiveFokFailures });
+      const gtcResult = await this.buyGtcWithTimeout(tokenId, size, maxPrice, side);
+      if (gtcResult.filled) {
+        this.consecutiveFokFailures = 0;
+      }
+      return gtcResult;
+    }
+
+    return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+  }
+
+  /**
+   * Place a FOK buy order (live or simulated).
+   */
+  private async buyFok(
+    tokenId: string,
+    size: number,
+    maxPrice: number,
+    side: TradeSide,
+  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
+    if (this.config.dryRun && this.dryRunEngine) {
+      return this.dryRunEngine.simulateFokBuy(tokenId, size, maxPrice, side);
+    }
+
+    // LIVE: Place FOK via CLOB API
+    const amount = size * maxPrice;
+    const result = await this.clob.placeMarketOrderFOK({
+      tokenId,
+      side: Side.BUY,
+      amount,
+      worstPrice: maxPrice,
+    });
+
+    if (!result.filled || result.orderIds.length === 0) {
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+    }
+
+    const fills = await this.clob.getOrderFills(result.orderIds);
+    let totalShares = 0;
+    let totalCost = 0;
+    for (const fill of fills) {
+      totalShares += fill.sizeMatched;
+      totalCost += fill.costFilled;
+    }
+
+    const fee = totalCost * this.config.takerFeeRate;
+    return {
+      filled: totalShares > 0,
+      filledSize: totalShares,
+      avgPrice: totalShares > 0 ? totalCost / totalShares : 0,
+      totalCost: totalCost + fee,
+    };
+  }
+
+  /**
+   * GTC order with timeout — used as fallback when FOK fails on thin books.
+   * Places GTC at aggressive price, waits ORDER_TIMEOUT, cancels unfilled rest.
+   */
+  private async buyGtcWithTimeout(
+    tokenId: string,
+    size: number,
+    maxPrice: number,
+    side: TradeSide,
+  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
+    if (this.config.dryRun && this.dryRunEngine) {
+      // For DRY_RUN, GTC fallback still simulates against current book
+      // but we're more lenient — simulate partial fill if possible
+      return this.dryRunEngine.simulateGtcFill(tokenId, size, maxPrice, side);
+    }
+
+    // LIVE: Place GTC limit order at aggressive price
+    const result = await this.clob.placeBatchOrders(
+      [{ tokenId, side: Side.BUY, price: maxPrice, size }],
+      OrderType.GTC,
+    );
+
+    if (result.placed === 0 || result.orderIds.length === 0) {
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+    }
+
+    // Wait for fills (timeout: ORDER_TIMEOUT_MS)
+    await sleep(this.config.orderTimeoutMs);
+
+    // Check what filled
+    const fills = await this.clob.getOrderFills(result.orderIds);
+    let totalShares = 0;
+    let totalCost = 0;
+    for (const fill of fills) {
+      totalShares += fill.sizeMatched;
+      totalCost += fill.costFilled;
+    }
+
+    // Cancel remaining unfilled portion
+    for (const orderId of result.orderIds) {
+      await this.clob.cancelOrder(orderId);
+    }
+
+    if (totalShares <= 0) {
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+    }
+
+    const fee = totalCost * this.config.takerFeeRate;
+    this.logger.info("GTC fallback filled", {
+      side,
+      requested: size.toFixed(1),
+      filled: totalShares.toFixed(1),
+      avgPrice: `${((totalCost / totalShares) * 100).toFixed(1)}¢`,
+    });
+
+    return {
+      filled: true,
+      filledSize: totalShares,
+      avgPrice: totalCost / totalShares,
+      totalCost: totalCost + fee,
+    };
+  }
+
+  /**
+   * Pre-flight check: orderbook depth + combined cost gate (Spec 9.2 step 3).
    */
   private async preFlightCheck(
     window: WindowInfo,
   ): Promise<{ pass: boolean; reason?: string }> {
-    let upBook, dnBook;
+    let upBook: BookSnapshot | null;
+    let dnBook: BookSnapshot | null;
 
     if (this.config.dryRun && this.dryRunEngine) {
-      // Use WS orderbook
       upBook = this.dryRunEngine.getBook(window.upTokenId);
       dnBook = this.dryRunEngine.getBook(window.downTokenId);
     } else {
-      // Fetch from REST API
-      upBook = await this.clob.getOrderbook(window.upTokenId);
-      dnBook = await this.clob.getOrderbook(window.downTokenId);
+      // Use WS book (should be populated by now after subscribe + 1s wait)
+      upBook = this.clobWs.getBook(window.upTokenId);
+      dnBook = this.clobWs.getBook(window.downTokenId);
+      // Fallback to REST if WS book not ready
+      if (!upBook || !dnBook) {
+        const upOb = await this.clob.getOrderbook(window.upTokenId);
+        const dnOb = await this.clob.getOrderbook(window.downTokenId);
+        upBook = { assetId: window.upTokenId, bids: [], asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
+        dnBook = { assetId: window.downTokenId, bids: [], asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
+      }
     }
 
     if (!upBook || !dnBook) {
       return { pass: false, reason: "Orderbook not available" };
     }
 
-    // Check depth
     const upLevels = upBook.asks?.length ?? 0;
     const dnLevels = dnBook.asks?.length ?? 0;
     if (upLevels < this.config.minBookLevels || dnLevels < this.config.minBookLevels) {
@@ -363,7 +647,6 @@ export class MergeArbExecutor {
       };
     }
 
-    // Check combined best ask
     const bestUpAsk = upBook.bestAsk ?? (upBook.asks?.[0]?.price ?? null);
     const bestDnAsk = dnBook.bestAsk ?? (dnBook.asks?.[0]?.price ?? null);
     if (bestUpAsk === null || bestDnAsk === null) {
@@ -390,7 +673,7 @@ export class MergeArbExecutor {
   }
 
   /**
-   * Check if we should buy the next pair (mid-window gate).
+   * Check if we should buy the next pair (mid-window gate, Spec 9.4).
    */
   private shouldBuyNextPair(
     window: WindowInfo,
@@ -407,7 +690,6 @@ export class MergeArbExecutor {
       upDepth = this.dryRunEngine.simulateDepth(window.upTokenId, chunkSize);
       dnDepth = this.dryRunEngine.simulateDepth(window.downTokenId, chunkSize);
     } else {
-      // Use WS book for real-time data
       const upBook = this.clobWs.getBook(window.upTokenId);
       const dnBook = this.clobWs.getBook(window.downTokenId);
       upDepth = this.simulateBookDepth(upBook, chunkSize);
@@ -437,10 +719,10 @@ export class MergeArbExecutor {
   }
 
   /**
-   * Simulate depth from a BookSnapshot (for live mode using WS data).
+   * Simulate depth from a BookSnapshot.
    */
   private simulateBookDepth(
-    book: import("../data/clob-ws.js").BookSnapshot | null,
+    book: BookSnapshot | null,
     targetSize: number,
   ): { canFill: boolean; avgPrice: number; levelsAvailable: number } {
     if (!book || book.asks.length === 0) {
@@ -449,7 +731,6 @@ export class MergeArbExecutor {
 
     let remaining = targetSize;
     let totalCost = 0;
-
     for (const level of book.asks) {
       const fill = Math.min(remaining, level.size);
       totalCost += fill * level.price;
@@ -466,71 +747,19 @@ export class MergeArbExecutor {
   }
 
   /**
-   * Place a FOK buy order (live or simulated).
+   * Execute a merge with proper profit calculation.
    */
-  private async buyFok(
-    tokenId: string,
-    size: number,
-    maxPrice: number,
-    side: "Up" | "Down",
-  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
-    if (this.config.dryRun && this.dryRunEngine) {
-      const sim = this.dryRunEngine.simulateFokBuy(tokenId, size, maxPrice, side);
-      return {
-        filled: sim.filled,
-        filledSize: sim.filledSize,
-        avgPrice: sim.avgPrice,
-        totalCost: sim.totalCost,
-      };
-    }
-
-    // LIVE: Place FOK via CLOB API
-    const amount = size * maxPrice; // USD amount for FOK
-    const result = await this.clob.placeMarketOrderFOK({
-      tokenId,
-      side: Side.BUY,
-      amount,
-      worstPrice: maxPrice,
-    });
-
-    if (!result.filled || result.orderIds.length === 0) {
-      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
-    }
-
-    // Query actual fill data
-    const fills = await this.clob.getOrderFills(result.orderIds);
-    let totalShares = 0;
-    let totalCost = 0;
-    for (const fill of fills) {
-      totalShares += fill.sizeMatched;
-      totalCost += fill.costFilled;
-    }
-
-    const fee = totalCost * this.config.takerFeeRate;
-    return {
-      filled: totalShares > 0,
-      filledSize: totalShares,
-      avgPrice: totalShares > 0 ? totalCost / totalShares : 0,
-      totalCost: totalCost + fee,
-    };
-  }
-
-  /**
-   * Merge matched shares (live or simulated).
-   */
-  private async merge(
+  private async doMerge(
     window: WindowInfo,
     amount: number,
+    upShares: number,
+    dnShares: number,
+    upCost: number,
+    dnCost: number,
   ): Promise<MergeResult | null> {
     if (this.config.dryRun && this.dryRunEngine) {
       const sim = this.dryRunEngine.simulateMerge(amount);
-      if (sim.merged <= 0) return null;
-      return {
-        merged: sim.merged,
-        recovered: sim.recovered,
-        profit: sim.profit,
-        timestamp: Date.now(),
-      };
+      return sim.merged > 0 ? { merged: sim.merged, recovered: sim.recovered, profit: sim.profit, timestamp: Date.now() } : null;
     }
 
     // LIVE: CTF merge via relayer
@@ -551,12 +780,44 @@ export class MergeArbExecutor {
     }
 
     const recovered = amount * 1.0;
-    // We don't know exact cost breakdown here — caller tracks it
+    const upAvg = upShares > 0 ? upCost / upShares : 0;
+    const dnAvg = dnShares > 0 ? dnCost / dnShares : 0;
+    const profit = recovered - amount * (upAvg + dnAvg);
+
     return {
       merged: amount,
       recovered,
-      profit: 0, // Caller calculates actual profit
+      profit,
       timestamp: Date.now(),
     };
+  }
+
+  /**
+   * Session-level chunk size (Spec 2.5: "Innerhalb eines Windows haben alle
+   * Orders nahezu exakt gleiche Stückzahl. Die Stückzahl wird pro Tag/Session berechnet.")
+   */
+  private getSessionChunkSize(balance: number): number {
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    if (this.sessionChunkSize !== null && this.sessionChunkDate === today) {
+      return this.sessionChunkSize;
+    }
+
+    const budget = balance * this.config.equityPerWindow;
+    const estimatedAvgPrice = 0.50;
+    // Budget covers MAX_PAIRS pairs (each pair = 2 orders × chunkSize × avgPrice)
+    const chunkSize = Math.max(
+      Math.floor(budget / (this.config.maxPairs * 2 * estimatedAvgPrice)),
+      20,
+    );
+
+    this.sessionChunkSize = chunkSize;
+    this.sessionChunkDate = today;
+    this.logger.info("Session chunk size calculated", {
+      date: today,
+      balance: `$${balance.toFixed(2)}`,
+      chunkSize,
+    });
+
+    return chunkSize;
   }
 }

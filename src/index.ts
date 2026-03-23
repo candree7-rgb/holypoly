@@ -925,6 +925,37 @@ const main = async () => {
           }
         }
 
+        // --- POST-RESOLUTION CLEANUP (Spec 4.2: sell/redeem remaining imbalance) ---
+        if (result.remainingUp > 0 || result.remainingDn > 0) {
+          // Wait for resolution
+          const waitForResolution = Math.max(0, window.endTime - Date.now()) + 5000;
+          if (waitForResolution > 0 && waitForResolution < 600_000) {
+            logger.info("Waiting for resolution to handle remaining imbalance", {
+              remainingUp: result.remainingUp.toFixed(1),
+              remainingDn: result.remainingDn.toFixed(1),
+              waitMs: waitForResolution,
+            });
+            await sleep(waitForResolution);
+          }
+
+          // Re-subscribe to get post-resolution prices for sell
+          clobWs.subscribe([window.upTokenId, window.downTokenId]);
+          await sleep(1000);
+
+          // Try to sell remaining shares (Spec 4.2)
+          if (result.remainingUp > 0) {
+            await mergeArbExecutor.sellRemainingShares(
+              window.upTokenId, result.remainingUp, "Up",
+            );
+          }
+          if (result.remainingDn > 0) {
+            await mergeArbExecutor.sellRemainingShares(
+              window.downTokenId, result.remainingDn, "Down",
+            );
+          }
+          // Auto-redeem handles the rest via redeemLoop
+        }
+
         // --- CLEANUP ---
         clobWs.clear();
 

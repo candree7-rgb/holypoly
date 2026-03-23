@@ -253,6 +253,95 @@ export class DryRunEngine {
   }
 
   /**
+   * Simulate a GTC buy order — allows partial fills (unlike FOK).
+   * Used as fallback when FOK fails repeatedly on thin books.
+   */
+  simulateGtcFill(
+    tokenId: string,
+    size: number,
+    maxPrice: number,
+    side: "Up" | "Down",
+  ): { filled: boolean; filledSize: number; avgPrice: number; totalCost: number } {
+    const book = this.clobWs.getBook(tokenId);
+    if (!book || book.asks.length === 0) {
+      this.logger.debug("DRY_RUN: No orderbook for GTC simulation", { tokenId: tokenId.slice(0, 12) });
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+    }
+
+    const consumed = this.getConsumedAsks(tokenId);
+    let remaining = size;
+    let totalCost = 0;
+
+    // Walk asks — accept partial fills (GTC behavior)
+    for (const level of book.asks) {
+      if (level.price > maxPrice) break;
+
+      const alreadyConsumed = consumed.get(level.price) ?? 0;
+      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
+      if (availableAtLevel <= 0) continue;
+
+      const fillAtLevel = Math.min(remaining, availableAtLevel);
+      totalCost += fillAtLevel * level.price;
+      remaining -= fillAtLevel;
+      if (remaining <= 0) break;
+    }
+
+    const filledSize = size - remaining;
+    if (filledSize <= 0) {
+      this.logger.debug("DRY_RUN: GTC no fills available", { side, maxPrice: `${(maxPrice * 100).toFixed(0)}¢` });
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+    }
+
+    // Consume liquidity for filled portion
+    let rem2 = filledSize;
+    for (const level of book.asks) {
+      if (level.price > maxPrice) break;
+      const alreadyConsumed = consumed.get(level.price) ?? 0;
+      const availableAtLevel = Math.max(0, level.size - alreadyConsumed);
+      if (availableAtLevel <= 0) continue;
+      const fillAtLevel = Math.min(rem2, availableAtLevel);
+      consumed.set(level.price, alreadyConsumed + fillAtLevel);
+      rem2 -= fillAtLevel;
+      if (rem2 <= 0) break;
+    }
+
+    const avgPrice = totalCost / filledSize;
+    const fee = totalCost * this.takerFeeRate;
+    const totalWithFee = totalCost + fee;
+
+    // Update virtual state
+    if (side === "Up") {
+      this.virtualUpShares += filledSize;
+      this.virtualUpCost += totalWithFee;
+    } else {
+      this.virtualDnShares += filledSize;
+      this.virtualDnCost += totalWithFee;
+    }
+    this.virtualBalance -= totalWithFee;
+    this.totalTakerFees += fee;
+
+    this.fillLog.push({
+      timestamp: Date.now(),
+      side,
+      size: filledSize,
+      avgPrice,
+      cost: totalWithFee,
+      type: "FOK", // logged as FOK for consistency (it's still a taker fill)
+    });
+
+    this.logger.info("DRY_RUN: GTC filled (partial ok)", {
+      side,
+      requested: size.toFixed(1),
+      filled: filledSize.toFixed(1),
+      avgPrice: `${(avgPrice * 100).toFixed(1)}¢`,
+      cost: `$${totalCost.toFixed(2)}`,
+      fee: `$${fee.toFixed(3)}`,
+    });
+
+    return { filled: true, filledSize, avgPrice, totalCost: totalWithFee };
+  }
+
+  /**
    * Get the current orderbook for pre-flight checks.
    * Returns null if no book available.
    */
