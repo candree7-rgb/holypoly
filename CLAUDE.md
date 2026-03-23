@@ -31,6 +31,7 @@ V5 postet Limit-Orders UNTER dem Ask (Maker) → 0% Fee → Combined < 100¢ wei
 - QUOTE_UPDATE_MS: 1000ms (quotes updaten / fills checken)
 - MAKER_PHASE_END_S: 60 (maker phase endet 60s vor Window-Ende → dann Rebalance)
 - MAX_TAKER_REBALANCE_SHARES: 500 (max Shares per Taker-Rebalance)
+- MAX_TAKER_REBALANCE_PRICE: 0.55 (max 55¢ — skip Rebalance wenn Ask > Cap, Imbalance halten)
 - EQUITY_PER_WINDOW: 80%
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares

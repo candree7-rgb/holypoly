@@ -305,6 +305,19 @@ export class MergeArbExecutor {
       if (sharesToRebalance > 0) {
         const book = this.getBook(shortToken);
         const bestAsk = book?.asks?.[0]?.price ?? 0.50;
+
+        // Price cap: skip rebalance if ask > maxTakerRebalancePrice (default 55¢)
+        if (bestAsk > this.config.maxTakerRebalancePrice) {
+          this.logger.warn("Rebalance skipped — ask too expensive", {
+            side: shortSide,
+            bestAsk: `${(bestAsk * 100).toFixed(1)}¢`,
+            maxPrice: `${(this.config.maxTakerRebalancePrice * 100).toFixed(1)}¢`,
+            imbalance: sharesToRebalance.toFixed(0),
+          });
+          this.telegram.send(
+            `⚠️ Rebalance SKIPPED: ${shortSide} ask ${(bestAsk * 100).toFixed(1)}¢ > cap ${(this.config.maxTakerRebalancePrice * 100).toFixed(1)}¢ — holding ${sharesToRebalance.toFixed(0)}sh imbalance`,
+          );
+        } else {
         const rebalancePrice = bestAsk + this.config.slippageBuffer;
 
         // Execute taker buy for rebalance
@@ -338,6 +351,7 @@ export class MergeArbExecutor {
         } else {
           this.logger.warn("Taker rebalance failed — will have imbalance at merge");
         }
+        } // end price cap else
       }
     }
 
