@@ -388,6 +388,28 @@ export class DryRunEngine {
     };
   }
 
+  /**
+   * Get a book view adjusted for consumed liquidity (for executor pre-order checks).
+   */
+  getBookView(tokenId: string): BookSnapshot | null {
+    const book = this.clobWs.getBook(tokenId);
+    if (!book) return null;
+
+    const consumed = this.getConsumedAsks(tokenId);
+    const asks = (book.asks ?? [])
+      .map(a => {
+        const c = consumed.get(a.price) ?? 0;
+        return { price: a.price, size: Math.max(0, a.size - c) };
+      })
+      .filter(a => a.size > 0);
+
+    return {
+      ...book,
+      asks,
+      bestAsk: asks.length > 0 ? asks[0].price : book.bestAsk,
+    };
+  }
+
   /** Reset state for a new window */
   resetWindow(): void {
     this.virtualUpShares = 0;

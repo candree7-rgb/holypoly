@@ -2,33 +2,35 @@
 
 Polymarket merge-arb trading bot for BTC 5-minute Up/Down binary markets.
 
-## Strategy: Merge-Arb (`STRATEGY_MODE=merge-arb`)
+## Strategy: Merge-Arb V3 (`STRATEGY_MODE=merge-arb`)
 
-Stargate5-style richtungsneutrale Arbitrage:
-1. Bot kauft **beide Seiten** (Up UND Down) alternierend mit FOK Orders
-2. Sobald Shares balanced → **Merge** zu $1/Share (sofortiger Profit wenn Combined < $1)
-3. Recyceltes Kapital wird für weitere Paare verwendet
-4. MAX_PAIRS = 5 ist der Hauptfilter (erste Fills = profitabelste)
+Stargate5-style richtungsneutrale Arbitrage (V3 accumulate-then-merge):
+1. Bot kauft **beide Seiten** (Up UND Down) alternierend über 2-4 Minuten (10-25 Orders)
+2. Einzelpaare KÖNNEN über 100¢ sein — der GESAMTDURCHSCHNITT über alle Orders zählt
+3. **Merge EINMAL am Ende** (T+260-280s), nicht nach jedem Paar
+4. Mid-Merge Recycling NUR wenn Budget ausgeht
 5. Nach Resolution: Redeem übrige Imbalance
 
 ### Kern-Edge
-Die Polymarket CLOB-Orderbücher für 5-min-BTC-Märkte haben eine strukturelle Ineffizienz:
-Die Summe der Ask-Preise (Up + Down) liegt im Durchschnitt unter $1.00. Die ersten
-Fills sweepen die billigsten Levels wo Combined oft 85-95¢ ist.
+BTC-Preisoszillation innerhalb 5 Minuten verursacht schwankende Up/Down Preise.
+Über viele Orders mittelt sich der Combined-Preis unter 100¢.
+Extreme Preise (10-20¢) haben fast keine Fee (Curve-Fee).
 
 ### Key Parameters
-- EQUITY_PER_WINDOW: 20% (Start), bis 80% nach Validierung
-- MAX_PAIRS: 5 (hard stop, DER Filter)
+- EQUITY_PER_WINDOW: 80%
+- MAX_ORDERS_PER_WINDOW: 30 (Stargate5 macht 10-25)
 - MERGE_MIN_SIZE: 10 shares
-- ENTRY_DELAY: 3s nach Window-Open
+- ENTRY_DELAY: 5s nach Window-Open
 - ORDER_INTERVAL: 2s zwischen Orders
+- STOP_BUYING_BEFORE_END_S: 40s vor Window-Ende
+- MERGE_BEFORE_END_S: 20s vor Window-Ende
 - SLIPPAGE_BUFFER: +2¢ über Best Ask
-- MAX_COMBINED_ENTRY: 105¢ (Window-Gate, selten)
-- MAX_COMBINED_PAIR: 103¢ (Pair-Gate, selten)
-- Taker Fee: 2% (alle Orders sind FOK/Taker)
+- SKIP_IF_BEST_COMBINED_GT: 110¢ (nur komplett kaputtes Buch)
+- MAX_CHUNK_SIZE: 200 shares
+- Fee: Polymarket Crypto Curve (NOT flat 2%)
 
 ### Architecture
-- `src/execution/merge-arb-executor.ts` — Core strategy: FOK buy cycle + dynamic merge
+- `src/execution/merge-arb-executor.ts` — V3 Core: accumulate loop + final merge
 - `src/execution/dry-run-engine.ts` — Realistic orderbook-based fill simulation
 - `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, PING/PONG every 5s)
 - `src/data/clob.ts` — CLOB REST API (orders, fills, balance)
@@ -40,11 +42,19 @@ Fills sweepen die billigsten Levels wo Combined oft 85-95¢ ist.
 ### DRY_RUN Mode
 `DRY_RUN=true` (default) runs the **identical strategy code** but:
 - CLOB WebSocket connects normally (no auth needed) → real orderbook data
-- FOK fills are simulated against live ask depth (DryRunEngine)
+- Fills are simulated against live ask depth (DryRunEngine)
 - Consumed liquidity is tracked (subsequent orders see less depth)
 - Merges are simulated with correct P&L math
-- Taker fees (2%) applied to all simulated fills
+- Polymarket crypto fee curve applied to all simulated fills
 - Virtual balance, positions, and P&L tracked throughout
+- Risk limits (losing streak, daily/weekly loss) skipped in DRY_RUN
+
+### Fee Model
+Polymarket crypto fee curve (NOT flat 2%):
+```
+fee = shares × price × 0.25 × (price × (1 - price))²
+```
+Max ~1.56% at 50¢, ~0.2% at extremes (10¢/90¢).
 
 ### WebSocket Notes
 - Polymarket CLOB WS requires subscription message immediately after connect
@@ -53,5 +63,6 @@ Fills sweepen die billigsten Levels wo Combined oft 85-95¢ ist.
 - No auth required for market channel (orderbook data)
 
 ### Specs
-- `HOLYPOLY_STRATEGY_SPEC.md` — Full strategy specification (Stargate5 analysis)
-- `HOLYPOLY_CHANGELOG.md` — Additions & updates (takes precedence on conflicts)
+- `HOLYPOLY_V3_DEFINITIVE.md` — V3 strategy specification (DEFINITIV, ersetzt alle vorherigen)
+- `HOLYPOLY_STRATEGY_SPEC.md` — Original strategy specification (veraltet)
+- `HOLYPOLY_CHANGELOG.md` — Additions & updates

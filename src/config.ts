@@ -102,37 +102,33 @@ export interface Config {
   /** "merge-arb" = Stargate5-style merge arb, "edge" = edge-detection, "webhook" = TradingView signals */
   strategyMode: "merge-arb" | "edge" | "webhook";
 
-  // Merge-Arb Strategy parameters (merge-arb mode)
-  /** Fraction of balance to allocate per window (e.g. 0.20 = 20%) */
+  // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
+  /** Fraction of balance to allocate per window (e.g. 0.80 = 80%) */
   equityPerWindow: number;
-  /** Maximum number of Up+Down pairs per window */
-  maxPairs: number;
+  /** Maximum number of orders (buys) per window */
+  maxOrdersPerWindow: number;
   /** Minimum matched shares before triggering merge */
   mergeMinSize: number;
   /** Milliseconds to wait after window opens before first order */
   mergeEntryDelayMs: number;
-  /** Milliseconds between orders within a pair cycle */
+  /** Milliseconds between orders within accumulate phase */
   orderIntervalMs: number;
-  /** Extra cents above best ask for FOK price (e.g. 0.02 = +2¢) */
+  /** Extra cents above best ask for order price (e.g. 0.02 = +2¢) */
   slippageBuffer: number;
-  /** Milliseconds to wait for FOK fill confirmation */
+  /** Milliseconds to wait for GTC fill confirmation */
   orderTimeoutMs: number;
-  /** Max combined ask (Up+Down) to enter a window (e.g. 1.05 = 105¢) */
-  maxCombinedEntry: number;
-  /** Max combined ask per pair to continue buying (e.g. 1.03 = 103¢) */
-  maxCombinedPair: number;
+  /** Skip window if best combined ask > this (e.g. 1.10 = 110¢) — only for broken books */
+  skipIfBestCombinedGt: number;
   /** Minimum orderbook levels on each side to proceed */
   minBookLevels: number;
-  /** Max acceptable share imbalance before rebalancing */
-  maxImbalanceShares: number;
   /** Number of retries per failed order */
   maxRetriesPerOrder: number;
-  /** Hard limit on total trades per window (pairs + retries) */
-  maxTradesPerWindow: number;
-  /** Merge immediately when shares are balanced */
-  autoMerge: boolean;
   /** Hard cap on shares per order (orderbooks are thin on 5-min markets) */
   maxChunkSize: number;
+  /** Stop buying this many seconds before window end */
+  stopBuyingBeforeEndS: number;
+  /** Merge this many seconds before window end */
+  mergeBeforeEndS: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -315,22 +311,20 @@ export const loadConfig = (): Config => {
     : strategyModeRaw === "edge" ? "edge"
     : "merge-arb" as const;
 
-  // Merge-Arb Strategy parameters
+  // Merge-Arb Strategy parameters (V3)
   const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);
-  const maxPairs = parseNumber("MAX_PAIRS", 5);
+  const maxOrdersPerWindow = parseNumber("MAX_ORDERS_PER_WINDOW", 30);
   const mergeMinSize = parseNumber("MERGE_MIN_SIZE", 10);
-  const mergeEntryDelayMs = parseNumber("MERGE_ENTRY_DELAY_MS", 3000);
+  const mergeEntryDelayMs = parseNumber("MERGE_ENTRY_DELAY_MS", 5000);
   const orderIntervalMs = parseNumber("ORDER_INTERVAL_MS", 2000);
   const slippageBuffer = parseNumber("SLIPPAGE_BUFFER", 0.02);
   const orderTimeoutMs = parseNumber("ORDER_TIMEOUT_MS", 5000);
-  const maxCombinedEntry = parseNumber("MAX_COMBINED_ENTRY", 1.05);
-  const maxCombinedPair = parseNumber("MAX_COMBINED_PAIR", 1.03);
+  const skipIfBestCombinedGt = parseNumber("SKIP_IF_BEST_COMBINED_GT", 1.10);
   const minBookLevels = parseNumber("MIN_BOOK_LEVELS", 3);
-  const maxImbalanceShares = parseNumber("MAX_IMBALANCE_SHARES", 5);
   const maxRetriesPerOrder = parseNumber("MAX_RETRIES_PER_ORDER", 1);
-  const maxTradesPerWindow = parseNumber("MAX_TRADES_PER_WINDOW", 12);
-  const autoMerge = parseBoolean("AUTO_MERGE", true);
-  const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 150);
+  const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 200);
+  const stopBuyingBeforeEndS = parseNumber("STOP_BUYING_BEFORE_END_S", 40);
+  const mergeBeforeEndS = parseNumber("MERGE_BEFORE_END_S", 20);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -400,20 +394,18 @@ export const loadConfig = (): Config => {
     telegramChatId,
     strategyMode,
     equityPerWindow,
-    maxPairs,
+    maxOrdersPerWindow,
     mergeMinSize,
     mergeEntryDelayMs,
     orderIntervalMs,
     slippageBuffer,
     orderTimeoutMs,
-    maxCombinedEntry,
-    maxCombinedPair,
+    skipIfBestCombinedGt,
     minBookLevels,
-    maxImbalanceShares,
     maxRetriesPerOrder,
-    maxTradesPerWindow,
-    autoMerge,
     maxChunkSize,
+    stopBuyingBeforeEndS,
+    mergeBeforeEndS,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,

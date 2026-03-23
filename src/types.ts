@@ -46,9 +46,20 @@ export interface Position {
   outcome?: string;
 }
 
-// === Merge-Arb Strategy Types ===
+// === Merge-Arb Strategy Types (V3) ===
 
-/** Result of a single Up+Down pair execution */
+/** Result of a single buy order in the V3 accumulate loop */
+export interface OrderFill {
+  orderNum: number;
+  side: TradeSide;
+  filledSize: number;
+  avgPrice: number;
+  totalCost: number;
+  fee: number;
+  timestamp: number;
+}
+
+/** Result of a single Up+Down pair execution (legacy, kept for DB compat) */
 export interface PairResult {
   pairNum: number;
   upFilled: number;
@@ -76,6 +87,9 @@ export interface WindowExecutionResult {
   conditionId: string;
   windowStart: number;
   windowEnd: number;
+  /** V3: individual order fills */
+  orderFills: OrderFill[];
+  /** Legacy pair grouping (for DB compat) */
   pairs: PairResult[];
   merges: MergeResult[];
   totalUpShares: number;

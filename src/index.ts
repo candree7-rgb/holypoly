@@ -64,16 +64,17 @@ const main = async () => {
   logger.info("Mode", { strategy: config.strategyMode, dryRun: config.dryRun });
 
   if (config.strategyMode === "merge-arb") {
-    logger.info("Merge-Arb parameters", {
+    logger.info("Merge-Arb V3 parameters", {
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
-      maxPairs: config.maxPairs,
+      maxOrders: config.maxOrdersPerWindow,
       mergeMinSize: config.mergeMinSize,
       entryDelay: `${config.mergeEntryDelayMs}ms`,
       orderInterval: `${config.orderIntervalMs}ms`,
       slippage: `+${(config.slippageBuffer * 100).toFixed(0)}¢`,
-      maxCombinedEntry: `${(config.maxCombinedEntry * 100).toFixed(0)}¢`,
-      maxCombinedPair: `${(config.maxCombinedPair * 100).toFixed(0)}¢`,
-      takerFee: `${(config.takerFeeRate * 100).toFixed(0)}%`,
+      skipGate: `${(config.skipIfBestCombinedGt * 100).toFixed(0)}¢`,
+      stopBuyingBefore: `${config.stopBuyingBeforeEndS}s`,
+      mergeBefore: `${config.mergeBeforeEndS}s`,
+      feeModel: "curve",
     });
   } else {
     logger.info("Edge parameters", {
@@ -840,16 +841,16 @@ const main = async () => {
     // --- CRASH RECOVERY (Spec 9.11 Scenario 6) ---
     await mergeArbExecutor.crashRecovery(dataApi, config.profileAddress);
 
-    logger.info("=== Merge-Arb Strategy Active ===", {
+    logger.info("=== Merge-Arb V3 Strategy Active ===", {
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
-      maxPairs: config.maxPairs,
+      maxOrders: config.maxOrdersPerWindow,
       mergeMinSize: config.mergeMinSize,
       entryDelay: `${config.mergeEntryDelayMs}ms`,
       orderInterval: `${config.orderIntervalMs}ms`,
       slippage: `+${(config.slippageBuffer * 100).toFixed(0)}¢`,
-      maxCombinedEntry: `${(config.maxCombinedEntry * 100).toFixed(0)}¢`,
-      maxCombinedPair: `${(config.maxCombinedPair * 100).toFixed(0)}¢`,
-      takerFee: `${config.takerFeeRate * 100}%`,
+      skipGate: `${(config.skipIfBestCombinedGt * 100).toFixed(0)}¢`,
+      stopBuyingBefore: `${config.stopBuyingBeforeEndS}s`,
+      feeModel: "curve",
       dryRun: config.dryRun,
     });
 
