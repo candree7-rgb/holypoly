@@ -938,22 +938,30 @@ const main = async () => {
             await sleep(waitForResolution);
           }
 
-          // Re-subscribe to get post-resolution prices for sell
-          clobWs.subscribe([window.upTokenId, window.downTokenId]);
-          await sleep(1000);
+          // Determine winner from settlement price (Spec 4.2)
+          const settlementPrice = rtds.price ?? binance.price;
+          const winner: TradeSide | null = settlementPrice && window.openingPrice > 0
+            ? (settlementPrice >= window.openingPrice ? "Up" : "Down")
+            : null;
 
-          // Try to sell remaining shares (Spec 4.2)
-          if (result.remainingUp > 0) {
-            await mergeArbExecutor.sellRemainingShares(
-              window.upTokenId, result.remainingUp, "Up",
-            );
+          if (winner) {
+            logger.info("Post-resolution cleanup", { winner, remainingUp: result.remainingUp, remainingDn: result.remainingDn });
+            // Winning side → auto-redeem at $1.00 (handled by redeemLoop)
+            // Losing side → sell at market to recover whatever possible
+            if (result.remainingUp > 0 && winner !== "Up") {
+              clobWs.subscribe([window.upTokenId]);
+              await sleep(1000);
+              await mergeArbExecutor.sellRemainingShares(window.upTokenId, result.remainingUp, "Up");
+            }
+            if (result.remainingDn > 0 && winner !== "Down") {
+              clobWs.subscribe([window.downTokenId]);
+              await sleep(1000);
+              await mergeArbExecutor.sellRemainingShares(window.downTokenId, result.remainingDn, "Down");
+            }
+            // Winning side remaining shares → redeemLoop handles at $1.00
+          } else {
+            logger.warn("No settlement price available, relying on redeemLoop for cleanup");
           }
-          if (result.remainingDn > 0) {
-            await mergeArbExecutor.sellRemainingShares(
-              window.downTokenId, result.remainingDn, "Down",
-            );
-          }
-          // Auto-redeem handles the rest via redeemLoop
         }
 
         // --- CLEANUP ---

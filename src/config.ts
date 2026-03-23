@@ -314,7 +314,7 @@ export const loadConfig = (): Config => {
     : "merge-arb" as const;
 
   // Merge-Arb Strategy parameters
-  const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.20);
+  const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);
   const maxPairs = parseNumber("MAX_PAIRS", 5);
   const mergeMinSize = parseNumber("MERGE_MIN_SIZE", 10);
   const mergeEntryDelayMs = parseNumber("MERGE_ENTRY_DELAY_MS", 3000);

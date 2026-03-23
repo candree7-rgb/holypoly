@@ -500,7 +500,6 @@ export class MergeArbExecutor {
       this.consecutiveFokFailures = 0;
       return fokResult;
     }
-    this.consecutiveFokFailures++;
 
     // Retry FOK once with wider slippage
     if (this.config.maxRetriesPerOrder > 0) {
@@ -512,10 +511,12 @@ export class MergeArbExecutor {
         this.consecutiveFokFailures = 0;
         return retry;
       }
-      this.consecutiveFokFailures++;
     }
 
-    // FOK failed >2x → try GTC fallback (Changelog §1)
+    // This order-level attempt failed (FOK + retry both failed)
+    this.consecutiveFokFailures++;
+
+    // >2 consecutive order-level failures → try GTC fallback (Changelog §1)
     if (this.consecutiveFokFailures >= this.FOK_FAILURE_THRESHOLD) {
       this.logger.info("FOK failed repeatedly, falling back to GTC", { side, failures: this.consecutiveFokFailures });
       const gtcResult = await this.buyGtcWithTimeout(tokenId, size, maxPrice, side);
@@ -588,7 +589,9 @@ export class MergeArbExecutor {
       return this.dryRunEngine.simulateGtcFill(tokenId, size, maxPrice, side);
     }
 
-    // LIVE: Place GTC limit order at aggressive price
+    // LIVE: Place single GTC limit order at aggressive price.
+    // Note: placeBatchOrders with 1 order = single order on CLOB (not smart-contract batching).
+    // Spec 8.2 "no batching" refers to Stargate5 not using on-chain multi-call batching.
     const result = await this.clob.placeBatchOrders(
       [{ tokenId, side: Side.BUY, price: maxPrice, size }],
       OrderType.GTC,
@@ -652,8 +655,8 @@ export class MergeArbExecutor {
     if (!upBook || !dnBook) {
       const upOb = await this.clob.getOrderbook(window.upTokenId);
       const dnOb = await this.clob.getOrderbook(window.downTokenId);
-      upBook = { assetId: window.upTokenId, bids: [], asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
-      dnBook = { assetId: window.downTokenId, bids: [], asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
+      upBook = { assetId: window.upTokenId, bids: upOb.bids.map(b => ({ price: b.price, size: b.size })), asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
+      dnBook = { assetId: window.downTokenId, bids: dnOb.bids.map(b => ({ price: b.price, size: b.size })), asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
     }
 
     if (!upBook || !dnBook) {
@@ -790,14 +793,25 @@ export class MergeArbExecutor {
       return null;
     }
 
-    const txHash = await this.redeem.mergePositions(
+    let txHash = await this.redeem.mergePositions(
       window.conditionId,
       amount,
       window.negRisk,
     );
 
+    // Retry once on failure (Spec 9.11 Scenario 3)
     if (!txHash) {
-      this.logger.warn("Merge transaction failed");
+      this.logger.warn("Merge failed, retrying once...");
+      await sleep(1000);
+      txHash = await this.redeem.mergePositions(
+        window.conditionId,
+        amount,
+        window.negRisk,
+      );
+    }
+
+    if (!txHash) {
+      this.logger.warn("Merge retry also failed — will hold for resolution + redeem");
       return null;
     }
 
