@@ -99,7 +99,7 @@ export interface Config {
   telegramChatId?: string;
 
   // Strategy mode
-  /** "merge-arb" = V5 maker, "signal-taker" = V6 Binance signal, "edge" = edge-detection, "webhook" = TradingView signals */
+  /** "merge-arb" = V5 maker, "signal-taker" = V7 adaptive EMA, "edge" = edge-detection, "webhook" = TradingView signals */
   strategyMode: "merge-arb" | "signal-taker" | "edge" | "webhook";
 
   // V7 Adaptive Signal-Taker parameters
