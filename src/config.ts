@@ -137,6 +137,10 @@ export interface Config {
   makerOffsetCents: number;
   /** V5 Maker: how often (ms) to update quotes / check fills */
   quoteUpdateMs: number;
+  /** V5: Maker phase ends this many seconds before window end (then assess+rebalance) */
+  makerPhaseEndS: number;
+  /** V5: Max shares to buy as taker for rebalancing (limits fee exposure) */
+  maxTakerRebalanceShares: number;
 
   // Signal strategy parameters (webhook mode)
   /** GTC limit ladder prices in cents (comma-separated) */
@@ -337,6 +341,8 @@ export const loadConfig = (): Config => {
   const monitorIntervalMs = parseNumber("MONITOR_INTERVAL_MS", 500);
   const makerOffsetCents = parseNumber("MAKER_OFFSET_CENTS", 2);
   const quoteUpdateMs = parseNumber("QUOTE_UPDATE_MS", 1000);
+  const makerPhaseEndS = parseNumber("MAKER_PHASE_END_S", 60);
+  const maxTakerRebalanceShares = parseNumber("MAX_TAKER_REBALANCE_SHARES", 500);
 
   // Signal strategy parameters (webhook mode)
   const signalLadderPricesRaw = getEnv("SIGNAL_LADDER_PRICES") ?? "49,50,51";
@@ -422,6 +428,8 @@ export const loadConfig = (): Config => {
     monitorIntervalMs,
     makerOffsetCents,
     quoteUpdateMs,
+    makerPhaseEndS,
+    maxTakerRebalanceShares,
     signalLadderPrices,
     signalLadderWeights,
     signalFokFallbackSec,

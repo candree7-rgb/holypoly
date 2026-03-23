@@ -6,14 +6,15 @@ Polymarket merge-arb trading bot for BTC 5-minute Up/Down binary markets.
 
 **CRITICAL: Maker fee = 0% on Polymarket crypto markets. Taker fee = 1-1.5%. This IS the edge.**
 
-V5 Maker Strategy (replaces V1-V4 taker approaches):
-1. Bot posts **GTC limit BUY orders BELOW the ask** on BOTH Up and Down (= maker, sits in book)
-2. Maker fee = **0%** (taker was 1-1.5% which destroyed ALL previous strategies)
-3. We **control the prices** → combined bid = upBid + dnBid < 100¢
-4. BTC oscillation causes asks to **cross down to our bids** → fills happen
-5. If prices move: **cancel + repost** (quote-update loop every 1s)
-6. **Merge EINMAL am Ende** (T+260-280s)
-7. Maker rebates on top of merge profit
+V5 3-Phase Maker Strategy (replaces V1-V4 taker approaches):
+1. **Phase 1 MAKER (T+5s→T+240s):** Post GTC limit BUY orders BELOW the ask on BOTH sides
+   - Maker fee = **0%** — this is the entire edge
+   - Only requote DOWNWARD (never chase ask upward)
+   - BTC oscillation causes asks to cross our bids → fills
+2. **Phase 2 ASSESS+REBALANCE (T+240s→T+270s):** Cancel unfilled orders
+   - If imbalance: buy short side as TAKER (1% fee) to eliminate naked exposure
+   - Only ~5-10% of shares are taker, 90%+ were filled as maker (0% fee)
+3. **Phase 3 MERGE (T+270s→T+290s):** Merge all matched shares → profit + rebates
 
 ### Kern-Edge
 **0% maker fee.** V1-V4 waren TAKER (hitten den Ask) → zahlten 1-1.5% Fee → Combined ≥ 101¢ + Fee = Verlust.
@@ -28,17 +29,17 @@ V5 postet Limit-Orders UNTER dem Ask (Maker) → 0% Fee → Combined < 100¢ wei
 ### Key Parameters
 - MAKER_OFFSET_CENTS: 2 (bid 2¢ unter Best Ask pro Seite → maker, nicht taker)
 - QUOTE_UPDATE_MS: 1000ms (quotes updaten / fills checken)
+- MAKER_PHASE_END_S: 60 (maker phase endet 60s vor Window-Ende → dann Rebalance)
+- MAX_TAKER_REBALANCE_SHARES: 500 (max Shares per Taker-Rebalance)
 - EQUITY_PER_WINDOW: 80%
 - MAX_ORDERS_PER_WINDOW: 30
 - MERGE_MIN_SIZE: 10 shares
-- ENTRY_DELAY: 5s nach Window-Open
-- STOP_BUYING_BEFORE_END_S: 40s vor Window-Ende
 - MERGE_BEFORE_END_S: 20s vor Window-Ende
 - MAX_CHUNK_SIZE: 200 shares
-- Fee: **0% (Maker)** — NOT the 1-1.5% taker curve
+- Fee: **0% (Maker)** for 90%+ of fills, **1-1.5% (Taker)** only for rebalance
 
 ### Architecture
-- `src/execution/merge-arb-executor.ts` — V5 Core: maker quoting loop + final merge
+- `src/execution/merge-arb-executor.ts` — V5 Core: 3-phase (maker→rebalance→merge)
 - `src/execution/dry-run-engine.ts` — Maker fill simulation (ask crosses bid = fill, 0% fee)
 - `src/data/clob-ws.ts` — CLOB WebSocket (orderbook data, price_change updates asks/bids)
 - `src/data/clob.ts` — CLOB REST API (orders, fills, balance, GTC limit orders)

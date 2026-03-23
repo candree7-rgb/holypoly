@@ -17,19 +17,18 @@ import { DryRunEngine } from "./dry-run-engine.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
 /**
- * MergeArbExecutor V5: Maker Strategy — post limit bids, 0% fee.
+ * MergeArbExecutor V5: 3-Phase Maker Strategy.
  *
  * KEY INSIGHT: Maker fee = 0% on Polymarket crypto markets.
- * V1-V4 were TAKERS (hit the ask) → paid 1-1.5% fee → edge destroyed.
- * V5 posts limit BUY orders BELOW the ask (maker) → 0% fee + rebates.
+ * V1-V4 were TAKERS → paid 1-1.5% fee → edge destroyed.
  *
- * Strategy:
- * 1. Post GTC BUY on Up at (bestAsk - MAKER_OFFSET)
- * 2. Post GTC BUY on Down at (bestAsk - MAKER_OFFSET)
- * 3. Combined bid < 100¢ (we control the prices!)
- * 4. Wait for fills — BTC oscillation causes ask to cross our bids
- * 5. Update quotes as prices move (cancel + repost)
- * 6. Merge matched shares at end → profit
+ * 3-Phase Flow:
+ * Phase 1 (MAKER, T+5s→T+240s): Post GTC BUY below ask on both sides.
+ *   0% fee, only requote downward, wait for fills via oscillation.
+ * Phase 2 (ASSESS+REBALANCE, T+240s→T+270s): Cancel unfilled orders.
+ *   If imbalance: buy the short side as TAKER (1% fee) to eliminate
+ *   naked directional exposure. Only ~5-10% of shares are taker.
+ * Phase 3 (MERGE, T+270s→T+290s): Merge all matched shares for $1.
  */
 export class MergeArbExecutor {
   private dryRunEngine: DryRunEngine | null = null;
@@ -117,11 +116,11 @@ export class MergeArbExecutor {
     );
 
     // ═══════════════════════════════════════════════════
-    // PHASE 1: ACCUMULATE — Maker Quoting (V5)
+    // PHASE 1: MAKER QUOTING (T+5s to T+240s)
     // Post limit BUY orders BELOW the ask on both sides.
-    // Maker fee = 0% (vs 1-1.5% taker fee that killed V1-V4).
-    // We choose the prices → combined < 100¢ → merge for profit.
-    // BTC oscillation causes ask to cross down to our bids → fills.
+    // Maker fee = 0%. We choose prices → combined < 100¢.
+    // BTC oscillation causes ask to cross our bids → fills.
+    // Only requote DOWNWARD — never chase ask upward!
     // ═══════════════════════════════════════════════════
     let filledUpShares = 0;
     let filledDnShares = 0;
@@ -133,7 +132,7 @@ export class MergeArbExecutor {
     const merges: MergeResult[] = [];
     let totalMergedInWindow = 0;
 
-    const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
+    const makerPhaseEnd = window.endTime - this.config.makerPhaseEndS * 1000;
     const minOrderCost = chunkSize * 0.05;
     const makerOffset = this.config.makerOffsetCents / 100;
 
@@ -146,22 +145,14 @@ export class MergeArbExecutor {
     while (
       orderCount < this.config.maxOrdersPerWindow &&
       availableBudget > minOrderCost &&
-      Date.now() < stopBuyingTime
+      Date.now() < makerPhaseEnd
     ) {
-      // --- READ BOTH BOOKS (live WS) ---
-      const upBook = this.config.dryRun && this.dryRunEngine
-        ? this.dryRunEngine.getBookView(window.upTokenId)
-        : this.clobWs.getBook(window.upTokenId);
-      const dnBook = this.config.dryRun && this.dryRunEngine
-        ? this.dryRunEngine.getBookView(window.downTokenId)
-        : this.clobWs.getBook(window.downTokenId);
+      const upBook = this.getBook(window.upTokenId);
+      const dnBook = this.getBook(window.downTokenId);
 
       if (!upBook?.asks?.length || !dnBook?.asks?.length) {
         this.consecutiveFailures++;
-        if (this.consecutiveFailures >= 20) {
-          this.logger.warn("Too many no-book ticks, stopping");
-          break;
-        }
+        if (this.consecutiveFailures >= 20) break;
         await sleep(this.config.quoteUpdateMs);
         continue;
       }
@@ -170,256 +161,191 @@ export class MergeArbExecutor {
       const upBestAsk = upBook.asks[0].price;
       const dnBestAsk = dnBook.asks[0].price;
 
-      // --- CALCULATE MAKER BID PRICES ---
-      // Bid below the ask → maker order (0% fee)
-      // makerOffset ¢ below ask gives us edge per side
-      let upBid = Math.max(0.01, upBestAsk - makerOffset);
-      let dnBid = Math.max(0.01, dnBestAsk - makerOffset);
-
-      // Round to cents (Polymarket tick = 0.01)
-      upBid = Math.round(upBid * 100) / 100;
-      dnBid = Math.round(dnBid * 100) / 100;
-
-      // Ensure we're maker (strictly below ask)
+      // Calculate maker bid prices (below ask = maker, 0% fee)
+      let upBid = Math.max(0.01, Math.round((upBestAsk - makerOffset) * 100) / 100);
+      let dnBid = Math.max(0.01, Math.round((dnBestAsk - makerOffset) * 100) / 100);
       if (upBid >= upBestAsk) upBid = Math.max(0.01, upBestAsk - 0.01);
       if (dnBid >= dnBestAsk) dnBid = Math.max(0.01, dnBestAsk - 0.01);
 
-      const combinedBid = (upBid + dnBid) * 100;
-
-      // --- DRY_RUN: CHECK FOR FILLS ON ACTIVE BIDS ---
+      // --- CHECK FOR FILLS & MANAGE ORDERS ---
       if (this.config.dryRun && this.dryRunEngine) {
-        // A maker bid fills when the ask crosses down to our bid price.
-        // In real life: someone sells into our resting bid.
+        // DRY_RUN: fill when bestAsk crosses down to our bid
         if (activeUpOrderId && upBestAsk <= activeUpPrice) {
           const fillCost = chunkSize * activeUpPrice; // 0% MAKER FEE!
           filledUpShares += chunkSize;
           totalUpCost += fillCost;
           availableBudget -= fillCost;
           this.dryRunEngine.recordMakerFill("Up", chunkSize, activeUpPrice);
-          orderFills.push({
-            orderNum: orderCount, side: "Up", filledSize: chunkSize,
-            avgPrice: activeUpPrice, totalCost: fillCost,
-            fee: 0, timestamp: Date.now(),
-          });
+          orderFills.push({ orderNum: orderCount, side: "Up", filledSize: chunkSize,
+            avgPrice: activeUpPrice, totalCost: fillCost, fee: 0, timestamp: Date.now() });
           orderCount++;
-          this.logger.info("V5 maker fill", {
-            side: "Up", price: `${(activeUpPrice * 100).toFixed(1)}¢`,
-            fee: "0¢ (maker)", upSh: filledUpShares.toFixed(0), dnSh: filledDnShares.toFixed(0),
-          });
-          activeUpOrderId = null;
-          activeUpPrice = 0;
+          this.logger.info("Maker fill", { side: "Up", price: `${(activeUpPrice * 100).toFixed(1)}¢`,
+            upSh: filledUpShares.toFixed(0), dnSh: filledDnShares.toFixed(0) });
+          activeUpOrderId = null; activeUpPrice = 0;
         }
-
         if (activeDnOrderId && dnBestAsk <= activeDnPrice) {
           const fillCost = chunkSize * activeDnPrice;
           filledDnShares += chunkSize;
           totalDnCost += fillCost;
           availableBudget -= fillCost;
           this.dryRunEngine.recordMakerFill("Down", chunkSize, activeDnPrice);
-          orderFills.push({
-            orderNum: orderCount, side: "Down", filledSize: chunkSize,
-            avgPrice: activeDnPrice, totalCost: fillCost,
-            fee: 0, timestamp: Date.now(),
-          });
+          orderFills.push({ orderNum: orderCount, side: "Down", filledSize: chunkSize,
+            avgPrice: activeDnPrice, totalCost: fillCost, fee: 0, timestamp: Date.now() });
           orderCount++;
-          this.logger.info("V5 maker fill", {
-            side: "Down", price: `${(activeDnPrice * 100).toFixed(1)}¢`,
-            fee: "0¢ (maker)", upSh: filledUpShares.toFixed(0), dnSh: filledDnShares.toFixed(0),
-          });
-          activeDnOrderId = null;
-          activeDnPrice = 0;
+          this.logger.info("Maker fill", { side: "Down", price: `${(activeDnPrice * 100).toFixed(1)}¢`,
+            upSh: filledUpShares.toFixed(0), dnSh: filledDnShares.toFixed(0) });
+          activeDnOrderId = null; activeDnPrice = 0;
         }
-
-        // Post/update virtual bids (balance: don't over-accumulate one side)
-        // CRITICAL: Only requote DOWNWARD (cheaper). Never chase the ask upward!
-        // If ask goes up → our old bid is further from ask → keep it (it's cheaper).
-        // If ask goes down → requote to stay at ask-offset (tighter, still maker).
+        // Post/update virtual bids — only requote DOWNWARD, never chase up
         if (!activeUpOrderId && filledUpShares <= filledDnShares + chunkSize) {
-          activeUpOrderId = `dry-up-${Date.now()}`;
-          activeUpPrice = upBid;
+          activeUpOrderId = `dry-up-${Date.now()}`; activeUpPrice = upBid;
         } else if (activeUpOrderId && upBid < activeUpPrice - 0.005) {
-          // Ask went DOWN → our bid should also go down (stay cheap)
-          activeUpOrderId = `dry-up-${Date.now()}`;
-          activeUpPrice = upBid;
+          activeUpOrderId = `dry-up-${Date.now()}`; activeUpPrice = upBid;
         }
-        // If upBid > activeUpPrice: ask went UP → DON'T requote up (keep cheap bid)
-
         if (!activeDnOrderId && filledDnShares <= filledUpShares + chunkSize) {
-          activeDnOrderId = `dry-dn-${Date.now()}`;
-          activeDnPrice = dnBid;
+          activeDnOrderId = `dry-dn-${Date.now()}`; activeDnPrice = dnBid;
         } else if (activeDnOrderId && dnBid < activeDnPrice - 0.005) {
-          // Ask went DOWN → requote down
-          activeDnOrderId = `dry-dn-${Date.now()}`;
-          activeDnPrice = dnBid;
+          activeDnOrderId = `dry-dn-${Date.now()}`; activeDnPrice = dnBid;
         }
-        // If dnBid > activeDnPrice: ask went UP → DON'T requote up
       } else {
-        // === LIVE MODE: Manage real GTC maker orders ===
-
-        // Check fills on active orders
+        // LIVE: manage real GTC orders
         if (activeUpOrderId) {
           const filled = await this.clob.getFilledShares(activeUpOrderId);
           if (filled > 0) {
-            const fillCost = filled * activeUpPrice; // 0% maker fee
-            filledUpShares += filled;
-            totalUpCost += fillCost;
-            availableBudget -= fillCost;
-            orderFills.push({
-              orderNum: orderCount, side: "Up", filledSize: filled,
-              avgPrice: activeUpPrice, totalCost: fillCost,
-              fee: 0, timestamp: Date.now(),
-            });
+            filledUpShares += filled; totalUpCost += filled * activeUpPrice; availableBudget -= filled * activeUpPrice;
+            orderFills.push({ orderNum: orderCount, side: "Up", filledSize: filled,
+              avgPrice: activeUpPrice, totalCost: filled * activeUpPrice, fee: 0, timestamp: Date.now() });
             orderCount++;
-            this.logger.info("V5 maker fill (LIVE)", {
-              side: "Up", filled: filled.toFixed(1), price: `${(activeUpPrice * 100).toFixed(1)}¢`,
-            });
-            await this.clob.cancelOrder(activeUpOrderId); // cancel remainder
-            activeUpOrderId = null;
-            activeUpPrice = 0;
+            await this.clob.cancelOrder(activeUpOrderId); activeUpOrderId = null; activeUpPrice = 0;
           } else if (upBid < activeUpPrice - 0.005) {
-            // Ask went DOWN → requote down (stay cheap). Never up!
-            await this.clob.cancelOrder(activeUpOrderId);
-            activeUpOrderId = null;
+            await this.clob.cancelOrder(activeUpOrderId); activeUpOrderId = null;
           }
         }
-
         if (activeDnOrderId) {
           const filled = await this.clob.getFilledShares(activeDnOrderId);
           if (filled > 0) {
-            const fillCost = filled * activeDnPrice;
-            filledDnShares += filled;
-            totalDnCost += fillCost;
-            availableBudget -= fillCost;
-            orderFills.push({
-              orderNum: orderCount, side: "Down", filledSize: filled,
-              avgPrice: activeDnPrice, totalCost: fillCost,
-              fee: 0, timestamp: Date.now(),
-            });
+            filledDnShares += filled; totalDnCost += filled * activeDnPrice; availableBudget -= filled * activeDnPrice;
+            orderFills.push({ orderNum: orderCount, side: "Down", filledSize: filled,
+              avgPrice: activeDnPrice, totalCost: filled * activeDnPrice, fee: 0, timestamp: Date.now() });
             orderCount++;
-            this.logger.info("V5 maker fill (LIVE)", {
-              side: "Down", filled: filled.toFixed(1), price: `${(activeDnPrice * 100).toFixed(1)}¢`,
-            });
-            await this.clob.cancelOrder(activeDnOrderId);
-            activeDnOrderId = null;
-            activeDnPrice = 0;
+            await this.clob.cancelOrder(activeDnOrderId); activeDnOrderId = null; activeDnPrice = 0;
           } else if (dnBid < activeDnPrice - 0.005) {
-            // Ask went DOWN → requote down. Never up!
-            await this.clob.cancelOrder(activeDnOrderId);
-            activeDnOrderId = null;
+            await this.clob.cancelOrder(activeDnOrderId); activeDnOrderId = null;
           }
         }
-
-        // Post new maker bids where needed (balance both sides)
-        // CRITICAL: Only requote DOWNWARD. Never chase the ask upward!
-        // Post new bids where needed
+        // Post new maker bids — only requote downward
         if (!activeUpOrderId && filledUpShares <= filledDnShares + chunkSize) {
-          const result = await this.clob.placeBatchOrders(
-            [{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }],
-            OrderType.GTC,
-          );
-          if (result.placed > 0 && result.orderIds.length > 0) {
-            activeUpOrderId = result.orderIds[0];
-            activeUpPrice = upBid;
-            this.logger.debug("Posted Up maker bid", { price: `${(upBid * 100).toFixed(1)}¢` });
-          }
+          const r = await this.clob.placeBatchOrders([{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }], OrderType.GTC);
+          if (r.placed > 0 && r.orderIds.length > 0) { activeUpOrderId = r.orderIds[0]; activeUpPrice = upBid; }
         } else if (activeUpOrderId && upBid < activeUpPrice - 0.005) {
-          // Ask went DOWN → requote our bid down (stay cheap)
           await this.clob.cancelOrder(activeUpOrderId);
-          const result = await this.clob.placeBatchOrders(
-            [{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }],
-            OrderType.GTC,
-          );
-          if (result.placed > 0 && result.orderIds.length > 0) {
-            activeUpOrderId = result.orderIds[0];
-            activeUpPrice = upBid;
-          } else {
-            activeUpOrderId = null;
-          }
+          const r = await this.clob.placeBatchOrders([{ tokenId: window.upTokenId, side: Side.BUY, price: upBid, size: chunkSize }], OrderType.GTC);
+          if (r.placed > 0 && r.orderIds.length > 0) { activeUpOrderId = r.orderIds[0]; activeUpPrice = upBid; } else { activeUpOrderId = null; }
         }
-        // If upBid > activeUpPrice: ask went UP → keep old cheap bid
-
         if (!activeDnOrderId && filledDnShares <= filledUpShares + chunkSize) {
-          const result = await this.clob.placeBatchOrders(
-            [{ tokenId: window.downTokenId, side: Side.BUY, price: dnBid, size: chunkSize }],
-            OrderType.GTC,
-          );
-          if (result.placed > 0 && result.orderIds.length > 0) {
-            activeDnOrderId = result.orderIds[0];
-            activeDnPrice = dnBid;
-            this.logger.debug("Posted Dn maker bid", { price: `${(dnBid * 100).toFixed(1)}¢` });
-          }
+          const r = await this.clob.placeBatchOrders([{ tokenId: window.downTokenId, side: Side.BUY, price: dnBid, size: chunkSize }], OrderType.GTC);
+          if (r.placed > 0 && r.orderIds.length > 0) { activeDnOrderId = r.orderIds[0]; activeDnPrice = dnBid; }
         } else if (activeDnOrderId && dnBid < activeDnPrice - 0.005) {
-          // Ask went DOWN → requote our bid down
           await this.clob.cancelOrder(activeDnOrderId);
-          const result = await this.clob.placeBatchOrders(
-            [{ tokenId: window.downTokenId, side: Side.BUY, price: dnBid, size: chunkSize }],
-            OrderType.GTC,
-          );
-          if (result.placed > 0 && result.orderIds.length > 0) {
-            activeDnOrderId = result.orderIds[0];
-            activeDnPrice = dnBid;
-          } else {
-            activeDnOrderId = null;
-          }
+          const r = await this.clob.placeBatchOrders([{ tokenId: window.downTokenId, side: Side.BUY, price: dnBid, size: chunkSize }], OrderType.GTC);
+          if (r.placed > 0 && r.orderIds.length > 0) { activeDnOrderId = r.orderIds[0]; activeDnPrice = dnBid; } else { activeDnOrderId = null; }
         }
-        // If dnBid > activeDnPrice: ask went UP → keep old cheap bid
       }
 
-      // --- RUNNING STATS ---
+      // Running stats
       const matched = Math.min(filledUpShares, filledDnShares);
       if (matched > 0 && orderCount % 2 === 0) {
-        const runningCombined = ((totalUpCost + totalDnCost) / matched) * 100;
-        this.logger.info("Maker progress", {
-          orders: orderCount, matched: `${matched.toFixed(0)}sh`,
-          avgCombined: `${runningCombined.toFixed(1)}¢`,
-          budget: `$${availableBudget.toFixed(0)}`,
-          upBid: `${(activeUpPrice * 100).toFixed(0)}¢`,
-          dnBid: `${(activeDnPrice * 100).toFixed(0)}¢`,
-        });
+        const rc = ((totalUpCost + totalDnCost) / matched) * 100;
+        this.logger.info("Maker progress", { orders: orderCount, matched: `${matched.toFixed(0)}sh`,
+          avgCombined: `${rc.toFixed(1)}¢`, budget: `$${availableBudget.toFixed(0)}` });
       }
 
-      // --- MID-MERGE RECYCLING ---
+      // Mid-merge recycling
       const matched2 = Math.min(filledUpShares, filledDnShares);
-      if (
-        availableBudget < chunkSize * 2 &&
-        matched2 >= this.config.mergeMinSize &&
-        Date.now() < stopBuyingTime - 30_000
-      ) {
-        this.logger.info("Mid-merge recycling: budget low", {
-          budget: `$${availableBudget.toFixed(0)}`,
-          merging: `${matched2.toFixed(0)}sh`,
-        });
-        const mergeResult = await this.doMerge(
-          window, matched2, filledUpShares, filledDnShares, totalUpCost, totalDnCost,
-        );
-        if (mergeResult) {
-          merges.push(mergeResult);
-          totalMergedInWindow += mergeResult.merged;
-          const origUp = filledUpShares;
-          const origDn = filledDnShares;
-          filledUpShares -= mergeResult.merged;
-          filledDnShares -= mergeResult.merged;
-          availableBudget += mergeResult.recovered;
-          totalUpCost = origUp > 0 ? totalUpCost * (filledUpShares / origUp) : 0;
-          totalDnCost = origDn > 0 ? totalDnCost * (filledDnShares / origDn) : 0;
+      if (availableBudget < chunkSize * 2 && matched2 >= this.config.mergeMinSize && Date.now() < makerPhaseEnd - 30_000) {
+        const mr = await this.doMerge(window, matched2, filledUpShares, filledDnShares, totalUpCost, totalDnCost);
+        if (mr) {
+          merges.push(mr); totalMergedInWindow += mr.merged;
+          const oU = filledUpShares, oD = filledDnShares;
+          filledUpShares -= mr.merged; filledDnShares -= mr.merged; availableBudget += mr.recovered;
+          totalUpCost = oU > 0 ? totalUpCost * (filledUpShares / oU) : 0;
+          totalDnCost = oD > 0 ? totalDnCost * (filledDnShares / oD) : 0;
         }
       }
 
       await sleep(this.config.quoteUpdateMs);
     }
 
-    // Cancel remaining active orders
+    // Cancel remaining active maker orders
     if (!this.config.dryRun) {
       if (activeUpOrderId) await this.clob.cancelOrder(activeUpOrderId);
       if (activeDnOrderId) await this.clob.cancelOrder(activeDnOrderId);
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2: FINAL MERGE (T+260-280s)
+    // PHASE 2: ASSESS + TAKER REBALANCE (T+240s to T+270s)
+    // If one side has more fills → buy the short side as TAKER.
+    // Yes, taker costs 1-1.5% fee — but only on the rebalance
+    // portion, not on the 90%+ that was filled as maker (0%).
+    // This eliminates naked directional exposure.
+    // ═══════════════════════════════════════════════════
+    const imbalance = Math.abs(filledUpShares - filledDnShares);
+    if (imbalance > 0 && availableBudget > 0) {
+      const shortSide: TradeSide = filledUpShares > filledDnShares ? "Down" : "Up";
+      const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
+      const sharesToRebalance = Math.min(imbalance, this.config.maxTakerRebalanceShares);
+
+      this.logger.info("Phase 2: Taker rebalance", {
+        imbalance: imbalance.toFixed(0),
+        shortSide,
+        rebalancing: sharesToRebalance.toFixed(0),
+        maxAllowed: this.config.maxTakerRebalanceShares,
+      });
+
+      if (sharesToRebalance > 0) {
+        const book = this.getBook(shortToken);
+        const bestAsk = book?.asks?.[0]?.price ?? 0.50;
+        const rebalancePrice = bestAsk + this.config.slippageBuffer;
+
+        // Execute taker buy for rebalance
+        const fill = await this.buyOrder(shortToken, sharesToRebalance, rebalancePrice, shortSide);
+        if (fill.filled) {
+          const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+          if (shortSide === "Up") {
+            filledUpShares += fill.filledSize;
+            totalUpCost += fill.totalCost;
+          } else {
+            filledDnShares += fill.filledSize;
+            totalDnCost += fill.totalCost;
+          }
+          availableBudget -= fill.totalCost;
+          orderFills.push({
+            orderNum: orderCount, side: shortSide, filledSize: fill.filledSize,
+            avgPrice: fill.avgPrice, totalCost: fill.totalCost, fee, timestamp: Date.now(),
+          });
+          orderCount++;
+
+          this.logger.info("Taker rebalance filled", {
+            side: shortSide, size: fill.filledSize.toFixed(0),
+            price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+            fee: `$${fee.toFixed(2)}`,
+            newBalance: `Up=${filledUpShares.toFixed(0)} Dn=${filledDnShares.toFixed(0)}`,
+          });
+          this.telegram.send(
+            `⚖️ Rebalance: bought ${fill.filledSize.toFixed(0)}sh ${shortSide} as taker ` +
+            `at ${(fill.avgPrice * 100).toFixed(1)}¢ (fee: $${fee.toFixed(2)})`,
+          );
+        } else {
+          this.logger.warn("Taker rebalance failed — will have imbalance at merge");
+        }
+      }
+    }
+
+    // ═══════════════════════════════════════════════════
+    // PHASE 3: FINAL MERGE (T+270-290s)
     // ═══════════════════════════════════════════════════
     const finalMatched = Math.min(filledUpShares, filledDnShares);
     if (finalMatched >= this.config.mergeMinSize) {
-      // Wait until merge time if needed
       const mergeTime = window.endTime - this.config.mergeBeforeEndS * 1000;
       const waitForMerge = mergeTime - Date.now();
       if (waitForMerge > 0 && waitForMerge < 60_000) {
@@ -435,7 +361,6 @@ export class MergeArbExecutor {
         totalMergedInWindow += mergeResult.merged;
         filledUpShares -= mergeResult.merged;
         filledDnShares -= mergeResult.merged;
-        // Reduce costs proportionally
         const upAvg = totalUpCost / (filledUpShares + mergeResult.merged);
         const dnAvg = totalDnCost / (filledDnShares + mergeResult.merged);
         totalUpCost = filledUpShares * upAvg;
@@ -634,6 +559,14 @@ export class MergeArbExecutor {
   }
 
   // ─── PRIVATE METHODS ───
+
+  /** Get orderbook — uses DryRunEngine in DRY_RUN, WS otherwise */
+  private getBook(tokenId: string): BookSnapshot | null {
+    if (this.config.dryRun && this.dryRunEngine) {
+      return this.dryRunEngine.getBookView(tokenId);
+    }
+    return this.clobWs.getBook(tokenId);
+  }
 
   /**
    * Buy order: GTC primary with 3s cancel, FOK fallback.
