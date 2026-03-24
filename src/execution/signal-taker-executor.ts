@@ -336,7 +336,7 @@ export class SignalTakerExecutor {
         cap: `${(dynamicCap * 100).toFixed(1)}¢`,
       });
 
-      const book = this.getBook(shortToken);
+      const book = await this.getRebalanceBook(shortToken);
       const bestAsk = this.getAskPrice(book);
 
       if (bestAsk === null) {
@@ -403,7 +403,7 @@ export class SignalTakerExecutor {
         this.config.rebalanceMaxPrice,
       );
 
-      const emergencyBook = this.getBook(shortToken);
+      const emergencyBook = await this.getRebalanceBook(shortToken);
       const emergencyAsk = this.getAskPrice(emergencyBook);
 
       this.logger.warn("Phase 2b: EMERGENCY rebalance (dynamic cap)", {
@@ -416,7 +416,7 @@ export class SignalTakerExecutor {
       // Try to buy — first attempt, then 1.5s retry
       let filled = false;
       for (let attempt = 0; attempt < 2 && !filled; attempt++) {
-        const book = attempt === 0 ? emergencyBook : this.getBook(shortToken);
+        const book = attempt === 0 ? emergencyBook : await this.getRebalanceBook(shortToken);
         const ask = this.getAskPrice(book);
 
         if (ask !== null && ask <= emergencyCap) {
@@ -656,6 +656,38 @@ export class SignalTakerExecutor {
   }
 
   // ─── PRIVATE METHODS (unchanged) ───
+
+  /**
+   * Get book for rebalance: if WS ask looks stale/empty (null or ≥ 90¢),
+   * fetch a fresh snapshot via REST. At end-of-window, MMs pull orders
+   * and WS book can show 1.0 or be empty.
+   */
+  private async getRebalanceBook(tokenId: string): Promise<BookSnapshot | null> {
+    const wsBook = this.getBook(tokenId);
+    const wsAsk = this.getAskPrice(wsBook);
+
+    // WS book looks reasonable
+    if (wsAsk !== null && wsAsk < 0.90) {
+      return wsBook;
+    }
+
+    // WS book is stale/empty — try REST
+    this.logger.debug("Rebalance: WS book stale, fetching REST snapshot", {
+      wsAsk: wsAsk !== null ? `${(wsAsk * 100).toFixed(1)}¢` : "null",
+    });
+    try {
+      const ob = await this.clob.getOrderbook(tokenId);
+      return {
+        assetId: tokenId,
+        bids: ob.bids.map(b => ({ price: b.price, size: b.size })),
+        asks: ob.asks.map(a => ({ price: a.price, size: a.size })),
+        bestBid: ob.bestBid,
+        bestAsk: ob.bestAsk,
+      };
+    } catch {
+      return wsBook; // fallback to whatever WS had
+    }
+  }
 
   private getBook(tokenId: string): BookSnapshot | null {
     if (this.config.dryRun && this.dryRunEngine) {
