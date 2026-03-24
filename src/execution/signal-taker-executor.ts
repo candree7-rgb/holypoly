@@ -39,8 +39,7 @@ export class SignalTakerExecutor {
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
-  private static readonly EMERGENCY_RISK_AVERSION = 0.30;    // 0=risk-neutral, 1=very risk-averse
-  private static readonly EMERGENCY_FEE_ESTIMATE = 0.005;   // ~0.5% typical taker fee at these prices
+  private static readonly EMERGENCY_MAX_LOSS = 0.10;         // max 10¢/share loss to avoid naked position
   private static readonly MERGE_MAX_RETRIES = 4;             // exponential backoff retries for merge
 
   constructor(
@@ -363,15 +362,12 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2b: EMERGENCY REBALANCE (EV-based)
+    // PHASE 2b: EMERGENCY REBALANCE (Stop-Loss)
     // If still imbalanced after Phase 2a, buy at market up to
-    // an EV-derived cap. Merging at a small loss beats naked
-    // 50/50 gamble (huge variance on $0-or-$1 resolution).
-    //
-    // Math: naked EV = 50¢ - longAvg (but stdev = 50¢/share!)
-    // Merge is better than naked when:
-    //   ask ≤ 50¢ + (50¢ × riskAversion) - fees ≈ 65¢
-    // This cap is INDEPENDENT of longSideAvg — always ~65¢.
+    // breakeven + MAX_LOSS to avoid naked positions.
+    // Max loss per share is capped (e.g. 10¢) regardless of
+    // long-side avg. -10¢/sh is always better than naked
+    // 50/50 gamble on $0 or $1 resolution.
     // ═══════════════════════════════════════════════════
     const emergencyImbalance = Math.abs(filledUp - filledDn);
     if (emergencyImbalance > 0 && availableBudget > 0) {
@@ -381,23 +377,25 @@ export class SignalTakerExecutor {
       const longSideAvg = shortSide === "Down"
         ? (filledUp > 0 ? costUp / filledUp : 0)
         : (filledDn > 0 ? costDn / filledDn : 0);
+      const breakeven = 1.00 - longSideAvg;
 
-      // EV-based cap: 50¢ (naked binary EV) + variance penalty - fees
-      const variancePenalty = 0.50 * SignalTakerExecutor.EMERGENCY_RISK_AVERSION;
-      const evBasedCap = 0.50 + variancePenalty - SignalTakerExecutor.EMERGENCY_FEE_ESTIMATE;
-      const emergencyCap = Math.min(evBasedCap, this.config.rebalanceMaxPrice);
+      // Stop-loss cap: breakeven + max acceptable loss per share
+      const emergencyCap = Math.min(
+        breakeven + SignalTakerExecutor.EMERGENCY_MAX_LOSS,
+        this.config.rebalanceMaxPrice,
+      );
 
       const emergencyBook = this.getBook(shortToken);
       const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
       const mergeLoss = (longSideAvg + emergencyAsk - 1.00) * 100;
 
-      this.logger.warn("Phase 2b: EMERGENCY rebalance (EV-based)", {
+      this.logger.warn("Phase 2b: EMERGENCY rebalance (stop-loss)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
         ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
-        evCap: `${(emergencyCap * 100).toFixed(1)}¢`,
+        cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+        maxLoss: `${(SignalTakerExecutor.EMERGENCY_MAX_LOSS * 100).toFixed(0)}¢/sh`,
         mergeLoss: `${mergeLoss.toFixed(1)}¢/sh`,
-        longAvg: `${(longSideAvg * 100).toFixed(1)}¢`,
       });
 
       if (emergencyAsk <= emergencyCap) {
@@ -481,14 +479,15 @@ export class SignalTakerExecutor {
             );
           }
         } else {
-          this.logger.error("EMERGENCY rebalance FAILED — ask exceeds EV cap, NAKED POSITION", {
+          this.logger.error("EMERGENCY rebalance FAILED — ask exceeds stop-loss cap, NAKED POSITION", {
             ask: `${(retryAsk * 100).toFixed(1)}¢`,
-            evCap: `${(emergencyCap * 100).toFixed(1)}¢`,
+            cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+            maxLoss: `${(SignalTakerExecutor.EMERGENCY_MAX_LOSS * 100).toFixed(0)}¢/sh`,
             nakedShares: emergencyImbalance.toFixed(0),
             nakedSide: shortSide === "Up" ? "Down" : "Up",
           });
           this.telegram.send(
-            `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh unhedged! Ask ${(retryAsk * 100).toFixed(0)}¢ > EV cap ${(emergencyCap * 100).toFixed(0)}¢`,
+            `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh unhedged! Ask ${(retryAsk * 100).toFixed(0)}¢ > cap ${(emergencyCap * 100).toFixed(0)}¢`,
           );
         }
       }
