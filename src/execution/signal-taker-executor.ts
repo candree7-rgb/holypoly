@@ -170,16 +170,15 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // First two buys (one per side) are unconditional — guarantees both sides get filled.
-      // After that, require momentum signal for timing.
+      // Dynamic interval: momentum-aware timing (no hard gate!)
+      // Good momentum → short interval (aggressive). No signal → normal interval. Near target → longer.
       const hasBothSides = filledUp > 0 && filledDn > 0;
-      if (hasBothSides && !this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow)) {
-        await sleep(this.config.signalCheckIntervalMs);
-        continue;
-      }
-
-      // Dynamic interval: aggressive when far from target, cautious when close
-      const minInterval = this.computeInterval(combinedCents);
+      const hasMomentum = this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow);
+      const baseInterval = this.computeInterval(combinedCents);
+      // Momentum bonus: buy faster when BTC favors this side, slower when not
+      const minInterval = hasBothSides && !hasMomentum
+        ? Math.max(baseInterval, 3000)  // no signal → at least 3s, but still buy!
+        : baseInterval;                  // momentum aligned or first buys → use base
       const now = Date.now();
       if (now - lastBuyTime < minInterval) {
         await sleep(this.config.signalCheckIntervalMs);
@@ -759,9 +758,9 @@ export class SignalTakerExecutor {
     }
 
     const budget = balance * this.config.equityPerWindow;
-    // V7: more fills expected with alternation, conservative chunks
-    const estimatedFills = 10;
-    const estimatedAvgPrice = 0.35;
+    // V8: many small alternating fills (Up/Down/Up/Down...) — target ~40-50 fills total
+    const estimatedFills = 40;
+    const estimatedAvgPrice = 0.40;
     const rawChunk = Math.floor(budget / (estimatedFills * estimatedAvgPrice));
     const chunkSize = Math.min(Math.max(rawChunk, 20), this.config.maxChunkSize);
 

@@ -357,7 +357,7 @@ export const loadConfig = (): Config => {
   const skipIfBestCombinedGt = parseNumber("SKIP_IF_BEST_COMBINED_GT", 1.10);
   const minBookLevels = parseNumber("MIN_BOOK_LEVELS", 3);
   const maxRetriesPerOrder = parseNumber("MAX_RETRIES_PER_ORDER", 1);
-  const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 200);
+  const maxChunkSize = parseNumber("MAX_CHUNK_SIZE", 80);
   const stopBuyingBeforeEndS = parseNumber("STOP_BUYING_BEFORE_END_S", 40);
   const mergeBeforeEndS = parseNumber("MERGE_BEFORE_END_S", 20);
   const dipThresholdPct = parseNumber("DIP_THRESHOLD_PCT", 0.92);
