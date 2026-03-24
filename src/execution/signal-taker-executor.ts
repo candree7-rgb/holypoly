@@ -39,7 +39,7 @@ export class SignalTakerExecutor {
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
-  // No EMERGENCY_MAX_LOSS — always buy to avoid naked. Hard cap = rebalanceMaxPrice (99¢).
+  // Emergency rebalance uses same dynamic cap (breakeven + 3¢). Better naked than guaranteed loss.
   private static readonly MERGE_MAX_RETRIES = 4;             // exponential backoff retries for merge
 
   constructor(
@@ -363,10 +363,10 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2b: EMERGENCY REBALANCE — NEVER NAKED
-    // If still imbalanced after Phase 2a, buy at market price.
-    // Any overpay on ~50 shares is tiny vs naked 50/50 gamble.
-    // Only hard cap: rebalanceMaxPrice (99¢) as sanity check.
+    // PHASE 2b: EMERGENCY REBALANCE — USE DYNAMIC CAP
+    // If still imbalanced after Phase 2a, retry with dynamic cap.
+    // Better to stay naked (50/50 gamble) than guarantee a loss
+    // by buying short side above breakeven.
     // With 1.5s retry if first attempt too expensive.
     // ═══════════════════════════════════════════════════
     const emergencyImbalance = Math.abs(filledUp - filledDn);
@@ -374,14 +374,24 @@ export class SignalTakerExecutor {
       const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
       const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
 
+      // Re-use dynamic cap from Phase 2 — never pay more than breakeven + 3¢
+      const emergencyLongAvg = shortSide === "Down"
+        ? (filledUp > 0 ? costUp / filledUp : 0)
+        : (filledDn > 0 ? costDn / filledDn : 0);
+      const emergencyBreakeven = 1.00 - emergencyLongAvg;
+      const emergencyCap = Math.min(
+        emergencyBreakeven + SignalTakerExecutor.REBALANCE_OVERPAY,
+        this.config.rebalanceMaxPrice,
+      );
+
       const emergencyBook = this.getBook(shortToken);
       const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
 
-      this.logger.warn("Phase 2b: EMERGENCY rebalance (never naked)", {
+      this.logger.warn("Phase 2b: EMERGENCY rebalance (dynamic cap)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
         ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
-        hardCap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
+        cap: `${(emergencyCap * 100).toFixed(1)}¢`,
       });
 
       // Try to buy — first attempt, then 1.5s retry
@@ -390,7 +400,7 @@ export class SignalTakerExecutor {
         const book = attempt === 0 ? emergencyBook : this.getBook(shortToken);
         const ask = book?.asks?.[0]?.price ?? 1.0;
 
-        if (ask <= this.config.rebalanceMaxPrice) {
+        if (ask <= emergencyCap) {
           const buyPrice = ask + this.config.slippageBuffer;
           const fill = await this.buyOrder(shortToken, emergencyImbalance, buyPrice, shortSide);
 
@@ -431,18 +441,22 @@ export class SignalTakerExecutor {
         }
 
         if (!filled && attempt === 0) {
-          this.logger.warn("Emergency: ask too high, retrying in 1.5s...");
+          this.logger.warn("Emergency: ask too high for dynamic cap, retrying in 1.5s...", {
+            ask: `${(ask * 100).toFixed(1)}¢`,
+            cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+          });
           await sleep(1500);
         }
       }
 
       if (!filled) {
-        this.logger.error("EMERGENCY FAILED — NAKED POSITION", {
+        this.logger.warn("NAKED POSITION — ask above dynamic cap, letting expire", {
           nakedShares: emergencyImbalance.toFixed(0),
           nakedSide: shortSide === "Up" ? "Down" : "Up",
+          cap: `${(emergencyCap * 100).toFixed(1)}¢`,
         });
         this.telegram.send(
-          `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged!`,
+          `⚠️ Naked: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged (ask > ${(emergencyCap * 100).toFixed(0)}¢ cap)`,
         );
       }
     }
