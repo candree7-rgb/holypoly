@@ -189,7 +189,7 @@ export class ClobService {
     side: Side;
     price: number;
     size: number;
-  }): Promise<void> {
+  }): Promise<string | null> {
     const { tokenId, side } = params;
     const meta = await this.getMarketMeta(tokenId);
 
@@ -202,7 +202,7 @@ export class ClobService {
         size,
         min: meta.minOrderSize,
       });
-      return;
+      return null;
     }
 
     const resp = await this.client.createAndPostOrder(
@@ -221,6 +221,7 @@ export class ClobService {
     if (resp?.status && resp.status >= 400) {
       throw new Error(`Order failed (status ${resp.status})`);
     }
+    return resp?.orderID ?? null;
   }
 
   /**

@@ -174,15 +174,19 @@ REGIME-WECHSEL:
 
 ### DO NOT TRADE Bedingungen
 
-Window wird **sofort geskippt** wenn:
+**Nur harte Ausschlüsse — wir wollen ~85-90% der Windows traden!**
 
-1. **Starker einseitiger Trend:** BTC >0.10% vom Open nach 15s Observation
-2. **Dünnes Orderbook:** Weniger als 3 Ask-Levels auf einer Seite
-3. **Zu breiter Spread:** Spread >5¢ auf einer Seite (keine realistischen Fills)
-4. **Kein Refill:** Orderbook füllt sich nach Fills nicht wieder auf (MM abwesend)
-5. **Später starker Move:** BTC bewegt sich >0.08% in eine Richtung innerhalb der letzten 60s des Windows
-6. **Zu wenig Oszillation:** Keine Reversal in den ersten 30s nach Observation Phase
-7. **Combined driftet hoch:** Combined >102¢ nach 5+ Fills → Circuit Breaker → sofort stoppen
+Window wird geskippt NUR wenn:
+
+1. **Ultra-starker Trend:** BTC >0.10% vom Open nach 15s Observation → Skip
+2. **Leeres Orderbook:** Weniger als 3 Ask-Levels auf einer Seite → kein Handel möglich
+3. **Combined driftet hoch:** Combined >102¢ nach 5+ Fills → Circuit Breaker → sofort stoppen
+
+**Weiche Signale (kein Skip, aber Vorsicht):**
+- Breiter Spread (>5¢): Kleinere Chunks, nicht skippen
+- Kein Refill nach Fill: Vorsichtiger weiter, nicht skippen
+- Trend (0.03-0.10%): Teurere Seite zuerst, NICHT skippen
+- Wenig Oszillation: Probing Phase klein halten, abwarten
 
 ---
 
@@ -354,14 +358,16 @@ REBALANCE_OVERPAY: 0.03         # max 3¢ over breakeven
 
 | Window-Typ | Häufigkeit | Erwarteter P&L |
 |------------|-----------|----------------|
-| Gute Oszillation (6+ Reversals) | 15% | +$12-18 |
-| Mittlere Oszillation (3-4 Reversals) | 25% | +$3-7 |
-| Trend + Recovery | 20% | +$1-3 |
-| Geskippt (Trend/Skip/Low-Liq) | 30% | $0 |
-| Schlechter Trend (naked) | 8% | -$15-25 |
-| Worst Case (starker Trend) | 2% | -$50-75 |
+| Gute Oszillation (6+ Reversals) | 20% | +$12-18 |
+| Mittlere Oszillation (3-4 Reversals) | 30% | +$3-7 |
+| Trend + Recovery (teurere zuerst) | 25% | +$1-3 |
+| Trend vorsichtig (kleine Probes) | 10% | -$1-3 |
+| Geskippt (ultra-Trend/leeres Buch) | 10% | $0 |
+| Schlechter Trend (naked) | 4% | -$15-25 |
+| Worst Case (starker Trend) | 1% | -$50-75 |
 
-**Gewichteter EV: ~$0.80-1.20 pro Window → $50-100/Tag auf $500 Balance**
+**~90% Participation Rate.** Nur ultra-klare Trends und leere Bücher werden geskippt.
+**Gewichteter EV: ~$1.00-1.50 pro Window → $60-120/Tag auf $500 Balance**
 
 Fee-Einsparung durch Maker: ~40-60% der Fills als Maker (0% Fee) statt Taker (~1.3% Fee).
 Das sind ~0.5-1.0¢ gespart pro Share → bei 100+ Shares/Window: **$0.50-1.00 extra pro Window**.

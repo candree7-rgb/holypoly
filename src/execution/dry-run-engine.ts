@@ -311,6 +311,77 @@ export class DryRunEngine {
   }
 
   /**
+   * Simulate a limit order: post at limitPrice, wait up to timeoutMs,
+   * check if the live ask drops to or below our limit price.
+   * If filled → 0% maker fee. If not → return unfilled.
+   *
+   * In dry-run we check the current ask: if ask ≤ limitPrice, we assume
+   * a fill would occur. This is conservative since in reality we'd need
+   * to wait for the ask to cross our price.
+   */
+  async simulateLimitOrder(
+    tokenId: string,
+    size: number,
+    limitPrice: number,
+    side: "Up" | "Down",
+    timeoutMs: number,
+  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
+    // Check periodically if the ask crosses our limit price
+    const checkInterval = 200;
+    const checks = Math.ceil(timeoutMs / checkInterval);
+    const { sleep } = await import("../utils.js");
+
+    for (let i = 0; i < checks; i++) {
+      const book = this.clobWs.getBook(tokenId);
+      if (book && book.asks.length > 0) {
+        const bestAsk = book.asks[0].price;
+        if (bestAsk <= limitPrice) {
+          // Fill at the ask price (we're a maker sitting at limitPrice, we get filled at our price)
+          const fillPrice = limitPrice;
+          const totalCost = size * fillPrice; // 0% maker fee!
+
+          if (side === "Up") {
+            this.virtualUpShares += size;
+            this.virtualUpCost += totalCost;
+          } else {
+            this.virtualDnShares += size;
+            this.virtualDnCost += totalCost;
+          }
+          this.virtualBalance -= totalCost;
+          // No fee for maker!
+
+          this.fillLog.push({
+            timestamp: Date.now(),
+            side,
+            size,
+            avgPrice: fillPrice,
+            cost: totalCost,
+            type: "GTC",
+          });
+
+          this.logger.info("DRY_RUN: Limit filled (0% maker fee)", {
+            side,
+            size: size.toFixed(1),
+            limitPrice: `${(limitPrice * 100).toFixed(1)}¢`,
+            ask: `${(bestAsk * 100).toFixed(1)}¢`,
+            cost: `$${totalCost.toFixed(2)}`,
+          });
+
+          return { filled: true, filledSize: size, avgPrice: fillPrice, totalCost };
+        }
+      }
+      await sleep(checkInterval);
+    }
+
+    this.logger.debug("DRY_RUN: Limit order timed out", {
+      side,
+      limitPrice: `${(limitPrice * 100).toFixed(1)}¢`,
+      timeoutMs,
+    });
+    return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+  }
+
+  /**
    * Get the current orderbook for pre-flight checks.
    * Returns null if no book available.
    */

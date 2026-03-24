@@ -338,13 +338,32 @@ export const loadConfig = (): Config => {
     : strategyModeRaw === "signal-taker" ? "signal-taker"
     : "merge-arb" as const;
 
-  // V7 Adaptive Signal-Taker parameters
+  // V9 Regime-Adaptive Signal-Taker parameters
   const btcMoveThreshold = parseNumber("BTC_MOVE_THRESHOLD", 0.0005);
   const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.55);
   const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
   const targetCombinedCents = parseNumber("TARGET_COMBINED_CENTS", 97);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
+
+  // V9 Regime Detection
+  const observationPeriodS = parseNumber("OBSERVATION_PERIOD_S", 15);
+  const oscillationThreshold = parseNumber("OSCILLATION_THRESHOLD", 0.0003);  // <0.03% = oscillation
+  const trendSkipThreshold = parseNumber("TREND_SKIP_THRESHOLD", 0.001);       // >0.10% = skip
+  const regimeReevalS = parseNumber("REGIME_REEVAL_S", 10);
+
+  // V9 Maker / Limit Orders
+  const makerTimeoutMs = parseNumber("MAKER_TIMEOUT_MS", 1500);
+
+  // V9 Risk
+  const circuitBreakerCents = parseNumber("CIRCUIT_BREAKER_CENTS", 102);
+  const maxImbalanceRatio = parseNumber("MAX_IMBALANCE_RATIO", 2);
+  const maxNakedDurationS = parseNumber("MAX_NAKED_DURATION_S", 30);
+  const maxSpreadCents = parseNumber("MAX_SPREAD_CENTS", 5);
+
+  // V9 Incremental Sizing
+  const probeChunkPct = parseNumber("PROBE_CHUNK_PCT", 0.25);
+  const probePhaseEndS = parseNumber("PROBE_PHASE_END_S", 30);
 
   // Merge-Arb Strategy parameters (V3)
   const equityPerWindow = parseNumber("EQUITY_PER_WINDOW", 0.80);
@@ -440,6 +459,17 @@ export const loadConfig = (): Config => {
     targetCombinedCents,
     budgetReservePct,
     rebalanceMaxPrice,
+    observationPeriodS,
+    oscillationThreshold,
+    trendSkipThreshold,
+    regimeReevalS,
+    makerTimeoutMs,
+    circuitBreakerCents,
+    maxImbalanceRatio,
+    maxNakedDurationS,
+    maxSpreadCents,
+    probeChunkPct,
+    probePhaseEndS,
     equityPerWindow,
     maxOrdersPerWindow,
     mergeMinSize,
