@@ -188,7 +188,13 @@ export class SignalTakerExecutor {
       // Get ask price
       const tokenId = nextSide === "Up" ? window.upTokenId : window.downTokenId;
       const book = this.getBook(tokenId);
-      const bestAsk = book?.asks?.[0]?.price ?? 1.0;
+      const bestAsk = this.getAskPrice(book);
+
+      if (bestAsk === null) {
+        this.logger.debug("No ask price available, skipping", { side: nextSide });
+        await sleep(this.config.signalCheckIntervalMs);
+        continue;
+      }
 
       // Safety cap
       if (bestAsk >= this.config.cheapThreshold) {
@@ -320,9 +326,11 @@ export class SignalTakerExecutor {
       });
 
       const book = this.getBook(shortToken);
-      const bestAsk = book?.asks?.[0]?.price ?? 1.0;
+      const bestAsk = this.getAskPrice(book);
 
-      if (bestAsk <= dynamicCap) {
+      if (bestAsk === null) {
+        this.logger.warn("Rebalance: no ask price available (book empty)");
+      } else if (bestAsk <= dynamicCap) {
         const rebalancePrice = bestAsk + this.config.slippageBuffer;
         const fill = await this.buyOrder(shortToken, imbalance, rebalancePrice, shortSide);
 
@@ -385,12 +393,12 @@ export class SignalTakerExecutor {
       );
 
       const emergencyBook = this.getBook(shortToken);
-      const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
+      const emergencyAsk = this.getAskPrice(emergencyBook);
 
       this.logger.warn("Phase 2b: EMERGENCY rebalance (dynamic cap)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
-        ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
+        ask: emergencyAsk !== null ? `${(emergencyAsk * 100).toFixed(1)}¢` : "N/A",
         cap: `${(emergencyCap * 100).toFixed(1)}¢`,
       });
 
@@ -398,9 +406,9 @@ export class SignalTakerExecutor {
       let filled = false;
       for (let attempt = 0; attempt < 2 && !filled; attempt++) {
         const book = attempt === 0 ? emergencyBook : this.getBook(shortToken);
-        const ask = book?.asks?.[0]?.price ?? 1.0;
+        const ask = this.getAskPrice(book);
 
-        if (ask <= emergencyCap) {
+        if (ask !== null && ask <= emergencyCap) {
           const buyPrice = ask + this.config.slippageBuffer;
           const fill = await this.buyOrder(shortToken, emergencyImbalance, buyPrice, shortSide);
 
@@ -442,7 +450,7 @@ export class SignalTakerExecutor {
 
         if (!filled && attempt === 0) {
           this.logger.warn("Emergency: ask too high for dynamic cap, retrying in 1.5s...", {
-            ask: `${(ask * 100).toFixed(1)}¢`,
+            ask: ask !== null ? `${(ask * 100).toFixed(1)}¢` : "N/A",
             cap: `${(emergencyCap * 100).toFixed(1)}¢`,
           });
           await sleep(1500);
@@ -563,8 +571,8 @@ export class SignalTakerExecutor {
     if (isFirstBuy) {
       const upBook = this.getBook(window.upTokenId);
       const dnBook = this.getBook(window.downTokenId);
-      const upAsk = upBook?.asks?.[0]?.price ?? 1.0;
-      const dnAsk = dnBook?.asks?.[0]?.price ?? 1.0;
+      const upAsk = this.getAskPrice(upBook) ?? 1.0;
+      const dnAsk = this.getAskPrice(dnBook) ?? 1.0;
       // Buy whichever side is cheaper — or Up if equal
       return dnAsk < upAsk ? "Down" : "Up";
     }
@@ -643,6 +651,14 @@ export class SignalTakerExecutor {
       return this.dryRunEngine.getBookView(tokenId);
     }
     return this.clobWs.getBook(tokenId);
+  }
+
+  /** Get best ask price from book — uses asks[0] first, falls back to bestAsk, never defaults to 1.0 */
+  private getAskPrice(book: BookSnapshot | null): number | null {
+    if (!book) return null;
+    if (book.asks.length > 0) return book.asks[0].price;
+    if (book.bestAsk !== null) return book.bestAsk;
+    return null;
   }
 
   /**
