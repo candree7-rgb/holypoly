@@ -39,7 +39,7 @@ export class SignalTakerExecutor {
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
-  private static readonly EMERGENCY_MAX_LOSS = 0.10;         // max 10¢/share loss to avoid naked position
+  // No EMERGENCY_MAX_LOSS — always buy to avoid naked. Hard cap = rebalanceMaxPrice (99¢).
   private static readonly MERGE_MAX_RETRIES = 4;             // exponential backoff retries for merge
 
   constructor(
@@ -362,92 +362,39 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2b: EMERGENCY REBALANCE (Stop-Loss)
-    // If still imbalanced after Phase 2a, buy at market up to
-    // breakeven + MAX_LOSS to avoid naked positions.
-    // Max loss per share is capped (e.g. 10¢) regardless of
-    // long-side avg. -10¢/sh is always better than naked
-    // 50/50 gamble on $0 or $1 resolution.
+    // PHASE 2b: EMERGENCY REBALANCE — NEVER NAKED
+    // If still imbalanced after Phase 2a, buy at market price.
+    // Any overpay on ~50 shares is tiny vs naked 50/50 gamble.
+    // Only hard cap: rebalanceMaxPrice (99¢) as sanity check.
+    // With 1.5s retry if first attempt too expensive.
     // ═══════════════════════════════════════════════════
     const emergencyImbalance = Math.abs(filledUp - filledDn);
     if (emergencyImbalance > 0 && availableBudget > 0) {
       const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
       const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
 
-      const longSideAvg = shortSide === "Down"
-        ? (filledUp > 0 ? costUp / filledUp : 0)
-        : (filledDn > 0 ? costDn / filledDn : 0);
-      const breakeven = 1.00 - longSideAvg;
-
-      // Stop-loss cap: breakeven + max acceptable loss per share
-      const emergencyCap = Math.min(
-        breakeven + SignalTakerExecutor.EMERGENCY_MAX_LOSS,
-        this.config.rebalanceMaxPrice,
-      );
-
       const emergencyBook = this.getBook(shortToken);
       const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
-      const mergeLoss = (longSideAvg + emergencyAsk - 1.00) * 100;
 
-      this.logger.warn("Phase 2b: EMERGENCY rebalance (stop-loss)", {
+      this.logger.warn("Phase 2b: EMERGENCY rebalance (never naked)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
         ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
-        cap: `${(emergencyCap * 100).toFixed(1)}¢`,
-        maxLoss: `${(SignalTakerExecutor.EMERGENCY_MAX_LOSS * 100).toFixed(0)}¢/sh`,
-        mergeLoss: `${mergeLoss.toFixed(1)}¢/sh`,
+        hardCap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
       });
 
-      if (emergencyAsk <= emergencyCap) {
-        const emergencyPrice = emergencyAsk + this.config.slippageBuffer;
-        const fill = await this.buyOrder(shortToken, emergencyImbalance, emergencyPrice, shortSide);
+      // Try to buy — first attempt, then 1.5s retry
+      let filled = false;
+      for (let attempt = 0; attempt < 2 && !filled; attempt++) {
+        const book = attempt === 0 ? emergencyBook : this.getBook(shortToken);
+        const ask = book?.asks?.[0]?.price ?? 1.0;
 
-        if (fill.filled) {
-          const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
-          totalTakerFees += fee;
-          if (shortSide === "Up") {
-            filledUp += fill.filledSize;
-            costUp += fill.totalCost;
-          } else {
-            filledDn += fill.filledSize;
-            costDn += fill.totalCost;
-          }
-          availableBudget -= fill.totalCost;
-          orderFills.push({
-            orderNum: orderCount,
-            side: shortSide,
-            filledSize: fill.filledSize,
-            avgPrice: fill.avgPrice,
-            totalCost: fill.totalCost,
-            fee,
-            timestamp: Date.now(),
-          });
-          orderCount++;
-
-          const projCombined = ((costUp / (filledUp || 1)) + (costDn / (filledDn || 1))) * 100;
-          this.logger.warn("EMERGENCY rebalance filled", {
-            side: shortSide,
-            size: fill.filledSize.toFixed(0),
-            price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
-            combined: `${projCombined.toFixed(1)}¢`,
-          });
-
-          this.telegram.send(
-            `🚨 Emergency rebalance: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
-          );
-        }
-      } else {
-        // One re-check after 1.5s — book might update
-        this.logger.warn("Emergency ask exceeds cap, waiting 1.5s for re-check...");
-        await sleep(1500);
-        const retryBook = this.getBook(shortToken);
-        const retryAsk = retryBook?.asks?.[0]?.price ?? 1.0;
-
-        if (retryAsk <= emergencyCap) {
-          const retryPrice = retryAsk + this.config.slippageBuffer;
-          const fill = await this.buyOrder(shortToken, emergencyImbalance, retryPrice, shortSide);
+        if (ask <= this.config.rebalanceMaxPrice) {
+          const buyPrice = ask + this.config.slippageBuffer;
+          const fill = await this.buyOrder(shortToken, emergencyImbalance, buyPrice, shortSide);
 
           if (fill.filled) {
+            filled = true;
             const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
             totalTakerFees += fee;
             if (shortSide === "Up") {
@@ -469,27 +416,33 @@ export class SignalTakerExecutor {
             });
             orderCount++;
 
-            this.logger.warn("EMERGENCY rebalance filled (retry)", {
+            const projCombined = ((costUp / (filledUp || 1)) + (costDn / (filledDn || 1))) * 100;
+            this.logger.warn("EMERGENCY filled" + (attempt > 0 ? " (retry)" : ""), {
               side: shortSide,
               size: fill.filledSize.toFixed(0),
               price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+              combined: `${projCombined.toFixed(1)}¢`,
             });
             this.telegram.send(
-              `🚨 Emergency rebalance (retry): ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
+              `🚨 Emergency: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
             );
           }
-        } else {
-          this.logger.error("EMERGENCY rebalance FAILED — ask exceeds stop-loss cap, NAKED POSITION", {
-            ask: `${(retryAsk * 100).toFixed(1)}¢`,
-            cap: `${(emergencyCap * 100).toFixed(1)}¢`,
-            maxLoss: `${(SignalTakerExecutor.EMERGENCY_MAX_LOSS * 100).toFixed(0)}¢/sh`,
-            nakedShares: emergencyImbalance.toFixed(0),
-            nakedSide: shortSide === "Up" ? "Down" : "Up",
-          });
-          this.telegram.send(
-            `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh unhedged! Ask ${(retryAsk * 100).toFixed(0)}¢ > cap ${(emergencyCap * 100).toFixed(0)}¢`,
-          );
         }
+
+        if (!filled && attempt === 0) {
+          this.logger.warn("Emergency: ask too high, retrying in 1.5s...");
+          await sleep(1500);
+        }
+      }
+
+      if (!filled) {
+        this.logger.error("EMERGENCY FAILED — NAKED POSITION", {
+          nakedShares: emergencyImbalance.toFixed(0),
+          nakedSide: shortSide === "Up" ? "Down" : "Up",
+        });
+        this.telegram.send(
+          `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged!`,
+        );
       }
     }
 
