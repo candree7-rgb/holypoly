@@ -170,8 +170,10 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // After first buy, check if price is moving favorably for this side
-      if (!isFirstBuy && !this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow)) {
+      // First two buys (one per side) are unconditional — guarantees both sides get filled.
+      // After that, require momentum signal for timing.
+      const hasBothSides = filledUp > 0 && filledDn > 0;
+      if (hasBothSides && !this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow)) {
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
