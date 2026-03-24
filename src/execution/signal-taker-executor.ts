@@ -196,12 +196,23 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Safety cap
-      if (bestAsk >= this.config.cheapThreshold) {
+      // Safety cap: adaptive based on what we already hold
+      // If we have fills on the OTHER side, allow a higher price as long as combined stays under target.
+      // If no fills yet on other side, use strict cheapThreshold.
+      const otherSideAvgCost = nextSide === "Up"
+        ? (filledDn > 0 ? costDn / filledDn : 0)
+        : (filledUp > 0 ? costUp / filledUp : 0);
+      const otherSideFilled = nextSide === "Up" ? filledDn : filledUp;
+      const effectiveCap = otherSideFilled > 0
+        ? Math.min(this.config.targetCombinedCents / 100 - otherSideAvgCost, this.config.cheapThreshold)
+        : this.config.cheapThreshold;
+
+      if (bestAsk >= effectiveCap) {
         this.logger.debug("Ask above safety cap", {
           side: nextSide,
           ask: `${(bestAsk * 100).toFixed(1)}¢`,
-          cap: `${(this.config.cheapThreshold * 100).toFixed(0)}¢`,
+          cap: `${(effectiveCap * 100).toFixed(1)}¢`,
+          otherAvg: otherSideFilled > 0 ? `${(otherSideAvgCost * 100).toFixed(1)}¢` : "N/A",
         });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
@@ -711,11 +722,23 @@ export class SignalTakerExecutor {
     let upBook = this.clobWs.getBook(window.upTokenId);
     let dnBook = this.clobWs.getBook(window.downTokenId);
 
-    if (!upBook || !dnBook) {
-      const upOb = await this.clob.getOrderbook(window.upTokenId);
-      const dnOb = await this.clob.getOrderbook(window.downTokenId);
-      upBook = { assetId: window.upTokenId, bids: upOb.bids.map(b => ({ price: b.price, size: b.size })), asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
-      dnBook = { assetId: window.downTokenId, bids: dnOb.bids.map(b => ({ price: b.price, size: b.size })), asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
+    const upLevelsWs = upBook?.asks?.length ?? 0;
+    const dnLevelsWs = dnBook?.asks?.length ?? 0;
+
+    // If either book is missing or has insufficient depth from WS,
+    // fall back to REST API for a fresh full snapshot
+    if (!upBook || !dnBook || upLevelsWs < this.config.minBookLevels || dnLevelsWs < this.config.minBookLevels) {
+      this.logger.debug("PreFlight: WS book thin/missing, fetching REST snapshot", {
+        upLevelsWs, dnLevelsWs,
+      });
+      try {
+        const upOb = await this.clob.getOrderbook(window.upTokenId);
+        const dnOb = await this.clob.getOrderbook(window.downTokenId);
+        upBook = { assetId: window.upTokenId, bids: upOb.bids.map(b => ({ price: b.price, size: b.size })), asks: upOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: upOb.bestBid, bestAsk: upOb.bestAsk };
+        dnBook = { assetId: window.downTokenId, bids: dnOb.bids.map(b => ({ price: b.price, size: b.size })), asks: dnOb.asks.map(a => ({ price: a.price, size: a.size })), bestBid: dnOb.bestBid, bestAsk: dnOb.bestAsk };
+      } catch (err) {
+        return { pass: false, reason: `REST orderbook fetch failed: ${(err as Error).message}` };
+      }
     }
 
     if (!upBook || !dnBook) {
