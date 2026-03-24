@@ -196,23 +196,14 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Safety cap: adaptive based on what we already hold
-      // If we have fills on the OTHER side, allow a higher price as long as combined stays under target.
-      // If no fills yet on other side, use strict cheapThreshold.
-      const otherSideAvgCost = nextSide === "Up"
-        ? (filledDn > 0 ? costDn / filledDn : 0)
-        : (filledUp > 0 ? costUp / filledUp : 0);
-      const otherSideFilled = nextSide === "Up" ? filledDn : filledUp;
-      const effectiveCap = otherSideFilled > 0
-        ? Math.min(this.config.targetCombinedCents / 100 - otherSideAvgCost, this.config.cheapThreshold)
-        : this.config.cheapThreshold;
-
-      if (bestAsk >= effectiveCap) {
+      // Safety cap: prevent buying a side so expensive that combined > $1 (guaranteed loss).
+      // The projectedCombined check (below) handles the softer target check.
+      // cheapThreshold is the absolute max we'll pay for any single side.
+      if (bestAsk >= this.config.cheapThreshold) {
         this.logger.debug("Ask above safety cap", {
           side: nextSide,
           ask: `${(bestAsk * 100).toFixed(1)}¢`,
-          cap: `${(effectiveCap * 100).toFixed(1)}¢`,
-          otherAvg: otherSideFilled > 0 ? `${(otherSideAvgCost * 100).toFixed(1)}¢` : "N/A",
+          cap: `${(this.config.cheapThreshold * 100).toFixed(0)}¢`,
         });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
@@ -582,13 +573,12 @@ export class SignalTakerExecutor {
     window: WindowInfo,
     isFirstBuy: boolean,
   ): TradeSide | null {
-    // If one side has fewer shares, must buy that side
-    if (filledUp < filledDn) return "Up";
-    if (filledDn < filledUp) return "Down";
-
-    // Equal (including 0/0): alternate from last buy
-    if (lastBuySide === "Up") return "Down";
-    if (lastBuySide === "Down") return "Up";
+    // Preferred side: whichever has fewer shares (strict alternation / catch-up)
+    let preferred: TradeSide | null = null;
+    if (filledUp < filledDn) preferred = "Up";
+    else if (filledDn < filledUp) preferred = "Down";
+    else if (lastBuySide === "Up") preferred = "Down";
+    else if (lastBuySide === "Down") preferred = "Up";
 
     // First buy ever: pick the cheaper side from the orderbook (no signal needed!)
     if (isFirstBuy) {
@@ -596,15 +586,35 @@ export class SignalTakerExecutor {
       const dnBook = this.getBook(window.downTokenId);
       const upAsk = this.getAskPrice(upBook) ?? 1.0;
       const dnAsk = this.getAskPrice(dnBook) ?? 1.0;
-      // Buy whichever side is cheaper — or Up if equal
       return dnAsk < upAsk ? "Down" : "Up";
     }
 
-    // Use momentum signal: buy the side that BTC is making cheaper
-    if (dipFromHigh > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Up";   // BTC falling → Up cheaper
-    if (bounceFromLow > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Down"; // BTC rising → Down cheaper
+    // If preferred side's ask is affordable, use it
+    if (preferred) {
+      const prefToken = preferred === "Up" ? window.upTokenId : window.downTokenId;
+      const prefBook = this.getBook(prefToken);
+      const prefAsk = this.getAskPrice(prefBook);
+      if (prefAsk !== null && prefAsk < this.config.cheapThreshold) {
+        return preferred;
+      }
+      // Preferred side too expensive — fall through to buy the other side if cheap
+      // (budget-reserve check in caller prevents over-concentration)
+      const other: TradeSide = preferred === "Up" ? "Down" : "Up";
+      const otherToken = other === "Up" ? window.upTokenId : window.downTokenId;
+      const otherBook = this.getBook(otherToken);
+      const otherAsk = this.getAskPrice(otherBook);
+      if (otherAsk !== null && otherAsk < this.config.cheapThreshold) {
+        return other;
+      }
+      // Both sides too expensive — wait
+      return null;
+    }
 
-    return null; // flat, wait for movement
+    // Equal and no last buy: use momentum
+    if (dipFromHigh > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Up";
+    if (bounceFromLow > SignalTakerExecutor.REVERSAL_THRESHOLD) return "Down";
+
+    return null;
   }
 
   /**
