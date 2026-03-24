@@ -540,12 +540,24 @@ export class SignalTakerExecutor {
     });
 
     // ── SINGLE TG MESSAGE ──
+    const nakedUp = filledUp - totalMerged;
+    const nakedDn = filledDn - totalMerged;
+    const nakedSide = nakedUp > 0 ? "Up" : nakedDn > 0 ? "Down" : null;
+    const nakedShares = Math.max(nakedUp, nakedDn);
+    const nakedCost = nakedSide === "Up"
+      ? avgUp * nakedShares
+      : nakedSide === "Down"
+        ? avgDn * nakedShares
+        : 0;
+
     if (totalMerged > 0) {
       const emoji = totalMergeProfit > 0 ? "✅" : "❌";
-      this.telegram.send(
-        `${emoji} ${totalMerged.toFixed(0)}sh merged | ${finalCombined.toFixed(1)}¢ | ` +
-        `${totalMergeProfit > 0 ? "+" : ""}$${totalMergeProfit.toFixed(2)}`,
-      );
+      let msg = `${emoji} ${totalMerged.toFixed(0)}sh merged | ${finalCombined.toFixed(1)}¢ | ` +
+        `${totalMergeProfit > 0 ? "+" : ""}$${totalMergeProfit.toFixed(2)}`;
+      if (nakedShares > 0 && nakedSide) {
+        msg += `\n🎲 ${nakedShares.toFixed(0)}sh ${nakedSide} naked ($${nakedCost.toFixed(2)} at risk)`;
+      }
+      this.telegram.send(msg);
     } else if (orderCount > 0) {
       this.telegram.send(
         `⚠️ ${orderCount} fills but no merge | Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,

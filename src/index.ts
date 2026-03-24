@@ -1094,6 +1094,49 @@ const main = async () => {
             });
             await sleep(waitForResolution);
           }
+
+          // Determine winner and report naked P&L
+          const settlementPrice = rtds.price ?? binance.price;
+          const winner: "Up" | "Down" | null = settlementPrice && window.openingPrice > 0
+            ? (settlementPrice >= window.openingPrice ? "Up" : "Down")
+            : null;
+
+          if (winner) {
+            const nakedSide = result.remainingUp > 0 ? "Up" : "Down";
+            const nakedShares = Math.max(result.remainingUp, result.remainingDn);
+            const nakedAvgCost = nakedSide === "Up"
+              ? (result.totalUpShares > 0 ? result.totalUpCost / result.totalUpShares : 0)
+              : (result.totalDnShares > 0 ? result.totalDnCost / result.totalDnShares : 0);
+            const nakedCost = nakedAvgCost * nakedShares;
+            const nakedWon = nakedSide === winner;
+            const nakedPnl = nakedWon ? (nakedShares - nakedCost) : -nakedCost;
+            const totalPnl = result.totalMergeProfit + nakedPnl;
+
+            logger.info("Naked position resolved", {
+              nakedSide,
+              nakedShares: nakedShares.toFixed(0),
+              winner,
+              nakedPnl: `$${nakedPnl.toFixed(2)}`,
+              totalPnl: `$${totalPnl.toFixed(2)}`,
+            });
+
+            const nakedEmoji = nakedWon ? "🎲✅" : "🎲❌";
+            telegram.send(
+              `${nakedEmoji} ${nakedShares.toFixed(0)}sh ${nakedSide} naked → ${winner} won | ` +
+              `${nakedPnl >= 0 ? "+" : ""}$${nakedPnl.toFixed(2)} | ` +
+              `Window total: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+            );
+
+            // Update P&L tracking with naked result
+            if (nakedPnl !== 0) {
+              await riskManager.recordResult(nakedPnl);
+              riskManager.invalidateBalanceCache();
+            }
+
+            // TODO: Live mode — sell losing shares via mergeArbExecutor.sellRemainingShares
+          } else {
+            logger.warn("No settlement price available for naked P&L calculation");
+          }
         }
 
         clobWs.clear();
