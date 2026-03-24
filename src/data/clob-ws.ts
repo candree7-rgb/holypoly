@@ -105,6 +105,8 @@ export class ClobWsClient {
     this.ws.send(JSON.stringify({
       assets_ids: this.subscribedTokens,
       type: "market",
+      initial_dump: true,
+      level: 2,
       custom_feature_enabled: true,
     }));
     this.logger.debug("CLOB WS subscribed", { tokens: this.subscribedTokens.length });
