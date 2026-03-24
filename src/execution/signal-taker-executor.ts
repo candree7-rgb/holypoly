@@ -39,6 +39,8 @@ export class SignalTakerExecutor {
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
+  private static readonly EMERGENCY_OVERPAY = 0.10;          // emergency: pay up to 10¢ over breakeven to avoid naked
+  private static readonly MERGE_MAX_RETRIES = 4;             // exponential backoff retries for merge
 
   constructor(
     private clob: ClobService,
@@ -360,6 +362,87 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
+    // PHASE 2b: EMERGENCY REBALANCE
+    // If still imbalanced after Phase 2a, pay up to breakeven+10¢
+    // to avoid naked positions. Small loss >> total loss.
+    // ═══════════════════════════════════════════════════
+    const emergencyImbalance = Math.abs(filledUp - filledDn);
+    if (emergencyImbalance > 0 && availableBudget > 0) {
+      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
+      const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
+
+      const longSideAvg = shortSide === "Down"
+        ? (filledUp > 0 ? costUp / filledUp : 0)
+        : (filledDn > 0 ? costDn / filledDn : 0);
+      const breakeven = 1.00 - longSideAvg;
+      const emergencyCap = Math.min(
+        breakeven + SignalTakerExecutor.EMERGENCY_OVERPAY,
+        this.config.rebalanceMaxPrice,
+      );
+
+      const emergencyBook = this.getBook(shortToken);
+      const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
+
+      this.logger.warn("Phase 2b: EMERGENCY rebalance", {
+        shortSide,
+        imbalance: emergencyImbalance.toFixed(0),
+        ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
+        emergencyCap: `${(emergencyCap * 100).toFixed(1)}¢`,
+        maxLossPerShare: `${((longSideAvg + emergencyCap - 1.00) * 100).toFixed(1)}¢`,
+      });
+
+      if (emergencyAsk <= emergencyCap) {
+        const emergencyPrice = emergencyAsk + this.config.slippageBuffer;
+        const fill = await this.buyOrder(shortToken, emergencyImbalance, emergencyPrice, shortSide);
+
+        if (fill.filled) {
+          const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+          totalTakerFees += fee;
+          if (shortSide === "Up") {
+            filledUp += fill.filledSize;
+            costUp += fill.totalCost;
+          } else {
+            filledDn += fill.filledSize;
+            costDn += fill.totalCost;
+          }
+          availableBudget -= fill.totalCost;
+          orderFills.push({
+            orderNum: orderCount,
+            side: shortSide,
+            filledSize: fill.filledSize,
+            avgPrice: fill.avgPrice,
+            totalCost: fill.totalCost,
+            fee,
+            timestamp: Date.now(),
+          });
+          orderCount++;
+
+          const projCombined = ((costUp / (filledUp || 1)) + (costDn / (filledDn || 1))) * 100;
+          this.logger.warn("EMERGENCY rebalance filled", {
+            side: shortSide,
+            size: fill.filledSize.toFixed(0),
+            price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+            combined: `${projCombined.toFixed(1)}¢`,
+          });
+
+          this.telegram.send(
+            `🚨 Emergency rebalance: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
+          );
+        }
+      } else {
+        this.logger.error("EMERGENCY rebalance FAILED — ask exceeds emergency cap, NAKED POSITION", {
+          ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
+          cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+          nakedShares: emergencyImbalance.toFixed(0),
+          nakedSide: shortSide === "Up" ? "Down" : "Up",
+        });
+        this.telegram.send(
+          `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged! Ask ${(emergencyAsk * 100).toFixed(0)}¢ > cap ${(emergencyCap * 100).toFixed(0)}¢`,
+        );
+      }
+    }
+
+    // ═══════════════════════════════════════════════════
     // PHASE 3: MERGE
     // ═══════════════════════════════════════════════════
     const matched = Math.min(filledUp, filledDn);
@@ -637,14 +720,21 @@ export class SignalTakerExecutor {
       return null;
     }
 
-    let txHash = await this.redeem.mergePositions(window.conditionId, amount, window.negRisk);
-    if (!txHash) {
-      this.logger.warn("Merge failed, retrying...");
-      await sleep(1000);
+    // Exponential backoff: 1s, 2s, 4s, 8s
+    let txHash: string | null = null;
+    for (let attempt = 0; attempt < SignalTakerExecutor.MERGE_MAX_RETRIES; attempt++) {
       txHash = await this.redeem.mergePositions(window.conditionId, amount, window.negRisk);
+      if (txHash) break;
+      const delayMs = 1000 * Math.pow(2, attempt);
+      this.logger.warn(`Merge attempt ${attempt + 1}/${SignalTakerExecutor.MERGE_MAX_RETRIES} failed, retrying in ${delayMs}ms...`);
+      await sleep(delayMs);
     }
     if (!txHash) {
-      this.logger.warn("Merge retry failed — holding for resolution");
+      this.logger.error("Merge FAILED after all retries — holding for resolution", {
+        attempts: SignalTakerExecutor.MERGE_MAX_RETRIES,
+        shares: amount.toFixed(0),
+      });
+      this.telegram.send(`🔴 Merge failed after ${SignalTakerExecutor.MERGE_MAX_RETRIES} retries! ${amount.toFixed(0)}sh held`);
       return null;
     }
 
