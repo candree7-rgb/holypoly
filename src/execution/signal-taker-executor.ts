@@ -39,7 +39,8 @@ export class SignalTakerExecutor {
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
   private static readonly REBALANCE_OVERPAY = 0.03;          // willing to pay 3¢ over breakeven
-  private static readonly EMERGENCY_OVERPAY = 0.10;          // emergency: pay up to 10¢ over breakeven to avoid naked
+  private static readonly EMERGENCY_RISK_AVERSION = 0.30;    // 0=risk-neutral, 1=very risk-averse
+  private static readonly EMERGENCY_FEE_ESTIMATE = 0.005;   // ~0.5% typical taker fee at these prices
   private static readonly MERGE_MAX_RETRIES = 4;             // exponential backoff retries for merge
 
   constructor(
@@ -362,9 +363,15 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2b: EMERGENCY REBALANCE
-    // If still imbalanced after Phase 2a, pay up to breakeven+10¢
-    // to avoid naked positions. Small loss >> total loss.
+    // PHASE 2b: EMERGENCY REBALANCE (EV-based)
+    // If still imbalanced after Phase 2a, buy at market up to
+    // an EV-derived cap. Merging at a small loss beats naked
+    // 50/50 gamble (huge variance on $0-or-$1 resolution).
+    //
+    // Math: naked EV = 50¢ - longAvg (but stdev = 50¢/share!)
+    // Merge is better than naked when:
+    //   ask ≤ 50¢ + (50¢ × riskAversion) - fees ≈ 65¢
+    // This cap is INDEPENDENT of longSideAvg — always ~65¢.
     // ═══════════════════════════════════════════════════
     const emergencyImbalance = Math.abs(filledUp - filledDn);
     if (emergencyImbalance > 0 && availableBudget > 0) {
@@ -374,21 +381,23 @@ export class SignalTakerExecutor {
       const longSideAvg = shortSide === "Down"
         ? (filledUp > 0 ? costUp / filledUp : 0)
         : (filledDn > 0 ? costDn / filledDn : 0);
-      const breakeven = 1.00 - longSideAvg;
-      const emergencyCap = Math.min(
-        breakeven + SignalTakerExecutor.EMERGENCY_OVERPAY,
-        this.config.rebalanceMaxPrice,
-      );
+
+      // EV-based cap: 50¢ (naked binary EV) + variance penalty - fees
+      const variancePenalty = 0.50 * SignalTakerExecutor.EMERGENCY_RISK_AVERSION;
+      const evBasedCap = 0.50 + variancePenalty - SignalTakerExecutor.EMERGENCY_FEE_ESTIMATE;
+      const emergencyCap = Math.min(evBasedCap, this.config.rebalanceMaxPrice);
 
       const emergencyBook = this.getBook(shortToken);
       const emergencyAsk = emergencyBook?.asks?.[0]?.price ?? 1.0;
+      const mergeLoss = (longSideAvg + emergencyAsk - 1.00) * 100;
 
-      this.logger.warn("Phase 2b: EMERGENCY rebalance", {
+      this.logger.warn("Phase 2b: EMERGENCY rebalance (EV-based)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
         ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
-        emergencyCap: `${(emergencyCap * 100).toFixed(1)}¢`,
-        maxLossPerShare: `${((longSideAvg + emergencyCap - 1.00) * 100).toFixed(1)}¢`,
+        evCap: `${(emergencyCap * 100).toFixed(1)}¢`,
+        mergeLoss: `${mergeLoss.toFixed(1)}¢/sh`,
+        longAvg: `${(longSideAvg * 100).toFixed(1)}¢`,
       });
 
       if (emergencyAsk <= emergencyCap) {
@@ -430,15 +439,58 @@ export class SignalTakerExecutor {
           );
         }
       } else {
-        this.logger.error("EMERGENCY rebalance FAILED — ask exceeds emergency cap, NAKED POSITION", {
-          ask: `${(emergencyAsk * 100).toFixed(1)}¢`,
-          cap: `${(emergencyCap * 100).toFixed(1)}¢`,
-          nakedShares: emergencyImbalance.toFixed(0),
-          nakedSide: shortSide === "Up" ? "Down" : "Up",
-        });
-        this.telegram.send(
-          `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged! Ask ${(emergencyAsk * 100).toFixed(0)}¢ > cap ${(emergencyCap * 100).toFixed(0)}¢`,
-        );
+        // One re-check after 1.5s — book might update
+        this.logger.warn("Emergency ask exceeds cap, waiting 1.5s for re-check...");
+        await sleep(1500);
+        const retryBook = this.getBook(shortToken);
+        const retryAsk = retryBook?.asks?.[0]?.price ?? 1.0;
+
+        if (retryAsk <= emergencyCap) {
+          const retryPrice = retryAsk + this.config.slippageBuffer;
+          const fill = await this.buyOrder(shortToken, emergencyImbalance, retryPrice, shortSide);
+
+          if (fill.filled) {
+            const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+            totalTakerFees += fee;
+            if (shortSide === "Up") {
+              filledUp += fill.filledSize;
+              costUp += fill.totalCost;
+            } else {
+              filledDn += fill.filledSize;
+              costDn += fill.totalCost;
+            }
+            availableBudget -= fill.totalCost;
+            orderFills.push({
+              orderNum: orderCount,
+              side: shortSide,
+              filledSize: fill.filledSize,
+              avgPrice: fill.avgPrice,
+              totalCost: fill.totalCost,
+              fee,
+              timestamp: Date.now(),
+            });
+            orderCount++;
+
+            this.logger.warn("EMERGENCY rebalance filled (retry)", {
+              side: shortSide,
+              size: fill.filledSize.toFixed(0),
+              price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
+            });
+            this.telegram.send(
+              `🚨 Emergency rebalance (retry): ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
+            );
+          }
+        } else {
+          this.logger.error("EMERGENCY rebalance FAILED — ask exceeds EV cap, NAKED POSITION", {
+            ask: `${(retryAsk * 100).toFixed(1)}¢`,
+            evCap: `${(emergencyCap * 100).toFixed(1)}¢`,
+            nakedShares: emergencyImbalance.toFixed(0),
+            nakedSide: shortSide === "Up" ? "Down" : "Up",
+          });
+          this.telegram.send(
+            `🔴 NAKED: ${emergencyImbalance.toFixed(0)}sh unhedged! Ask ${(retryAsk * 100).toFixed(0)}¢ > EV cap ${(emergencyCap * 100).toFixed(0)}¢`,
+          );
+        }
       }
     }
 
