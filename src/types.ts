@@ -82,6 +82,26 @@ export interface MergeResult {
   timestamp: number;
 }
 
+/** Paired vs unpaired inventory breakdown */
+export interface InventorySnapshot {
+  /** Shares matched on both sides (mergeable) */
+  pairedShares: number;
+  /** Weighted average combined cost of paired shares only (cents) */
+  pairedCombinedAvgCents: number;
+  /** Unpaired Up shares (exposed to resolution) */
+  unpairedUp: number;
+  /** Unpaired Down shares (exposed to resolution) */
+  unpairedDown: number;
+  /** How long the current unpaired position has existed (ms), 0 if balanced */
+  unpairedExposureDurationMs: number;
+  /** Collateral value if all paired shares are merged: pairedShares × $1.00 */
+  mergeableCollateralValue: number;
+  /** Cost basis of paired inventory only */
+  pairedCostBasis: number;
+  /** Locked profit from paired inventory: mergeableCollateralValue - pairedCostBasis */
+  pairedProfit: number;
+}
+
 /** Complete result of one window's merge-arb execution */
 export interface WindowExecutionResult {
   conditionId: string;
@@ -106,6 +126,8 @@ export interface WindowExecutionResult {
   dryRun: boolean;
   skipped: boolean;
   skipReason?: string;
+  /** Paired vs unpaired inventory breakdown at window end */
+  inventory?: InventorySnapshot;
 }
 
 /** Simulated FOK fill result (used by DryRunEngine) */

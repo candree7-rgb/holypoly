@@ -105,7 +105,7 @@ export interface Config {
   // V7 Adaptive Signal-Taker parameters
   /** BTC % move threshold to trigger buy (e.g. 0.0005 = 0.05%) */
   btcMoveThreshold: number;
-  /** Only buy when ask < this price — safety cap (e.g. 0.55 = 55¢) */
+  /** Only buy when ask < this price — safety cap (e.g. 0.50 = 50¢) */
   cheapThreshold: number;
   /** How often (ms) to check Binance price and evaluate signal */
   signalCheckIntervalMs: number;
@@ -169,6 +169,34 @@ export interface Config {
   makerFeeRate: number;
   /** Taker fee rate (0.02 on Polymarket crypto) */
   takerFeeRate: number;
+
+  // V9 Regime Detection
+  /** Seconds to observe before first buy */
+  observationPeriodS: number;
+  /** BTC distance from open below this = Oscillation regime (e.g. 0.0003 = 0.03%) */
+  oscillationThreshold: number;
+  /** BTC distance from open above this = Skip regime (e.g. 0.001 = 0.10%) */
+  trendSkipThreshold: number;
+  /** Re-evaluate regime every N seconds */
+  regimeReevalS: number;
+  /** Max wait time for limit order fill (ms) */
+  makerTimeoutMs: number;
+
+  // V9 Risk
+  /** Stop accumulating if combined > this after 5+ fills (cents) */
+  circuitBreakerCents: number;
+  /** Max imbalance ratio between sides (e.g. 2 = 2:1) */
+  maxImbalanceRatio: number;
+  /** Max seconds unhedged on one side */
+  maxNakedDurationS: number;
+  /** Skip if spread > this (cents) */
+  maxSpreadCents: number;
+
+  // V9 Incremental Sizing
+  /** Fraction of normal chunk size in probing phase (e.g. 0.25 = 25%) */
+  probeChunkPct: number;
+  /** Probing phase ends N seconds after window start */
+  probePhaseEndS: number;
 
   // Operation
   dryRun: boolean;
@@ -340,9 +368,9 @@ export const loadConfig = (): Config => {
 
   // V9 Regime-Adaptive Signal-Taker parameters
   const btcMoveThreshold = parseNumber("BTC_MOVE_THRESHOLD", 0.0005);
-  const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.55);
+  const cheapThreshold = parseNumber("CHEAP_THRESHOLD", 0.50);
   const signalCheckIntervalMs = parseNumber("SIGNAL_CHECK_INTERVAL_MS", 500);
-  const targetCombinedCents = parseNumber("TARGET_COMBINED_CENTS", 97);
+  const targetCombinedCents = parseNumber("TARGET_COMBINED_CENTS", 95);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
 
@@ -356,10 +384,10 @@ export const loadConfig = (): Config => {
   const makerTimeoutMs = parseNumber("MAKER_TIMEOUT_MS", 1500);
 
   // V9 Risk
-  const circuitBreakerCents = parseNumber("CIRCUIT_BREAKER_CENTS", 102);
+  const circuitBreakerCents = parseNumber("CIRCUIT_BREAKER_CENTS", 99);
   const maxImbalanceRatio = parseNumber("MAX_IMBALANCE_RATIO", 2);
   const maxNakedDurationS = parseNumber("MAX_NAKED_DURATION_S", 30);
-  const maxSpreadCents = parseNumber("MAX_SPREAD_CENTS", 5);
+  const maxSpreadCents = parseNumber("MAX_SPREAD_CENTS", 3);
 
   // V9 Incremental Sizing
   const probeChunkPct = parseNumber("PROBE_CHUNK_PCT", 0.25);

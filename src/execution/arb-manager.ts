@@ -1,5 +1,5 @@
 import type { Logger } from "../logger.js";
-import type { TradeSide } from "../types.js";
+import type { TradeSide, InventorySnapshot } from "../types.js";
 
 /**
  * ArbManager: Tracks per-window position state for the hybrid strategy.
@@ -46,6 +46,8 @@ export class ArbManager {
   private roundTrips = 0;
   private windowConditionId: string | null = null;
   private lastEntryTime = 0;
+  /** Timestamp when current imbalance started (0 if balanced) */
+  private imbalanceStartTime = 0;
 
   constructor(
     private config: ArbManagerConfig,
@@ -61,6 +63,7 @@ export class ArbManager {
     this.roundTrips = 0;
     this.windowConditionId = conditionId;
     this.lastEntryTime = 0;
+    this.imbalanceStartTime = 0;
   }
 
   /** Record a fill on one side */
@@ -82,11 +85,15 @@ export class ArbManager {
 
     if (prevUnhedged > 0.01 && newUnhedged < 0.01) {
       this.roundTrips++;
+      this.imbalanceStartTime = 0; // balanced now
       this.logger.info("Arb round-trip completed", {
         roundTrip: this.roundTrips,
         lockedProfit: `+$${this.getLockedProfit().toFixed(2)}`,
         totalCost: `$${this.getTotalCost().toFixed(2)}`,
       });
+    } else if (prevUnhedged < 0.01 && newUnhedged > 0.01) {
+      // Just became imbalanced — start tracking exposure duration
+      this.imbalanceStartTime = Date.now();
     }
   }
 
@@ -176,6 +183,45 @@ export class ArbManager {
     const state = this.getState();
     if (state.unhedgedShares < 0.01) return false;
     return this.getTimeSinceEntry() > this.config.emergencyBalanceAfterMs;
+  }
+
+  /** Get detailed paired vs unpaired inventory breakdown */
+  getInventorySnapshot(): InventorySnapshot {
+    const paired = Math.min(this.upShares, this.downShares);
+    const unpairedUp = this.upShares - paired;
+    const unpairedDown = this.downShares - paired;
+
+    // Proportional cost for paired portion only
+    const upProportion = this.upShares > 0 ? paired / this.upShares : 0;
+    const downProportion = this.downShares > 0 ? paired / this.downShares : 0;
+    const pairedUpCost = this.upCostUsd * upProportion;
+    const pairedDnCost = this.downCostUsd * downProportion;
+    const pairedCostBasis = pairedUpCost + pairedDnCost;
+
+    // Paired combined avg: (avgUp + avgDn) * 100 for paired shares
+    const pairedAvgUp = paired > 0 ? pairedUpCost / paired : 0;
+    const pairedAvgDn = paired > 0 ? pairedDnCost / paired : 0;
+    const pairedCombinedAvgCents = paired > 0 ? (pairedAvgUp + pairedAvgDn) * 100 : 0;
+
+    const mergeableCollateralValue = paired * 1.0; // $1.00 per merged pair
+    const pairedProfit = mergeableCollateralValue - pairedCostBasis;
+
+    // Exposure duration: how long has the current imbalance existed?
+    const isImbalanced = unpairedUp > 0.01 || unpairedDown > 0.01;
+    const unpairedExposureDurationMs = isImbalanced && this.imbalanceStartTime > 0
+      ? Date.now() - this.imbalanceStartTime
+      : 0;
+
+    return {
+      pairedShares: paired,
+      pairedCombinedAvgCents,
+      unpairedUp,
+      unpairedDown,
+      unpairedExposureDurationMs,
+      mergeableCollateralValue,
+      pairedCostBasis,
+      pairedProfit,
+    };
   }
 
   private getLockedProfit(): number {

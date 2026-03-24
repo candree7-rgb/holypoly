@@ -11,6 +11,7 @@ import type {
   OrderFill,
   MergeResult,
   WindowExecutionResult,
+  InventorySnapshot,
   TradeSide,
 } from "../types.js";
 import { DryRunEngine } from "./dry-run-engine.js";
@@ -209,12 +210,11 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Imbalance guard: never let one side exceed 3× the other side's shares.
+      // Imbalance guard: never let one side exceed MAX_IMBALANCE_RATIO× the other side's shares.
       // This prevents the runaway accumulation bug where cheap side is bought endlessly.
       const thisSideShares = nextSide === "Up" ? filledUp : filledDn;
       const otherSideShares = nextSide === "Up" ? filledDn : filledUp;
-      const maxImbalanceRatio = 3;
-      if (otherSideShares > 0 && thisSideShares >= otherSideShares * maxImbalanceRatio) {
+      if (otherSideShares > 0 && thisSideShares >= otherSideShares * this.config.maxImbalanceRatio) {
         this.logger.debug("Imbalance guard: too many shares on one side", {
           side: nextSide,
           thisShares: thisSideShares.toFixed(0),
@@ -297,6 +297,23 @@ export class SignalTakerExecutor {
           combined: combinedCents === Infinity ? "—" : `${combinedCents.toFixed(1)}¢`,
           balance: `Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
         });
+
+        // Circuit breaker: stop if combined > threshold after enough fills
+        if (
+          combinedCents > this.config.circuitBreakerCents &&
+          orderCount >= 5 &&
+          filledUp > 0 && filledDn > 0
+        ) {
+          this.logger.warn("CIRCUIT BREAKER: combined too high, stopping accumulation", {
+            combined: `${combinedCents.toFixed(1)}¢`,
+            breaker: `${this.config.circuitBreakerCents}¢`,
+            fills: orderCount,
+          });
+          this.telegram.send(
+            `🛑 Circuit breaker: ${combinedCents.toFixed(1)}¢ > ${this.config.circuitBreakerCents}¢ after ${orderCount} fills`,
+          );
+          break;
+        }
 
         // Check if target reached
         if (
@@ -388,44 +405,31 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 2b: EMERGENCY REBALANCE — USE DYNAMIC CAP
-    // If still imbalanced after Phase 2a, retry with dynamic cap.
-    // Better to stay naked (50/50 gamble) than guarantee a loss
-    // by buying short side above breakeven.
-    // With 1.5s retry if first attempt too expensive.
+    // PHASE 2b: MUST-HEDGE REBALANCE — NO NAKED ALLOWED
+    // If still imbalanced after Phase 2a, MUST hedge at any price
+    // up to rebalanceMaxPrice (99¢). We NEVER leave naked positions.
+    // 3 attempts with 1.5s intervals, escalating price tolerance.
     // ═══════════════════════════════════════════════════
     const emergencyImbalance = Math.abs(filledUp - filledDn);
     if (emergencyImbalance > 0 && availableBudget > 0) {
       const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
       const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
 
-      // Re-use dynamic cap from Phase 2 — never pay more than breakeven + 3¢
-      const emergencyLongAvg = shortSide === "Down"
-        ? (filledUp > 0 ? costUp / filledUp : 0)
-        : (filledDn > 0 ? costDn / filledDn : 0);
-      const emergencyBreakeven = 1.00 - emergencyLongAvg;
-      const emergencyCap = Math.min(
-        emergencyBreakeven + SignalTakerExecutor.REBALANCE_OVERPAY,
-        this.config.rebalanceMaxPrice,
-      );
-
-      const emergencyBook = await this.getRebalanceBook(shortToken);
-      const emergencyAsk = this.getAskPrice(emergencyBook);
-
-      this.logger.warn("Phase 2b: EMERGENCY rebalance (dynamic cap)", {
+      this.logger.warn("Phase 2b: MUST-HEDGE rebalance (NO NAKED policy)", {
         shortSide,
         imbalance: emergencyImbalance.toFixed(0),
-        ask: emergencyAsk !== null ? `${(emergencyAsk * 100).toFixed(1)}¢` : "N/A",
-        cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+        hardCap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
       });
 
-      // Try to buy — first attempt, then 1.5s retry
+      // 3 attempts — each time we use the hard safety cap (99¢)
       let filled = false;
-      for (let attempt = 0; attempt < 2 && !filled; attempt++) {
-        const book = attempt === 0 ? emergencyBook : await this.getRebalanceBook(shortToken);
+      for (let attempt = 0; attempt < 3 && !filled; attempt++) {
+        if (attempt > 0) await sleep(1500);
+
+        const book = await this.getRebalanceBook(shortToken);
         const ask = this.getAskPrice(book);
 
-        if (ask !== null && ask <= emergencyCap) {
+        if (ask !== null && ask <= this.config.rebalanceMaxPrice) {
           const buyPrice = ask + this.config.slippageBuffer;
           const fill = await this.buyOrder(shortToken, emergencyImbalance, buyPrice, shortSide);
 
@@ -453,35 +457,32 @@ export class SignalTakerExecutor {
             orderCount++;
 
             const projCombined = ((costUp / (filledUp || 1)) + (costDn / (filledDn || 1))) * 100;
-            this.logger.warn("EMERGENCY filled" + (attempt > 0 ? " (retry)" : ""), {
+            this.logger.warn(`MUST-HEDGE filled (attempt ${attempt + 1})`, {
               side: shortSide,
               size: fill.filledSize.toFixed(0),
               price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
               combined: `${projCombined.toFixed(1)}¢`,
             });
             this.telegram.send(
-              `🚨 Emergency: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
+              `🔒 Hedged: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
             );
           }
-        }
-
-        if (!filled && attempt === 0) {
-          this.logger.warn("Emergency: ask too high for dynamic cap, retrying in 1.5s...", {
+        } else {
+          this.logger.warn(`MUST-HEDGE attempt ${attempt + 1}: ask above hard cap`, {
             ask: ask !== null ? `${(ask * 100).toFixed(1)}¢` : "N/A",
-            cap: `${(emergencyCap * 100).toFixed(1)}¢`,
+            cap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
           });
-          await sleep(1500);
         }
       }
 
       if (!filled) {
-        this.logger.warn("NAKED POSITION — ask above dynamic cap, letting expire", {
+        // This should be extremely rare — orderbook is completely empty or >99¢
+        this.logger.error("HEDGE FAILED — no liquidity below 99¢ after 3 attempts", {
           nakedShares: emergencyImbalance.toFixed(0),
           nakedSide: shortSide === "Up" ? "Down" : "Up",
-          cap: `${(emergencyCap * 100).toFixed(1)}¢`,
         });
         this.telegram.send(
-          `⚠️ Naked: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} unhedged (ask > ${(emergencyCap * 100).toFixed(0)}¢ cap)`,
+          `🔴 HEDGE FAILED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} — NO liquidity below ${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
         );
       }
     }
@@ -522,6 +523,30 @@ export class SignalTakerExecutor {
     const avgDn = filledDn > 0 ? costDn / filledDn : 0;
     const finalCombined = (avgUp + avgDn) * 100;
 
+    // Build inventory snapshot
+    const pairedShares = Math.min(filledUp, filledDn);
+    const unpairedUp = filledUp - pairedShares;
+    const unpairedDn = filledDn - pairedShares;
+    const upProp = filledUp > 0 ? pairedShares / filledUp : 0;
+    const dnProp = filledDn > 0 ? pairedShares / filledDn : 0;
+    const pairedCostBasis = costUp * upProp + costDn * dnProp;
+    const pairedAvgUp = pairedShares > 0 ? (costUp * upProp) / pairedShares : 0;
+    const pairedAvgDn = pairedShares > 0 ? (costDn * dnProp) / pairedShares : 0;
+    const pairedCombinedAvgCents = pairedShares > 0 ? (pairedAvgUp + pairedAvgDn) * 100 : 0;
+    const mergeableCollateralValue = pairedShares * 1.0;
+    const pairedProfit = mergeableCollateralValue - pairedCostBasis;
+
+    const inventory: InventorySnapshot = {
+      pairedShares,
+      pairedCombinedAvgCents,
+      unpairedUp,
+      unpairedDown: unpairedDn,
+      unpairedExposureDurationMs: 0, // at window end, exposure is resolved
+      mergeableCollateralValue,
+      pairedCostBasis,
+      pairedProfit,
+    };
+
     result.orderFills = orderFills;
     result.merges = merges;
     result.totalUpShares = filledUp;
@@ -535,38 +560,32 @@ export class SignalTakerExecutor {
     result.totalCost = costUp + costDn;
     result.avgCombinedCents = finalCombined;
     result.takerFees = totalTakerFees;
+    result.inventory = inventory;
 
-    this.logger.info("=== V8 Window Summary ===", {
+    this.logger.info("=== V9 Window Summary ===", {
       fills: orderCount,
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
       combined: `${finalCombined.toFixed(1)}¢`,
+      paired: `${pairedShares.toFixed(0)}sh @${pairedCombinedAvgCents.toFixed(1)}¢`,
+      unpaired: `Up=${unpairedUp.toFixed(0)} Dn=${unpairedDn.toFixed(0)}`,
       merged: totalMerged.toFixed(0),
       profit: `$${totalMergeProfit.toFixed(2)}`,
+      pairedProfit: `$${pairedProfit.toFixed(2)}`,
     });
 
     // ── SINGLE TG MESSAGE ──
-    const nakedUp = filledUp - totalMerged;
-    const nakedDn = filledDn - totalMerged;
-    const nakedSide = nakedUp > 0 ? "Up" : nakedDn > 0 ? "Down" : null;
-    const nakedShares = Math.max(nakedUp, nakedDn);
-    const nakedCost = nakedSide === "Up"
-      ? avgUp * nakedShares
-      : nakedSide === "Down"
-        ? avgDn * nakedShares
-        : 0;
-
     if (totalMerged > 0) {
-      const emoji = totalMergeProfit > 0 ? "✅" : "❌";
-      let msg = `${emoji} ${totalMerged.toFixed(0)}sh merged | ${finalCombined.toFixed(1)}¢ | ` +
-        `${totalMergeProfit > 0 ? "+" : ""}$${totalMergeProfit.toFixed(2)}`;
-      if (nakedShares > 0 && nakedSide) {
-        msg += `\n🎲 ${nakedShares.toFixed(0)}sh ${nakedSide} naked ($${nakedCost.toFixed(2)} at risk)`;
+      const emoji = totalMergeProfit > 0 ? "+" : "";
+      let msg = `${totalMergeProfit > 0 ? "✅" : "❌"} ${totalMerged.toFixed(0)}sh merged | ` +
+        `paired@${pairedCombinedAvgCents.toFixed(1)}¢ | ${emoji}$${totalMergeProfit.toFixed(2)}`;
+      if (unpairedUp > 0 || unpairedDn > 0) {
+        msg += `\n⚠️ Unpaired: Up=${unpairedUp.toFixed(0)} Dn=${unpairedDn.toFixed(0)} (hedge failed)`;
       }
       this.telegram.send(msg);
     } else if (orderCount > 0) {
       this.telegram.send(
-        `⚠️ ${orderCount} fills but no merge | Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
+        `⚠️ ${orderCount} fills, no merge | paired=${pairedShares.toFixed(0)}@${pairedCombinedAvgCents.toFixed(1)}¢ | Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
       );
     }
 

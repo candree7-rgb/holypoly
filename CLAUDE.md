@@ -158,17 +158,18 @@ REGIME-WECHSEL:
 
 | Guard | Beschreibung | V8→V9 Änderung |
 |-------|-------------|-----------------|
-| Cheap Threshold | Max 55¢ pro Seite | Gleich |
+| Cheap Threshold | Max 50¢ pro Seite | **55→50¢** (strenger) |
 | Imbalance Guard | Max Ratio zwischen Seiten | **3:1 → 2:1** (strenger) |
 | Budget Reserve | Max 50% auf eine Seite bis andere ≥1 Fill | Gleich |
 | Projected Combined | Nur kaufen wenn Combined sich verbessert | Gleich |
-| Circuit Breaker | Stopp bei combined >102¢ nach 5+ Fills | **NEU** |
+| Circuit Breaker | Stopp bei combined >99¢ nach 5+ Fills | **NEU, 102→99¢** |
 | Observation Phase | 15s warten vor erstem Kauf | **NEU** |
 | Trend-Skip | Window skippen bei BTC >0.10% vom Open | **NEU** |
 | No-Leg-2-Without-Leg-1 | Gegenseite NUR kaufen wenn erste Seite gefüllt | **NEU** |
-| Max Naked Duration | Max 30s ungehedged auf einer Seite | **NEU** |
-| Dynamic Cap Rebal. | breakeven + 3¢, max 99¢ | Gleich |
+| **MUST-HEDGE** | **KEINE NAKED Positionen. Immer hedgen bis 99¢** | **NEU — ersetzt Naked-Toleranz** |
+| Dynamic Cap Rebal. | breakeven + 3¢, Fallback auf hard cap 99¢ | **Upgraded: 3 Versuche** |
 | Stop Buying Timer | 40s vor Window-Ende aufhören | Gleich |
+| Max Spread | Skip wenn Spread > 3¢ | **5→3¢** (strenger) |
 
 ---
 
@@ -224,22 +225,38 @@ Schlechte Volatilität:
 
 ---
 
-### Naked Exposure Management
+### KEINE NAKED Positionen — MUST-HEDGE Policy
 
-**Nackte Positionen sind das größte Risiko. Strikte Regeln:**
+**Wir lassen NIEMALS nackte Positionen offen. Punkt.**
 
-1. **Max Naked Duration:** Wenn eine Seite >30s ohne Gegenseite ist → aggressive FOK auf Gegenseite
-2. **Max Imbalance Ratio:** 2:1 hart. Bei 2:1 → sofort Gegenseite kaufen (auch FOK)
+**Prävention (während Accumulation):**
+1. **Strikte Alternation:** Immer die Seite mit weniger Shares zuerst
+2. **Max Imbalance Ratio:** 2:1 hart. Bei 2:1 → nächster Kauf MUSS Gegenseite sein
 3. **Budget Reserve:** Max 50% Budget auf einer Seite bis andere ≥1 Fill hat
-4. **Emergency Hedge:** Wenn Regime zu Skip wechselt und Position offen → sofort FOK Rebalance
-5. **Lieber klein nackt als groß nackt:** Erste Orders klein halten (Incremental Sizing)
+4. **Kein Leg 2 ohne Leg 1 Fill:** Gegenseite NUR kaufen wenn erste Seite gefüllt
 
-**Controlled Imbalance Bands:**
+**Rebalance (Phase 2 — wenn Imbalance am Window-Ende):**
+1. **Phase 2a:** Dynamic Cap (breakeven + 3¢) — versucht günstigen Hedge
+2. **Phase 2b: MUST-HEDGE** — 3 Versuche mit 1.5s Intervall, Hard Cap 99¢
+3. Wenn Ask ≤ 99¢ → KAUFEN, auch wenn Combined >100¢ (Verlust akzeptieren, kein Naked!)
+4. Nur wenn Buch komplett leer (Ask >99¢ oder kein Ask) → technisch unmöglich zu hedgen
+
+**Imbalance Bands (während Accumulation):**
 - 1:1 bis 1.5:1 → normal, kein Eingriff
 - 1.5:1 bis 2:1 → Warnung, nächster Kauf MUSS Gegenseite sein
-- >2:1 → SOFORT Gegenseite kaufen (FOK, höheres Slippage-Budget)
-- Temporäre Imbalance OK wenn Regime = Oscillation (Reversal kommt)
-- Temporäre Imbalance NICHT OK wenn Regime = Trend (kann sich verschlimmern)
+- >2:1 → BLOCKIERT, nur Gegenseite darf gekauft werden
+
+### Paired vs. Unpaired Inventory Tracking
+
+**Wir tracken explizit:**
+- `pairedShares` — Shares die auf beiden Seiten vorhanden sind (mergeable)
+- `pairedCombinedAvgCents` — gewichteter Combined-Durchschnitt NUR der gepaarten Shares
+- `unpairedUp` / `unpairedDown` — Shares ohne Gegenseite
+- `unpairedExposureDurationMs` — wie lange die aktuelle Imbalance besteht
+- `mergeableCollateralValue` — was wir bei Merge zurückbekommen (pairedShares × $1.00)
+- `pairedProfit` — mergeableCollateralValue - pairedCostBasis
+
+**Wichtig:** Der `pairedCombinedAvgCents` ist der ECHTE P&L-Indikator, nicht der Total Combined.
 
 ---
 
@@ -325,13 +342,12 @@ SIGNAL_CHECK_INTERVAL_MS: 500   # Check alle 500ms
 REVERSAL_THRESHOLD: 0.00015     # 0.015% von rolling extreme
 
 # Risk / Caps
-CHEAP_THRESHOLD: 0.55           # safety cap — nie mehr als 55¢ pro Seite
-TARGET_COMBINED_CENTS: 97       # aufhören wenn combined ≤ 97¢
-CIRCUIT_BREAKER_CENTS: 102      # stopp wenn combined > 102¢
+CHEAP_THRESHOLD: 0.50           # safety cap — nie mehr als 50¢ pro Seite
+TARGET_COMBINED_CENTS: 95       # aufhören wenn combined ≤ 95¢
+CIRCUIT_BREAKER_CENTS: 99       # stopp wenn combined > 99¢ nach 5+ Fills
 MAX_IMBALANCE_RATIO: 2          # max 2:1 zwischen Seiten
 BUDGET_RESERVE_PCT: 0.50        # max 50% budget auf einer Seite
-MAX_NAKED_DURATION_S: 30        # max 30s ohne Gegenseite
-MAX_SPREAD_CENTS: 5             # skip wenn Spread > 5¢
+MAX_SPREAD_CENTS: 3             # skip wenn Spread > 3¢
 
 # Sizing
 EQUITY_PER_WINDOW: 0.30         # 30% des Balances pro Window
