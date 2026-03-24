@@ -209,9 +209,24 @@ export class SignalTakerExecutor {
         continue;
       }
 
+      // Imbalance guard: never let one side exceed 3× the other side's shares.
+      // This prevents the runaway accumulation bug where cheap side is bought endlessly.
+      const thisSideShares = nextSide === "Up" ? filledUp : filledDn;
+      const otherSideShares = nextSide === "Up" ? filledDn : filledUp;
+      const maxImbalanceRatio = 3;
+      if (otherSideShares > 0 && thisSideShares >= otherSideShares * maxImbalanceRatio) {
+        this.logger.debug("Imbalance guard: too many shares on one side", {
+          side: nextSide,
+          thisShares: thisSideShares.toFixed(0),
+          otherShares: otherSideShares.toFixed(0),
+          ratio: (thisSideShares / otherSideShares).toFixed(1),
+        });
+        await sleep(this.config.signalCheckIntervalMs);
+        continue;
+      }
+
       // Budget-reserve: max 50% on one side until other side has ≥1 fill
       const thisSideCost = nextSide === "Up" ? costUp : costDn;
-      const otherSideShares = nextSide === "Up" ? filledDn : filledUp;
       if (otherSideShares === 0 && thisSideCost >= budget * this.config.budgetReservePct) {
         this.logger.debug("Budget-reserve: waiting for other side", {
           side: nextSide,
@@ -589,7 +604,7 @@ export class SignalTakerExecutor {
       return dnAsk < upAsk ? "Down" : "Up";
     }
 
-    // If preferred side's ask is affordable, use it
+    // Try preferred side first
     if (preferred) {
       const prefToken = preferred === "Up" ? window.upTokenId : window.downTokenId;
       const prefBook = this.getBook(prefToken);
@@ -597,16 +612,8 @@ export class SignalTakerExecutor {
       if (prefAsk !== null && prefAsk < this.config.cheapThreshold) {
         return preferred;
       }
-      // Preferred side too expensive — fall through to buy the other side if cheap
-      // (budget-reserve check in caller prevents over-concentration)
-      const other: TradeSide = preferred === "Up" ? "Down" : "Up";
-      const otherToken = other === "Up" ? window.upTokenId : window.downTokenId;
-      const otherBook = this.getBook(otherToken);
-      const otherAsk = this.getAskPrice(otherBook);
-      if (otherAsk !== null && otherAsk < this.config.cheapThreshold) {
-        return other;
-      }
-      // Both sides too expensive — wait
+      // Preferred side too expensive — wait. Do NOT fall through to buy the other side,
+      // as that creates runaway imbalance (the imbalance guard in the caller is the last resort).
       return null;
     }
 
