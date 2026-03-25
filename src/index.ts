@@ -21,7 +21,7 @@ import { WindowManager } from "./execution/window-manager.js";
 import { SignalExecutor } from "./execution/signal-executor.js";
 import { MergeArbExecutor } from "./execution/merge-arb-executor.js";
 import { SignalTakerExecutor } from "./execution/signal-taker-executor.js";
-import { SignalTakerExperimentRunner } from "./execution/signal-taker-experiment-runner.js";
+// SignalTakerExperimentRunner removed in V11 — strategy is now defined, no A/B variants
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
 import { createWebhookServer } from "./webhook.js";
@@ -994,7 +994,7 @@ const main = async () => {
     }
   };
 
-  // === SIGNAL-TAKER V7 STRATEGY LOOP ===
+  // === SIGNAL-TAKER V11 INVENTORY ENGINE LOOP ===
   const signalTakerLoop = async () => {
     const executor = new SignalTakerExecutor(
       clob,
@@ -1005,32 +1005,13 @@ const main = async () => {
       logger,
       telegram,
     );
-    const experimentRunner = config.dryRun && config.signalExperimentMode
-      ? new SignalTakerExperimentRunner(
-        clob,
-        clobWs,
-        binance,
-        redeemService,
-        config,
-        logger,
-        telegram,
-      )
-      : null;
 
-    if (config.signalExperimentMode && !config.dryRun) {
-      logger.warn("Signal experiment mode requested but disabled in LIVE mode (requires DRY_RUN=true)");
-    }
-
-    logger.info("=== Signal-Taker V10 Regime Strategy Active ===", {
-      reversalThreshold: "0.015%",
+    logger.info("=== V11 Inventory Engine Active ===", {
       cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
       targetCombined: `${config.targetCombinedCents}¢`,
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
       dryRun: config.dryRun,
-      experimentMode: Boolean(experimentRunner),
-      experimentVariants: experimentRunner
-        ? config.signalExperimentVariants.split(",").map((v) => v.trim()).filter(Boolean)
-        : [],
+      features: "state-machine, micro-fills, mid-window-merge, 5m+15m auto-profile",
     });
 
     while (true) {
@@ -1074,10 +1055,8 @@ const main = async () => {
         clobWs.subscribe([window.upTokenId, window.downTokenId]);
         await sleep(1000);
 
-        // Execute V7
-        const result = experimentRunner
-          ? await experimentRunner.executeWindow(window, balance)
-          : await executor.executeWindow(window, balance);
+        // Execute V11 — auto-detects 5m/15m profile from window duration
+        const result = await executor.executeWindow(window, balance);
 
         // Record to DB
         const hadFills = !result.skipped && result.orderFills.length > 0;

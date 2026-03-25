@@ -31,17 +31,50 @@ interface ObservationResult {
   refillScore: number;
 }
 
-export interface SignalExecutorVariantOptions {
-  name?: string;
-  firstLegMultiplier?: number;
-  firstLegMinShares?: number;
-  firstLegMaxShares?: number;
-  enableHedgeabilityGate?: boolean;
-  enableBalancingOnlyMode?: boolean;
-  unpairedTimeoutS?: number;
-  lateWindowNoNewUnpairedS?: number;
-  enableRegimeConfidenceFilter?: boolean;
-  useMildHedgeabilityGate?: boolean;
+/**
+ * Timeframe-specific parameter profile.
+ * Same engine, different tuning for 5m vs 15m markets.
+ */
+export interface TimeframeProfile {
+  label: string;                   // "5m" or "15m"
+  observationPeriodS: number;      // seconds to observe before first buy
+  stopBuyingBeforeEndS: number;    // stop accumulating N seconds before end
+  defensiveUnpairedS: number;      // seconds unpaired before DEFENSIVE_REBALANCE
+  midWindowMergeMinTimeS: number;  // only mid-merge if >N seconds remain
+  maxOrdersPerWindow: number;
+  mergeMinSize: number;
+  probePhaseEndS: number;          // probing phase duration
+  intervalMultiplier: number;      // 1.0 for 5m, ~1.5 for 15m (slower pacing)
+}
+
+export const PROFILE_5M: TimeframeProfile = {
+  label: "5m",
+  observationPeriodS: 15,
+  stopBuyingBeforeEndS: 40,
+  defensiveUnpairedS: 20,
+  midWindowMergeMinTimeS: 120,
+  maxOrdersPerWindow: 30,
+  mergeMinSize: 10,
+  probePhaseEndS: 30,
+  intervalMultiplier: 1.0,
+};
+
+export const PROFILE_15M: TimeframeProfile = {
+  label: "15m",
+  observationPeriodS: 25,
+  stopBuyingBeforeEndS: 100,
+  defensiveUnpairedS: 45,
+  midWindowMergeMinTimeS: 300,
+  maxOrdersPerWindow: 70,
+  mergeMinSize: 15,
+  probePhaseEndS: 60,
+  intervalMultiplier: 1.4,
+};
+
+/** Auto-detect profile from window duration */
+export function detectProfile(window: WindowInfo): TimeframeProfile {
+  const durationMin = (window.endTime - window.startTime) / 60_000;
+  return durationMin > 8 ? PROFILE_15M : PROFILE_5M;
 }
 
 /**
@@ -85,7 +118,6 @@ export class SignalTakerExecutor {
     private config: Config,
     private logger: Logger,
     private telegram: TelegramNotifier,
-    private variant: SignalExecutorVariantOptions = {},
   ) {}
 
   /**
@@ -138,10 +170,13 @@ export class SignalTakerExecutor {
       return result;
     }
 
+    // --- TIMEFRAME PROFILE ---
+    const profile = detectProfile(window);
+
     const chunkSize = this.getSessionChunkSize(balance);
-    const firstLegMultiplier = this.variant.firstLegMultiplier ?? SignalTakerExecutor.FIRST_LEG_MULTIPLIER;
-    const firstLegMinShares = this.variant.firstLegMinShares ?? SignalTakerExecutor.FIRST_LEG_MIN_SHARES;
-    const firstLegMaxShares = this.variant.firstLegMaxShares ?? SignalTakerExecutor.FIRST_LEG_MAX_SHARES;
+    const firstLegMultiplier = SignalTakerExecutor.FIRST_LEG_MULTIPLIER;
+    const firstLegMinShares = SignalTakerExecutor.FIRST_LEG_MIN_SHARES;
+    const firstLegMaxShares = SignalTakerExecutor.FIRST_LEG_MAX_SHARES;
     const firstLegChunk = Math.min(
       firstLegMaxShares,
       Math.max(firstLegMinShares, Math.floor(chunkSize * firstLegMultiplier)),
@@ -165,25 +200,18 @@ export class SignalTakerExecutor {
     // ── Inventory State Machine ──
     const sm = new InventoryStateMachine({
       nearBalancedRatio: 1.3,
-      defensiveUnpairedS: this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS,
-      stopBuildTimeS: this.config.stopBuyingBeforeEndS,
-      mergeReadyMinShares: this.config.mergeMinSize,
+      defensiveUnpairedS: profile.defensiveUnpairedS,
+      stopBuildTimeS: profile.stopBuyingBeforeEndS,
+      mergeReadyMinShares: profile.mergeMinSize,
       stopBuildCombinedCents: 103,
       defensiveCombinedCents: 100,
     });
     let fillTick = 0;
 
     const audit = {
-      variant: this.variant.name ?? "baseline",
-      hedgeGateEnabled: this.variant.enableHedgeabilityGate !== false,
-      hedgeGateMode: this.variant.useMildHedgeabilityGate ? "mild" : "standard",
-      balancingOnlyEnabled: this.variant.enableBalancingOnlyMode !== false,
-      unpairedTimeoutS: this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS,
-      lateWindowNoNewUnpairedS: this.variant.lateWindowNoNewUnpairedS ?? null,
+      profile: profile.label,
       firstLegLateBlocked: false,
       hedgeGateSkippedWindow: false,
-      lateUnpairedStopTriggered: false,
-      unpairedTimeoutTriggered: false,
       finalAction: "unknown" as "trade" | "skip" | "no_fill",
       finalReason: "none",
     };
@@ -193,15 +221,11 @@ export class SignalTakerExecutor {
     let rollingHigh = btcOpen;
     let rollingLow = btcOpen;
 
-    this.logger.info("=== V11 Regime Window Start ===", {
-      variant: this.variant.name ?? "baseline",
-      flags: {
-        hedgeGateEnabled: audit.hedgeGateEnabled,
-        hedgeGateMode: audit.hedgeGateMode,
-        balancingOnlyEnabled: audit.balancingOnlyEnabled,
-        unpairedTimeoutS: audit.unpairedTimeoutS,
-        lateWindowNoNewUnpairedS: audit.lateWindowNoNewUnpairedS,
-      },
+    this.logger.info("=== V11 Inventory Engine Start ===", {
+      profile: profile.label,
+      observationS: profile.observationPeriodS,
+      stopBuyS: profile.stopBuyingBeforeEndS,
+      defensiveUnpairedS: profile.defensiveUnpairedS,
       btc: `$${btcOpen.toFixed(0)}`,
       budget: `$${budget.toFixed(0)}`,
       chunk: chunkSize,
@@ -210,7 +234,7 @@ export class SignalTakerExecutor {
     });
 
     // Phase A/B gate: observe + classify + hedge-feasibility before first fill.
-    const observation = await this.observeAndClassify(window, btcOpen, chunkSize);
+    const observation = await this.observeAndClassify(window, btcOpen, chunkSize, profile);
     if (observation.regime === "SKIP") {
       result.skipped = true;
       result.skipReason = `Regime skip (${(observation.distanceToOpenPct * 100).toFixed(3)}% from open)`;
@@ -223,35 +247,15 @@ export class SignalTakerExecutor {
       this.telegram.send("⏭️ Skip: one-sided extreme book (hedge toxicity)");
       return result;
     }
-    if (this.variant.enableHedgeabilityGate !== false) {
-      const feasible = this.assessHedgeFeasibility(
-        window,
-        chunkSize,
-        observation,
-        this.variant.useMildHedgeabilityGate === true,
-      );
-      if (!feasible.ok) {
-        result.skipped = true;
-        result.skipReason = feasible.reason;
-        audit.hedgeGateSkippedWindow = true;
-        audit.finalAction = "skip";
-        audit.finalReason = feasible.reason ?? "hedge_gate_skip";
-        this.logger.info("Variant decision audit", audit);
-        this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
-        return result;
-      }
-    }
-    if (
-      this.variant.enableRegimeConfidenceFilter &&
-      observation.regime === "TREND" &&
-      observation.reversals === 0 &&
-      observation.distanceToOpenPct > this.config.oscillationThreshold * 2
-    ) {
+    // Hedge feasibility gate: always check if opposite side is executable
+    const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
+    if (!feasible.ok) {
       result.skipped = true;
-      result.skipReason = "Low-confidence trend regime";
+      result.skipReason = feasible.reason;
+      audit.hedgeGateSkippedWindow = true;
       audit.finalAction = "skip";
-      audit.finalReason = result.skipReason;
-      this.logger.info("Variant decision audit", audit);
+      audit.finalReason = feasible.reason ?? "hedge_gate_skip";
+      this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
       return result;
     }
 
@@ -261,13 +265,13 @@ export class SignalTakerExecutor {
     // Mid-window merge recycles capital (Stargate-style)
     // ═══════════════════════════════════════════════════
     const merges: MergeResult[] = [];
-    const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
+    const stopBuyingTime = window.endTime - profile.stopBuyingBeforeEndS * 1000;
     const windowStartTime = Date.now();
 
     while (
       Date.now() < stopBuyingTime &&
       availableBudget > chunkSize * 0.20 &&
-      orderCount < this.config.maxOrdersPerWindow
+      orderCount < profile.maxOrdersPerWindow
     ) {
       const btcNow = this.binance.price;
       if (!btcNow) {
@@ -301,7 +305,7 @@ export class SignalTakerExecutor {
       // STOP_BUILD: no more accumulation
       if (currentState === "STOP_BUILD" && !allowed.canAccumulate) {
         this.logger.info("State machine: STOP_BUILD — exiting accumulation", {
-          variant: this.variant.name ?? "baseline",
+          variant: profile.label,
           state: currentState,
           timeRemainingS: timeRemainingS.toFixed(0),
         });
@@ -365,20 +369,12 @@ export class SignalTakerExecutor {
         }
       }
 
-      // Late window unpaired stop
-      if (
-        this.variant.lateWindowNoNewUnpairedS &&
-        filledUp !== filledDn &&
-        timeRemainingS <= this.variant.lateWindowNoNewUnpairedS
-      ) {
-        audit.lateUnpairedStopTriggered = true;
-        break;
-      }
+      // Late window unpaired stop — handled by state machine (STOP_BUILD / DEFENSIVE_REBALANCE)
 
       // Dynamic interval: momentum-aware timing
       const hasBothSides = filledUp > 0 && filledDn > 0;
       const hasMomentum = this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow);
-      const baseInterval = this.computeInterval(combinedCents);
+      const baseInterval = Math.round(this.computeInterval(combinedCents) * profile.intervalMultiplier);
       const minInterval = hasBothSides && !hasMomentum
         ? Math.max(baseInterval, 2000)  // V11: 2s floor (was 3s) — still buy without momentum
         : baseInterval;
@@ -547,7 +543,7 @@ export class SignalTakerExecutor {
 
         const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
         this.logger.info("V11 fill", {
-          variant: this.variant.name ?? "baseline",
+          variant: profile.label,
           state: postFillState,
           side: nextSide,
           sideReason,
@@ -562,7 +558,7 @@ export class SignalTakerExecutor {
         // STOP conditions driven by state machine
         if (postFillState === "STOP_BUILD") {
           this.logger.info("State machine: STOP_BUILD after fill — exiting", {
-            variant: this.variant.name ?? "baseline",
+            variant: profile.label,
           });
           break;
         }
@@ -613,12 +609,12 @@ export class SignalTakerExecutor {
           (postFillState === "MERGE_READY" || postFillState === "NEAR_BALANCED") &&
           pairBand !== null &&
           (pairBand === "IDEAL" || pairBand === "GOOD" || pairBand === "ACCEPTABLE") &&
-          timeRemainingS > 120 // only if >2min left to keep accumulating
+          timeRemainingS > profile.midWindowMergeMinTimeS
         ) {
           const midMatched = Math.min(filledUp, filledDn);
           if (midMatched >= this.config.mergeMinSize) {
             this.logger.info("Mid-window merge triggered", {
-              variant: this.variant.name ?? "baseline",
+              variant: profile.label,
               state: postFillState,
               band: pairBand,
               matched: midMatched.toFixed(0),
@@ -654,7 +650,7 @@ export class SignalTakerExecutor {
                 tick: fillTick,
               });
               this.logger.info("Mid-window merge complete — capital recycled", {
-                variant: this.variant.name ?? "baseline",
+                variant: profile.label,
                 recovered: `$${midMerge.recovered.toFixed(2)}`,
                 profit: `$${midMerge.profit.toFixed(2)}`,
                 remainingUp: filledUp.toFixed(0),
@@ -681,7 +677,7 @@ export class SignalTakerExecutor {
     // ═══════════════════════════════════════════════════
     const matched = Math.min(filledUp, filledDn);
 
-    if (matched >= this.config.mergeMinSize) {
+    if (matched >= profile.mergeMinSize) {
       const avgUp = filledUp > 0 ? costUp / filledUp : 0;
       const avgDn = filledDn > 0 ? costDn / filledDn : 0;
       const finalCombined = (avgUp + avgDn) * 100;
@@ -753,7 +749,7 @@ export class SignalTakerExecutor {
     // State machine final summary
     const smSummary = sm.summary(filledUp, filledDn, costUp, costDn);
     this.logger.info("=== V11 Window Summary ===", {
-      variant: this.variant.name ?? "baseline",
+      variant: profile.label,
       fills: orderCount,
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
@@ -771,7 +767,7 @@ export class SignalTakerExecutor {
     // Log all state transitions for this window
     if (sm.transitions.length > 0) {
       this.logger.info("State transitions", {
-        variant: this.variant.name ?? "baseline",
+        variant: profile.label,
         transitions: sm.transitions.map(t => `${t.from}->${t.to} (${t.reason})`),
       });
     }
@@ -787,7 +783,7 @@ export class SignalTakerExecutor {
         return acc;
       }, {} as Record<string, number>);
       this.logger.info("Fill decision summary", {
-        variant: this.variant.name ?? "baseline",
+        variant: profile.label,
         totalDecisions: decisions.length,
         fills: fillDecisions.length,
         skips: skipDecisions.length,
@@ -938,8 +934,8 @@ export class SignalTakerExecutor {
     return (newAvgUp + newAvgDn) * 100;
   }
 
-  private async observeAndClassify(window: WindowInfo, btcOpen: number, chunkSize: number): Promise<ObservationResult> {
-    const until = Date.now() + this.config.observationPeriodS * 1000;
+  private async observeAndClassify(window: WindowInfo, btcOpen: number, chunkSize: number, profile: TimeframeProfile): Promise<ObservationResult> {
+    const until = Date.now() + profile.observationPeriodS * 1000;
     const prices: number[] = [btcOpen];
     let reversals = 0;
     let lastDir = 0;
@@ -1012,30 +1008,23 @@ export class SignalTakerExecutor {
     window: WindowInfo,
     chunkSize: number,
     observation: ObservationResult,
-    mildGate: boolean,
   ): { ok: boolean; reason?: string } {
     const secondsLeft = Math.max(0, (window.endTime - Date.now()) / 1000);
-    const requiredSeconds = mildGate
-      ? Math.max(this.config.stopBuyingBeforeEndS + 10, 60)
-      : Math.max(this.config.stopBuyingBeforeEndS + 20, 75);
+    const requiredSeconds = Math.max(this.config.stopBuyingBeforeEndS + 15, 65);
     if (secondsLeft < requiredSeconds) return { ok: false, reason: "Too little time left for safe hedging" };
     if (observation.avgUpSpreadCents > this.config.maxSpreadCents || observation.avgDnSpreadCents > this.config.maxSpreadCents) {
       return { ok: false, reason: "Spread quality too poor for chunked hedge" };
     }
-    const minDepthNeed = mildGate
-      ? Math.max(15, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT * 0.8)
-      : Math.max(20, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT);
+    const minDepthNeed = Math.max(15, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT);
     if (observation.upDepthWithinBand < minDepthNeed || observation.dnDepthWithinBand < minDepthNeed) {
       return { ok: false, reason: "Insufficient depth in intended hedge band" };
     }
-    const refillThreshold = mildGate ? 0.18 : 0.25;
-    if (observation.refillScore < refillThreshold) {
+    if (observation.refillScore < 0.20) {
       return { ok: false, reason: "Book refill resilience too weak" };
     }
     const hedgeableChunksUp = observation.upDepthWithinBand / minDepthNeed;
     const hedgeableChunksDn = observation.dnDepthWithinBand / minDepthNeed;
-    const minHedgeableChunks = mildGate ? 1.2 : SignalTakerExecutor.MIN_HEDGEABLE_CHUNKS;
-    if (Math.min(hedgeableChunksUp, hedgeableChunksDn) < minHedgeableChunks) {
+    if (Math.min(hedgeableChunksUp, hedgeableChunksDn) < SignalTakerExecutor.MIN_HEDGEABLE_CHUNKS) {
       return { ok: false, reason: "Opposite side not hedgeable in chunks" };
     }
     return { ok: true };

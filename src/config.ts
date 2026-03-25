@@ -115,9 +115,9 @@ export interface Config {
   budgetReservePct: number;
   /** Hard safety cap for rebalance (e.g. 0.99 = 99¢) */
   rebalanceMaxPrice: number;
-  /** Enable parallel dry-run executor experiments on identical windows/data */
+  /** @deprecated V11 removed experiment runner — strategy is now defined */
   signalExperimentMode: boolean;
-  /** Comma-separated variant ids for experiment runner */
+  /** @deprecated V11 removed experiment runner */
   signalExperimentVariants: string;
 
   // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
