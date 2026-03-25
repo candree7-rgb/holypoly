@@ -103,6 +103,11 @@ export class SignalTakerExecutor {
   private static readonly ONE_SIDED_EXTREME_HIGH = 0.80;
   private static readonly BALANCE_PRICE_BUFFER = 0.03; // +3¢ above target-implied hedge price
 
+  // Maker/Limit order constants
+  private static readonly MAKER_OFFSET_CENTS = 0.01;       // Post limit 1¢ below best ask
+  private static readonly MAKER_TIMEOUT_MS = 1500;          // Wait up to 1.5s for limit fill
+  private static readonly MAKER_POLL_INTERVAL_MS = 200;     // Check fill status every 200ms
+
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
@@ -503,12 +508,13 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // ── BUY! ──
+      // ── BUY (Limit-First + FOK Fallback) ──
       const buyPrice = bestAsk + this.config.slippageBuffer;
-      const fill = await this.buyOrder(tokenId, orderSize, buyPrice, nextSide);
+      const fill = await this.buyOrder(tokenId, orderSize, buyPrice, nextSide, false);
 
       if (fill.filled) {
-        const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+        // Maker fills have 0% fee (already reflected in totalCost). Taker fills include fee.
+        const fee = fill.maker ? 0 : polymarketCryptoFee(fill.filledSize, fill.avgPrice);
         totalTakerFees += fee;
 
         if (nextSide === "Up") {
@@ -559,7 +565,7 @@ export class SignalTakerExecutor {
         sm.recordDecision({
           tick: fillTick++, state: postFillState, regime: observation.regime,
           chosenSide: nextSide,
-          reason: `FILL ${sideReason} @${(fill.avgPrice*100).toFixed(1)}c x${fill.filledSize.toFixed(0)}`,
+          reason: `FILL ${sideReason} @${(fill.avgPrice*100).toFixed(1)}c x${fill.filledSize.toFixed(0)} ${fill.maker ? "MAKER" : "TAKER"}`,
           altReason,
           pairBand,
           filledUp, filledDn, combinedCents,
@@ -570,10 +576,11 @@ export class SignalTakerExecutor {
 
         const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
         this.logger.info("V11 fill", {
-          variant: profile.label,
+          profile: profile.label,
           state: postFillState,
           side: nextSide,
           sideReason,
+          type: fill.maker ? "MAKER(0%)" : "TAKER",
           price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
           size: fill.filledSize.toFixed(0),
           combined: combinedCents === Infinity ? "—" : `${combinedCents.toFixed(1)}¢`,
@@ -775,9 +782,14 @@ export class SignalTakerExecutor {
 
     // State machine final summary
     const smSummary = sm.summary(filledUp, filledDn, costUp, costDn);
+    const makerFills = sm.decisions.filter(d => d.reason.includes("MAKER")).length;
+    const takerFills = sm.decisions.filter(d => d.reason.includes("TAKER")).length;
     this.logger.info("=== V11 Window Summary ===", {
-      variant: profile.label,
+      profile: profile.label,
       fills: orderCount,
+      makerFills,
+      takerFills,
+      makerPct: orderCount > 0 ? `${((makerFills / orderCount) * 100).toFixed(0)}%` : "—",
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
       combined: `${finalCombined.toFixed(1)}¢`,
@@ -1226,9 +1238,10 @@ export class SignalTakerExecutor {
         break;
       }
 
-      const fill = await this.buyOrder(shortToken, chunk, ask + this.config.slippageBuffer, shortSide);
+      // Rebalance: FOK only (time pressure, no limit wait)
+      const fill = await this.buyOrder(shortToken, chunk, ask + this.config.slippageBuffer, shortSide, true);
       if (!fill.filled) continue;
-      const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+      const fee = fill.maker ? 0 : polymarketCryptoFee(fill.filledSize, fill.avgPrice);
       totalTakerFees += fee;
       if (shortSide === "Up") { filledUp += fill.filledSize; costUp += fill.totalCost; }
       else { filledDn += fill.filledSize; costDn += fill.totalCost; }
@@ -1314,19 +1327,102 @@ export class SignalTakerExecutor {
   }
 
   /**
-   * Buy as taker: FOK order against the ask.
+   * Buy with Limit-First + FOK Fallback strategy.
+   *
+   * 1. Post GTC limit order at bestAsk - MAKER_OFFSET (1¢ inside spread)
+   * 2. Wait up to MAKER_TIMEOUT_MS (1.5s), polling every 200ms
+   * 3. If filled → 0% maker fee, best price
+   * 4. If not filled → cancel, immediately FOK at maxPrice (taker fee)
+   *
+   * When `fokOnly=true` (rebalance): skip limit, go straight to FOK.
    */
   private async buyOrder(
     tokenId: string,
     size: number,
     maxPrice: number,
     side: TradeSide,
-  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number }> {
+    fokOnly = false,
+  ): Promise<{ filled: boolean; filledSize: number; avgPrice: number; totalCost: number; maker: boolean }> {
+    // ── DRY RUN ──
     if (this.config.dryRun && this.dryRunEngine) {
-      return this.dryRunEngine.simulateFokBuy(tokenId, size, maxPrice, side);
+      if (!fokOnly) {
+        // Try limit simulation first
+        const limitPrice = maxPrice - SignalTakerExecutor.MAKER_OFFSET_CENTS;
+        const limitResult = await this.dryRunEngine.simulateLimitOrder(
+          tokenId, size, limitPrice, side, SignalTakerExecutor.MAKER_TIMEOUT_MS,
+        );
+        if (limitResult.filled) {
+          return { ...limitResult, maker: true };
+        }
+        // Limit timed out — fall through to FOK
+      }
+      const fokResult = this.dryRunEngine.simulateFokBuy(tokenId, size, maxPrice, side);
+      return { ...fokResult, maker: false };
     }
 
-    // LIVE: FOK taker order
+    // ── LIVE: Limit-First + FOK Fallback ──
+    if (!fokOnly) {
+      const limitPrice = maxPrice - SignalTakerExecutor.MAKER_OFFSET_CENTS;
+      try {
+        const orderId = await this.clob.placeLimitOrder({
+          tokenId,
+          side: Side.BUY,
+          price: limitPrice,
+          size,
+        });
+
+        if (orderId) {
+          // Poll for fill
+          const polls = Math.ceil(SignalTakerExecutor.MAKER_TIMEOUT_MS / SignalTakerExecutor.MAKER_POLL_INTERVAL_MS);
+          for (let i = 0; i < polls; i++) {
+            await sleep(SignalTakerExecutor.MAKER_POLL_INTERVAL_MS);
+            const filled = await this.clob.getFilledShares(orderId);
+            if (filled >= size * 0.9) {
+              // Filled as maker — 0% fee!
+              const totalCost = filled * limitPrice; // maker: no fee
+              this.logger.info("Limit order FILLED (0% maker fee)", {
+                side, size: filled.toFixed(0),
+                price: `${(limitPrice * 100).toFixed(1)}¢`,
+                cost: `$${totalCost.toFixed(2)}`,
+              });
+              return {
+                filled: true,
+                filledSize: filled,
+                avgPrice: limitPrice,
+                totalCost,
+                maker: true,
+              };
+            }
+          }
+          // Timed out — cancel and fall through to FOK
+          await this.clob.cancelOrder(orderId);
+          // Check if partially filled before cancel
+          const partialFill = await this.clob.getFilledShares(orderId);
+          if (partialFill > 0) {
+            const totalCost = partialFill * limitPrice;
+            this.logger.info("Limit order PARTIAL fill before cancel (0% fee)", {
+              side, filled: partialFill.toFixed(0), requested: size.toFixed(0),
+            });
+            return {
+              filled: true,
+              filledSize: partialFill,
+              avgPrice: limitPrice,
+              totalCost,
+              maker: true,
+            };
+          }
+          this.logger.debug("Limit order timed out, falling back to FOK", {
+            side, limitPrice: `${(limitPrice * 100).toFixed(1)}¢`,
+          });
+        }
+      } catch (err) {
+        this.logger.warn("Limit order failed, falling back to FOK", {
+          error: (err as Error).message,
+        });
+      }
+    }
+
+    // ── FOK FALLBACK (or fokOnly mode) ──
     const amount = size * maxPrice;
     const result = await this.clob.placeMarketOrderFOK({
       tokenId,
@@ -1336,7 +1432,7 @@ export class SignalTakerExecutor {
     });
 
     if (!result.filled || result.orderIds.length === 0) {
-      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0 };
+      return { filled: false, filledSize: 0, avgPrice: 0, totalCost: 0, maker: false };
     }
 
     const fills = await this.clob.getOrderFills(result.orderIds);
@@ -1354,6 +1450,7 @@ export class SignalTakerExecutor {
       filledSize: totalShares,
       avgPrice,
       totalCost: totalCost + fee,
+      maker: false,
     };
   }
 
