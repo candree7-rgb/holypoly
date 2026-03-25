@@ -16,6 +16,8 @@ import type {
 } from "../types.js";
 import { DryRunEngine } from "./dry-run-engine.js";
 import { InventoryStateMachine, classifyPairQuality, type FillDecision, type PairQualityBand } from "./inventory-state-machine.js";
+import { FairValueEngine } from "../signal/fair-value.js";
+import { VolatilityCalculator } from "../signal/volatility.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
 type Regime = "OSCILLATION" | "TREND" | "SKIP";
@@ -108,6 +110,15 @@ export class SignalTakerExecutor {
   private static readonly MAKER_TIMEOUT_MS = 1500;          // Wait up to 1.5s for limit fill
   private static readonly MAKER_POLL_INTERVAL_MS = 200;     // Check fill status every 200ms
 
+  // Edge-trigger: fair value mispricing detection
+  private static readonly EDGE_ENTRY_THRESHOLD_CENTS = 5;   // Min edge for first-leg entry
+  private static readonly EDGE_CONTINUE_THRESHOLD_CENTS = 2; // Min edge to continue accumulating
+  private static readonly HEDGE_SIDE_MIN_EDGE_CENTS = -3;   // Hedge side: allow slightly negative edge (pair economics matter)
+
+  // Volatility + fair value engines (initialized per window)
+  private volatilityCalc: VolatilityCalculator | null = null;
+  private fairValueEngine: FairValueEngine | null = null;
+
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
   private static readonly REVERSAL_THRESHOLD = 0.00015;      // 0.015% reversal from recent extreme
@@ -155,6 +166,10 @@ export class SignalTakerExecutor {
     if (this.config.dryRun) {
       this.dryRunEngine = new DryRunEngine(this.clobWs, this.config.takerFeeRate, balance, this.logger);
     }
+
+    // --- FAIR VALUE ENGINE (edge detection) ---
+    this.volatilityCalc = new VolatilityCalculator(this.config.volatilityLookbackSeconds);
+    this.fairValueEngine = new FairValueEngine(this.volatilityCalc);
 
     // --- PRE-FLIGHT ---
     const preflight = await this.preFlightCheck(window);
@@ -312,6 +327,14 @@ export class SignalTakerExecutor {
         continue;
       }
 
+      // Feed volatility calculator for fair value computation
+      if (this.volatilityCalc) {
+        this.volatilityCalc.addPrice(btcNow, Date.now());
+      }
+
+      // ── EDGE CALCULATION ──
+      const edge = this.calculateEdge(window, btcNow, btcOpen);
+
       // Update price history rolling window
       priceHistory.push(btcNow);
       if (priceHistory.length > SignalTakerExecutor.PRICE_HISTORY_SIZE) {
@@ -375,18 +398,60 @@ export class SignalTakerExecutor {
         break;
       }
 
-      // ── SIDE SELECTION (state-machine-aware) ──
-      let nextSide = this.chooseNextSide(
-        observation.regime, lastBuySide, filledUp, filledDn, costUp, costDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
-      );
-      let sideReason = "chooseNextSide";
+      // ── SIDE SELECTION (edge-aware + state-machine-aware) ──
+      let nextSide: TradeSide | null;
+      let sideReason: string;
       let altReason: string | null = null;
 
+      if (isFirstBuy && edge) {
+        // FIRST BUY: edge-triggered — buy the underpriced side
+        if (edge.bestEdge >= SignalTakerExecutor.EDGE_ENTRY_THRESHOLD_CENTS) {
+          nextSide = edge.bestSide;
+          sideReason = `edge_entry: ${edge.bestSide} edge=${edge.bestEdge.toFixed(1)}¢ fair=${edge.fairUp.toFixed(0)}¢`;
+        } else {
+          // Not enough edge yet — wait for mispricing
+          nextSide = null;
+          sideReason = "no_edge";
+        }
+      } else if (isFirstBuy && !edge) {
+        // No fair value available — fallback to regime-based first-buy
+        nextSide = this.chooseNextSide(
+          observation.regime, lastBuySide, filledUp, filledDn, costUp, costDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
+        );
+        sideReason = "chooseNextSide_fallback";
+      } else {
+        // SUBSEQUENT BUYS: strict alternation + state machine + edge check
+        nextSide = this.chooseNextSide(
+          observation.regime, lastBuySide, filledUp, filledDn, costUp, costDn, dipFromHigh, bounceFromLow, window, false,
+        );
+        sideReason = "chooseNextSide";
+
+        // For the non-first-buy side: check if there's still edge or pair-economics justification
+        if (nextSide && edge && filledUp > 0 && filledDn > 0) {
+          const sideEdge = nextSide === "Up" ? edge.upEdge : edge.downEdge;
+          const shortSideForEdge = sm.getShortSide(filledUp, filledDn);
+          const isHedgeSide = nextSide === shortSideForEdge;
+          // Entry side needs continued edge; hedge side just needs to not be terrible
+          const minEdge = isHedgeSide
+            ? SignalTakerExecutor.HEDGE_SIDE_MIN_EDGE_CENTS
+            : SignalTakerExecutor.EDGE_CONTINUE_THRESHOLD_CENTS;
+          if (sideEdge < minEdge) {
+            this.logger.debug("Edge too low for continued accumulation", {
+              side: nextSide, sideEdge: `${sideEdge.toFixed(1)}¢`, minEdge, isHedgeSide,
+            });
+            // Don't block hedge side — pair economics override edge for balancing
+            if (!isHedgeSide) {
+              nextSide = null;
+              sideReason = "no_continued_edge";
+            }
+          }
+        }
+      }
+
       if (!nextSide) {
-        // Record skip decision
         sm.recordDecision({
           tick: fillTick++, state: currentState, regime: observation.regime,
-          chosenSide: null, reason: "no_side_available", altReason: null,
+          chosenSide: null, reason: sideReason, altReason: null,
           pairBand: combinedCents !== Infinity ? classifyPairQuality(combinedCents) : null,
           filledUp, filledDn, combinedCents,
           imbalanceRatio: Math.min(filledUp, filledDn) > 0 ? Math.max(filledUp, filledDn) / Math.min(filledUp, filledDn) : 0,
@@ -631,6 +696,7 @@ export class SignalTakerExecutor {
           pairBand: pairBand ?? "—",
           marginalPair: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
           balance: `Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
+          edge: edge ? `fair=${edge.fairUp.toFixed(0)}¢ up=${edge.upEdge.toFixed(1)}¢ dn=${edge.downEdge.toFixed(1)}¢` : "—",
         });
 
         // STOP conditions driven by state machine
@@ -1293,6 +1359,48 @@ export class SignalTakerExecutor {
 
     // Tier 1: ENTRY CAP — value-seeking
     return { cap: this.config.cheapThreshold, type: "entry" };
+  }
+
+  /**
+   * Calculate fair value edge: how much is Polymarket mispriced vs Binance-implied fair value?
+   *
+   * Returns edge in cents for each side:
+   *   upEdge > 0 → Up is underpriced (buy Up)
+   *   downEdge > 0 → Down is underpriced (buy Down)
+   *
+   * This is the core edge-trigger: a context-aware signal that fires when BTC has moved
+   * enough (relative to this window's duration + time remaining) that the fair PM price
+   * should have shifted by ≥ threshold, but hasn't fully repriced yet.
+   */
+  private calculateEdge(
+    window: WindowInfo,
+    btcNow: number,
+    btcOpen: number,
+  ): { upEdge: number; downEdge: number; fairUp: number; bestSide: TradeSide; bestEdge: number } | null {
+    if (!this.fairValueEngine || !this.volatilityCalc) return null;
+
+    const timeRemainingS = Math.max(0, (window.endTime - Date.now()) / 1000);
+    const upAsk = this.getAskPrice(this.getBook(window.upTokenId));
+    const dnAsk = this.getAskPrice(this.getBook(window.downTokenId));
+    if (upAsk === null || dnAsk === null) return null;
+
+    // Fair value from BTC move + time remaining + volatility
+    const fv = this.fairValueEngine.calculateFairValue(btcNow, btcOpen, timeRemainingS);
+    const fairUpCents = fv.fairUp;
+    const fairDnCents = 100 - fairUpCents;
+
+    // Market prices in cents
+    const marketUpCents = upAsk * 100;
+    const marketDnCents = dnAsk * 100;
+
+    // Edge = fair value - market price (positive = underpriced = opportunity)
+    const upEdge = fairUpCents - marketUpCents;
+    const downEdge = fairDnCents - marketDnCents;
+
+    const bestSide: TradeSide = upEdge >= downEdge ? "Up" : "Down";
+    const bestEdge = Math.max(upEdge, downEdge);
+
+    return { upEdge, downEdge, fairUp: fairUpCents, bestSide, bestEdge };
   }
 
   private isOneSidedToxic(window: WindowInfo): boolean {
