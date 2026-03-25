@@ -305,11 +305,31 @@ export class SignalTakerExecutor {
       // STOP_BUILD: no more accumulation
       if (currentState === "STOP_BUILD" && !allowed.canAccumulate) {
         this.logger.info("State machine: STOP_BUILD — exiting accumulation", {
-          variant: profile.label,
+          profile: profile.label,
           state: currentState,
           timeRemainingS: timeRemainingS.toFixed(0),
         });
         break;
+      }
+
+      // Opposite-side executability check (executor_spec: "whether the opposite side remains executable")
+      if (currentState === "FIRST_LEG_ACQUIRED" || currentState === "BALANCING") {
+        const shortSideCheck = sm.getShortSide(filledUp, filledDn);
+        if (shortSideCheck) {
+          const shortToken = shortSideCheck === "Up" ? window.upTokenId : window.downTokenId;
+          const shortBook = this.getBook(shortToken);
+          const shortAsk = this.getAskPrice(shortBook);
+          if (shortAsk === null || shortAsk > this.config.rebalanceMaxPrice) {
+            this.logger.warn("Opposite side not executable — short side dried up", {
+              shortSide: shortSideCheck,
+              ask: shortAsk !== null ? `${(shortAsk * 100).toFixed(1)}¢` : "null",
+              state: currentState,
+            });
+            // Don't accumulate more on long side if we can't hedge
+            await sleep(this.config.signalCheckIntervalMs);
+            continue;
+          }
+        }
       }
 
       // Late first-leg check
@@ -345,13 +365,20 @@ export class SignalTakerExecutor {
       }
 
       // State-machine overrides on side selection
+      // (executor_spec: "whether same-side expansion was allowed or blocked")
       const shortSide = sm.getShortSide(filledUp, filledDn);
       if (allowed.mustPrioritizeShortSide && shortSide && nextSide !== shortSide) {
         altReason = `state=${currentState} forced short_side=${shortSide} (was ${nextSide})`;
+        this.logger.debug("Same-side BLOCKED: state forces short side", {
+          state: currentState, wanted: nextSide, forced: shortSide,
+        });
         nextSide = shortSide;
         sideReason = "sm_priority_short";
       } else if (!isFirstBuy && !allowed.canAccumulateLongSide && shortSide && nextSide !== shortSide) {
         altReason = `state=${currentState} blocked long_side=${nextSide}`;
+        this.logger.debug("Same-side BLOCKED: long-side accumulation not allowed", {
+          state: currentState, wanted: nextSide, forced: shortSide,
+        });
         nextSide = shortSide;
         sideReason = "sm_blocked_long";
       }
