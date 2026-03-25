@@ -1017,13 +1017,20 @@ const main = async () => {
       )
       : null;
 
-    logger.info("=== Signal-Taker V8 Momentum Strategy Active ===", {
+    if (config.signalExperimentMode && !config.dryRun) {
+      logger.warn("Signal experiment mode requested but disabled in LIVE mode (requires DRY_RUN=true)");
+    }
+
+    logger.info("=== Signal-Taker V10 Regime Strategy Active ===", {
       reversalThreshold: "0.015%",
       cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
       targetCombined: `${config.targetCombinedCents}¢`,
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
       dryRun: config.dryRun,
       experimentMode: Boolean(experimentRunner),
+      experimentVariants: experimentRunner
+        ? config.signalExperimentVariants.split(",").map((v) => v.trim()).filter(Boolean)
+        : [],
     });
 
     while (true) {
