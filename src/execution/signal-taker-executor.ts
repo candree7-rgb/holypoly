@@ -202,6 +202,13 @@ export class SignalTakerExecutor {
     let combinedCents = Infinity;
     let unpairedStartMs: number | null = null;
 
+    // ── Paired Quality Trailing ──
+    // Tracks best weighted avg seen. Once pair quality improves enough,
+    // prevents giving back gains by trailing the best seen value.
+    let bestPairedAvgSeen = Infinity;
+    let trailingActive = false;
+    const TRAILING_MIN_PAIRED = Math.max(profile.mergeMinSize, chunkSize * 0.5);
+
     // ── Inventory State Machine ──
     const sm = new InventoryStateMachine({
       nearBalancedRatio: 1.3,
@@ -671,15 +678,51 @@ export class SignalTakerExecutor {
           break;
         }
 
-        // Target reached notification (keep accumulating)
-        if (
-          combinedCents <= this.config.targetCombinedCents &&
-          filledUp > 0 && filledDn > 0
-        ) {
-          this.logger.info("Target reached!", {
-            combined: `${combinedCents.toFixed(1)}¢`,
-            target: `${this.config.targetCombinedCents}¢`,
-          });
+        // ── PAIRED QUALITY TRAILING ──
+        // Once meaningful paired inventory exists and quality is good,
+        // trail the best weighted avg to protect profit.
+        const pairedNow = Math.min(filledUp, filledDn);
+        if (filledUp > 0 && filledDn > 0 && combinedCents !== Infinity) {
+          // Update best seen
+          if (pairedNow >= TRAILING_MIN_PAIRED && combinedCents < bestPairedAvgSeen) {
+            bestPairedAvgSeen = combinedCents;
+            if (!trailingActive && bestPairedAvgSeen < 100) {
+              trailingActive = true;
+              this.logger.info("Trailing activated", {
+                bestPairedAvg: `${bestPairedAvgSeen.toFixed(1)}¢`,
+                paired: pairedNow.toFixed(0),
+              });
+            }
+          }
+
+          // Check trailing stop
+          if (trailingActive && pairedNow >= TRAILING_MIN_PAIRED) {
+            // Tighter band when quality is better
+            let trailingBand: number;
+            if (bestPairedAvgSeen < 95) trailingBand = 3.0;       // excellent → protect tightly
+            else if (bestPairedAvgSeen < 98) trailingBand = 4.0;   // good → moderate room
+            else trailingBand = 5.0;                                // near 100 → wider room
+
+            // Tighten band as window ends (less time to recover)
+            if (timeRemainingS < 120) trailingBand *= 0.7;
+            if (timeRemainingS < 60) trailingBand *= 0.5;
+
+            const deterioration = combinedCents - bestPairedAvgSeen;
+            if (deterioration > trailingBand) {
+              this.logger.warn("TRAILING STOP: pair quality deteriorated beyond band", {
+                current: `${combinedCents.toFixed(1)}¢`,
+                bestSeen: `${bestPairedAvgSeen.toFixed(1)}¢`,
+                deterioration: `${deterioration.toFixed(1)}¢`,
+                band: `${trailingBand.toFixed(1)}¢`,
+                paired: pairedNow.toFixed(0),
+                timeLeftS: timeRemainingS.toFixed(0),
+              });
+              this.telegram.send(
+                `🔒 Trailing stop: ${combinedCents.toFixed(1)}¢ (best: ${bestPairedAvgSeen.toFixed(1)}¢, band: ${trailingBand.toFixed(1)}¢)`,
+              );
+              break;
+            }
+          }
         }
 
         // ── MID-WINDOW MERGE ──
@@ -849,6 +892,9 @@ export class SignalTakerExecutor {
       merged: totalMerged.toFixed(0),
       profit: `$${totalMergeProfit.toFixed(2)}`,
       pairedProfit: `$${pairedProfit.toFixed(2)}`,
+      trailing: trailingActive
+        ? `best=${bestPairedAvgSeen.toFixed(1)}¢ final=${finalCombined.toFixed(1)}¢`
+        : "inactive",
     });
 
     // Log all state transitions for this window
