@@ -55,9 +55,9 @@ export class SignalTakerExecutor {
 
   private static readonly OBSERVATION_SAMPLE_MS = 500;
   private static readonly MIN_HEDGEABLE_CHUNKS = 2;
-  private static readonly FIRST_LEG_MULTIPLIER = 0.25;
-  private static readonly FIRST_LEG_MIN_SHARES = 31;
-  private static readonly FIRST_LEG_MAX_SHARES = 46;
+  private static readonly FIRST_LEG_MULTIPLIER = 0.20;
+  private static readonly FIRST_LEG_MIN_SHARES = 15;
+  private static readonly FIRST_LEG_MAX_SHARES = 30;
   private static readonly REBALANCE_CHUNK_PCT = 0.35;
   private static readonly SOFT_HEDGE_CAP = 0.90;
   private static readonly TREND_FIRST_LEG_MAX_PRICE = 0.70;
@@ -378,7 +378,7 @@ export class SignalTakerExecutor {
       const hasMomentum = this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow);
       const baseInterval = this.computeInterval(combinedCents);
       const minInterval = hasBothSides && !hasMomentum
-        ? Math.max(baseInterval, 3000)
+        ? Math.max(baseInterval, 2000)  // V11: 2s floor (was 3s) — still buy without momentum
         : baseInterval;
       const now = Date.now();
       if (now - lastBuyTime < minInterval) {
@@ -826,16 +826,19 @@ export class SignalTakerExecutor {
    * Close to target → longer interval (selective).
    */
   private computeInterval(combinedCents: number): number {
-    if (combinedCents === Infinity) return 1500; // no data yet, use 1.5s base
+    // V11: Much faster intervals for micro-fill density.
+    // Stargate uses many small fills (30-60+ per window).
+    // Old V10: 1.5s-12s → real ~10-15 fills. New: 0.8s-4s → target 30-50+ fills.
+    if (combinedCents === Infinity) return 800;  // no data yet, go fast
 
     const target = this.config.targetCombinedCents;
     const dist = target - combinedCents; // positive = below target (good)
 
-    if (dist > 15) return 1500;   // very far below target: 1.5s
-    if (dist > 8)  return 3000;   // far below: 3s
-    if (dist > 3)  return 5000;   // getting close: 5s
-    if (dist > 0)  return 8000;   // near target: 8s
-    return 12000;                  // at/above target: 12s (very selective)
+    if (dist > 15) return 800;    // very far below target: 0.8s (aggressive)
+    if (dist > 8)  return 1200;   // far below: 1.2s
+    if (dist > 3)  return 2000;   // getting close: 2s
+    if (dist > 0)  return 3000;   // near target: 3s
+    return 4000;                   // at/above target: 4s (still active, not frozen)
   }
 
   /**
@@ -1363,11 +1366,11 @@ export class SignalTakerExecutor {
     }
 
     const budget = balance * this.config.equityPerWindow;
-    // V8: many small alternating fills (Up/Down/Up/Down...) — target ~40-50 fills total
-    const estimatedFills = 40;
-    const estimatedAvgPrice = 0.40;
+    // V11: micro-fill density — target 60+ fills per window (Stargate-style)
+    const estimatedFills = 60;
+    const estimatedAvgPrice = 0.42;
     const rawChunk = Math.floor(budget / (estimatedFills * estimatedAvgPrice));
-    const chunkSize = Math.min(Math.max(rawChunk, 20), this.config.maxChunkSize);
+    const chunkSize = Math.min(Math.max(rawChunk, 10), this.config.maxChunkSize);
 
     this.sessionChunkSize = chunkSize;
     this.sessionChunkDate = today;
