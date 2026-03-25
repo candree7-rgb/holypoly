@@ -252,7 +252,7 @@ export class SignalTakerExecutor {
       this.telegram.send("⏭️ Skip: one-sided extreme book (hedge toxicity)");
       return result;
     }
-    // Hedge feasibility gate: always check if opposite side is executable
+    // Hedge feasibility gate: check if opposite side is executable AND economically viable
     const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
     if (!feasible.ok) {
       result.skipped = true;
@@ -262,6 +262,27 @@ export class SignalTakerExecutor {
       audit.finalReason = feasible.reason ?? "hedge_gate_skip";
       this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
       return result;
+    }
+    // Pre-entry combined price check: would buying both sides at current asks
+    // result in an acceptable combined cost? If not, skip the window entirely.
+    // This prevents entering first legs that can never be profitably hedged.
+    {
+      const upAsk = this.getAskPrice(this.getBook(window.upTokenId));
+      const dnAsk = this.getAskPrice(this.getBook(window.downTokenId));
+      if (upAsk !== null && dnAsk !== null) {
+        const bestCaseCombined = (Math.min(upAsk, dnAsk) + Math.max(upAsk, dnAsk)) * 100;
+        // If even at current prices the combined is above TOXIC (103¢), skip.
+        // The sequential strategy can improve ~2-5¢ through timing, but not 10¢+
+        const maxPreEntryCombined = 106; // allow some room for timing improvement
+        if (bestCaseCombined > maxPreEntryCombined) {
+          result.skipped = true;
+          result.skipReason = `Pre-entry combined too high: ${bestCaseCombined.toFixed(1)}¢ > ${maxPreEntryCombined}¢`;
+          audit.finalAction = "skip";
+          audit.finalReason = result.skipReason;
+          this.telegram.send(`⏭️ Skip: combined ${bestCaseCombined.toFixed(1)}¢ too high pre-entry`);
+          return result;
+        }
+      }
     }
 
     // ═══════════════════════════════════════════════════
@@ -1013,8 +1034,10 @@ export class SignalTakerExecutor {
       if (upSpread !== null) upSpreadSum += upSpread;
       if (dnSpread !== null) dnSpreadSum += dnSpread;
 
-      const upDepth = this.depthWithinBand(upBook, this.getAskPrice(upBook), 0.02);
-      const dnDepth = this.depthWithinBand(dnBook, this.getAskPrice(dnBook), 0.02);
+      // V11: Check depth within a wider band (10¢) since hedge side may cost
+      // significantly more than best ask. Old 2¢ band missed executable liquidity.
+      const upDepth = this.depthWithinBand(upBook, this.getAskPrice(upBook), 0.10);
+      const dnDepth = this.depthWithinBand(dnBook, this.getAskPrice(dnBook), 0.10);
       upDepthSum += upDepth;
       dnDepthSum += dnDepth;
       if (upDepth > lastUpDepth * 0.95 || dnDepth > lastDnDepth * 0.95) refillHits++;
@@ -1083,6 +1106,13 @@ export class SignalTakerExecutor {
     return baseChunk;
   }
 
+  /**
+   * Project the REAL marginal pair cost if we buy `size` shares of `side` at `askPrice`.
+   *
+   * Marginal pair cost = this side's price + the OTHER side's existing avg price.
+   * Because a pair needs BOTH sides — the cost of the new pair is what we pay NOW
+   * plus what we already paid on average for the matching side.
+   */
   private projectPairState(
     side: TradeSide,
     askPrice: number,
@@ -1097,8 +1127,17 @@ export class SignalTakerExecutor {
     const projectedDn = side === "Down" ? filledDn + size : filledDn;
     const projectedPaired = Math.min(projectedUp, projectedDn);
     const newPairs = Math.max(0, projectedPaired - beforePaired);
-    const marginal = newPairs > 0 ? askPrice * 100 : (askPrice + 0.60) * 100;
-    return { projectedMarginalPairCostCents: marginal };
+
+    if (newPairs > 0) {
+      // This fill creates new pairs. Marginal pair cost = this price + other side's avg
+      const otherSideAvg = side === "Up"
+        ? (filledDn > 0 ? costDn / filledDn : 0)
+        : (filledUp > 0 ? costUp / filledUp : 0);
+      return { projectedMarginalPairCostCents: (askPrice + otherSideAvg) * 100 };
+    }
+    // No new pairs created (stacking same side) — cost is this price + unknown future hedge
+    // Use a pessimistic estimate: this price + 55¢ (typical hedge cost)
+    return { projectedMarginalPairCostCents: (askPrice + 0.55) * 100 };
   }
 
   private resolveSideByPairQuality(

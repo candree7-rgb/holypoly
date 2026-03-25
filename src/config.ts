@@ -391,7 +391,9 @@ export const loadConfig = (): Config => {
   const makerTimeoutMs = parseNumber("MAKER_TIMEOUT_MS", 1500);
 
   // V9 Risk
-  const circuitBreakerCents = parseNumber("CIRCUIT_BREAKER_CENTS", 99);
+  // V11: DEFENSIVE band allows up to 103¢. Old 99¢ was too restrictive —
+  // stopped accumulation in ACCEPTABLE territory (merged pairs still profitable).
+  const circuitBreakerCents = parseNumber("CIRCUIT_BREAKER_CENTS", 103);
   const maxImbalanceRatio = parseNumber("MAX_IMBALANCE_RATIO", 2);
   const maxNakedDurationS = parseNumber("MAX_NAKED_DURATION_S", 30);
   const maxSpreadCents = parseNumber("MAX_SPREAD_CENTS", 3);
