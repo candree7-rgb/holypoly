@@ -499,13 +499,25 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Projected combined check
+      // ── 3-LAYER WEIGHTED AVERAGE ECONOMICS ──
+      // Layer 1 (IDEAL/GOOD): weighted avg < 97¢ → full speed accumulation
+      // Layer 2 (ACCEPTABLE): weighted avg 97-103¢ → still accumulate, smaller chunks
+      // Layer 3 (TOXIC): weighted avg ≥ 103¢ → STOP (handled by circuit breaker)
+      //
+      // Key: individual fills may produce pairs slightly >100¢.
+      // What matters is the WEIGHTED AVERAGE across ALL paired inventory.
+      const currentBand = (filledUp > 0 && filledDn > 0 && combinedCents !== Infinity)
+        ? classifyPairQuality(combinedCents) : null;
+
+      // Projected weighted average check: block only if the fill would push
+      // weighted avg into TOXIC territory (≥103¢). Worsening within ACCEPTABLE is OK.
       if (filledUp > 0 && filledDn > 0) {
         const projected = this.projectCombined(
           nextSide, bestAsk, chunkSize, filledUp, filledDn, costUp, costDn,
         );
-        if (projected > combinedCents && combinedCents <= this.config.targetCombinedCents) {
-          this.logger.debug("Skip: would worsen combined past target", {
+        const projectedBand = classifyPairQuality(projected);
+        if (projectedBand === "TOXIC") {
+          this.logger.debug("Skip: would push weighted avg into TOXIC", {
             projected: `${projected.toFixed(1)}¢`,
             current: `${combinedCents.toFixed(1)}¢`,
           });
@@ -514,22 +526,20 @@ export class SignalTakerExecutor {
         }
       }
 
-      // Band-aware chunk sizing
-      const currentBand = (filledUp > 0 && filledDn > 0 && combinedCents !== Infinity)
-        ? classifyPairQuality(combinedCents) : null;
+      // Chunk sizing based on current weighted average band
       let orderSize = orderCount === 0 ? firstLegChunk : this.getAdaptiveChunk(windowStartTime, chunkSize);
-      if (combinedCents <= this.config.targetCombinedCents) {
-        orderSize = Math.max(10, Math.floor(chunkSize * SignalTakerExecutor.POST_TARGET_CHUNK_PCT));
-      }
-      // In DEFENSIVE band: smaller chunks to limit damage
-      if (currentBand === "DEFENSIVE") {
+      if (currentBand === "ACCEPTABLE" || currentBand === "DEFENSIVE") {
+        // In ACCEPTABLE/DEFENSIVE: smaller chunks to protect weighted average
         orderSize = Math.max(10, Math.floor(orderSize * 0.5));
       }
+      // Marginal pair cost check: the cost of the NEXT pair (this fill + other side avg)
+      // Block if marginal pair is wildly expensive even if weighted avg is still OK
       const projectedPair = this.projectPairState(nextSide, bestAsk, orderSize, filledUp, filledDn, costUp, costDn);
-      if (projectedPair.projectedMarginalPairCostCents > 110) {
-        this.logger.warn("Skip expensive rescue leg", {
+      if (projectedPair.projectedMarginalPairCostCents > 108) {
+        this.logger.warn("Skip: marginal pair cost too high", {
           side: nextSide,
-          projectedMarginalPairCost: `${projectedPair.projectedMarginalPairCostCents.toFixed(1)}¢`,
+          marginalPairCost: `${projectedPair.projectedMarginalPairCostCents.toFixed(1)}¢`,
+          weightedAvg: combinedCents !== Infinity ? `${combinedCents.toFixed(1)}¢` : "—",
         });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
@@ -624,13 +634,24 @@ export class SignalTakerExecutor {
           break;
         }
 
-        // Tail guard: marginal pair cost explosion
+        // Tail guard: stop if marginal pair is expensive AND weighted avg is deteriorating
+        // Individual pairs >100¢ are OK if weighted avg stays in ACCEPTABLE range
         if (pairState.projectedMarginalPairCostCents > 108 && orderCount >= 3) {
-          this.logger.warn("TAIL GUARD: stopping accumulation due to expensive marginal pair", {
+          const avgBand = classifyPairQuality(combinedCents);
+          if (avgBand === "DEFENSIVE" || avgBand === "TOXIC") {
+            this.logger.warn("TAIL GUARD: marginal pair expensive + weighted avg in DEFENSIVE/TOXIC", {
+              marginal: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
+              weightedAvg: `${combinedCents.toFixed(1)}¢`,
+              band: avgBand,
+              fills: orderCount,
+            });
+            break;
+          }
+          // Marginal is expensive but weighted avg is still OK — continue accumulating
+          this.logger.debug("Marginal pair expensive but weighted avg still acceptable", {
             marginal: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
-            fills: orderCount,
+            weightedAvg: `${combinedCents.toFixed(1)}¢`,
           });
-          break;
         }
 
         // Circuit breaker
