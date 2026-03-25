@@ -46,6 +46,8 @@ export class SignalTakerExecutor {
   private static readonly REBALANCE_CHUNK_PCT = 0.35;
   private static readonly SOFT_HEDGE_CAP = 0.90;
   private static readonly TREND_FIRST_LEG_MAX_PRICE = 0.70;
+  private static readonly BINANCE_BOOTSTRAP_WAIT_MS = 6000;
+  private static readonly MAX_RESCUE_COMBINED_CENTS = 102;
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -106,7 +108,7 @@ export class SignalTakerExecutor {
     }
 
     // --- BINANCE PRICE CHECK ---
-    const btcOpen = this.binance.price;
+    const btcOpen = await this.awaitBinancePrice();
     if (!btcOpen) {
       this.logger.warn("No Binance price available, skipping window");
       result.skipped = true;
@@ -791,6 +793,39 @@ export class SignalTakerExecutor {
     return this.config.cheapThreshold;
   }
 
+  private async awaitBinancePrice(): Promise<number | null> {
+    const until = Date.now() + SignalTakerExecutor.BINANCE_BOOTSTRAP_WAIT_MS;
+    while (Date.now() < until) {
+      const price = this.binance.price;
+      if (price) return price;
+      await sleep(250);
+    }
+    return this.binance.price ?? null;
+  }
+
+  private projectCombinedAfterRebalance(
+    shortSide: TradeSide,
+    ask: number,
+    chunk: number,
+    filledUp: number,
+    filledDn: number,
+    costUp: number,
+    costDn: number,
+  ): number {
+    if (shortSide === "Up") {
+      const nextUp = filledUp + chunk;
+      const nextCostUp = costUp + chunk * ask;
+      const avgUp = nextCostUp / Math.max(nextUp, 1);
+      const avgDn = costDn / Math.max(filledDn, 1);
+      return (avgUp + avgDn) * 100;
+    }
+    const nextDn = filledDn + chunk;
+    const nextCostDn = costDn + chunk * ask;
+    const avgUp = costUp / Math.max(filledUp, 1);
+    const avgDn = nextCostDn / Math.max(nextDn, 1);
+    return (avgUp + avgDn) * 100;
+  }
+
   private async chunkedRebalance(
     window: WindowInfo,
     state: {
@@ -817,6 +852,24 @@ export class SignalTakerExecutor {
       if (ask === null) continue;
       const cap = ask <= softCap ? softCap : hardCap;
       if (ask > cap) continue;
+      const projectedCombined = this.projectCombinedAfterRebalance(
+        shortSide,
+        ask,
+        chunk,
+        filledUp,
+        filledDn,
+        costUp,
+        costDn,
+      );
+      if (projectedCombined > SignalTakerExecutor.MAX_RESCUE_COMBINED_CENTS) {
+        this.logger.warn("Rebalance stop: projected combined too expensive", {
+          projectedCombined: `${projectedCombined.toFixed(1)}¢`,
+          max: `${SignalTakerExecutor.MAX_RESCUE_COMBINED_CENTS}¢`,
+          shortSide,
+          chunk: chunk.toFixed(0),
+        });
+        break;
+      }
 
       const fill = await this.buyOrder(shortToken, chunk, ask + this.config.slippageBuffer, shortSide);
       if (!fill.filled) continue;
