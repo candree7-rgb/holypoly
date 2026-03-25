@@ -21,6 +21,7 @@ import { WindowManager } from "./execution/window-manager.js";
 import { SignalExecutor } from "./execution/signal-executor.js";
 import { MergeArbExecutor } from "./execution/merge-arb-executor.js";
 import { SignalTakerExecutor } from "./execution/signal-taker-executor.js";
+import { SignalTakerExperimentRunner } from "./execution/signal-taker-experiment-runner.js";
 import { RiskManager } from "./risk/limits.js";
 import { TelegramNotifier } from "./telegram.js";
 import { createWebhookServer } from "./webhook.js";
@@ -1004,13 +1005,32 @@ const main = async () => {
       logger,
       telegram,
     );
+    const experimentRunner = config.dryRun && config.signalExperimentMode
+      ? new SignalTakerExperimentRunner(
+        clob,
+        clobWs,
+        binance,
+        redeemService,
+        config,
+        logger,
+        telegram,
+      )
+      : null;
 
-    logger.info("=== Signal-Taker V8 Momentum Strategy Active ===", {
+    if (config.signalExperimentMode && !config.dryRun) {
+      logger.warn("Signal experiment mode requested but disabled in LIVE mode (requires DRY_RUN=true)");
+    }
+
+    logger.info("=== Signal-Taker V10 Regime Strategy Active ===", {
       reversalThreshold: "0.015%",
       cheapThreshold: `${(config.cheapThreshold * 100).toFixed(0)}¢`,
       targetCombined: `${config.targetCombinedCents}¢`,
       equityPerWindow: `${(config.equityPerWindow * 100).toFixed(0)}%`,
       dryRun: config.dryRun,
+      experimentMode: Boolean(experimentRunner),
+      experimentVariants: experimentRunner
+        ? config.signalExperimentVariants.split(",").map((v) => v.trim()).filter(Boolean)
+        : [],
     });
 
     while (true) {
@@ -1055,7 +1075,9 @@ const main = async () => {
         await sleep(1000);
 
         // Execute V7
-        const result = await executor.executeWindow(window, balance);
+        const result = experimentRunner
+          ? await experimentRunner.executeWindow(window, balance)
+          : await executor.executeWindow(window, balance);
 
         // Record to DB
         const hadFills = !result.skipped && result.orderFills.length > 0;
