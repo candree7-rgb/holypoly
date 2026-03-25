@@ -379,7 +379,7 @@ export const loadConfig = (): Config => {
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
   const signalExperimentMode = parseBoolean("SIGNAL_EXPERIMENT_MODE", false);
   const signalExperimentVariants = getEnv("SIGNAL_EXPERIMENT_VARIANTS")
-    ?? "baseline,small_first_leg,hedgeability_gate_only,balancing_only_only,short_unpaired_timeout,late_window_no_new_unpaired,regime_confidence_filter,combo_quality,combo_tail_guard";
+    ?? "baseline,short_unpaired_timeout,baseline_plus_short_timeout,baseline_plus_short_timeout_plus_mild_hedge_gate";
 
   // V9 Regime Detection
   const observationPeriodS = parseNumber("OBSERVATION_PERIOD_S", 15);

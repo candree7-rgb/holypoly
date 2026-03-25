@@ -67,37 +67,29 @@ export class SignalTakerExperimentRunner {
   private buildVariantCatalog(): Record<string, VariantDefinition> {
     return {
       baseline: { name: "baseline", options: { name: "baseline" } },
-      small_first_leg: { name: "small_first_leg", options: { name: "small_first_leg", firstLegMultiplier: 0.18, firstLegMinShares: 20, firstLegMaxShares: 31 } },
-      hedgeability_gate_only: { name: "hedgeability_gate_only", options: { name: "hedgeability_gate_only", enableHedgeabilityGate: true, enableBalancingOnlyMode: false } },
-      balancing_only_only: { name: "balancing_only_only", options: { name: "balancing_only_only", enableHedgeabilityGate: false, enableBalancingOnlyMode: true } },
-      short_unpaired_timeout: { name: "short_unpaired_timeout", options: { name: "short_unpaired_timeout", unpairedTimeoutS: 15 } },
-      late_window_no_new_unpaired: { name: "late_window_no_new_unpaired", options: { name: "late_window_no_new_unpaired", lateWindowNoNewUnpairedS: 90 } },
-      regime_confidence_filter: { name: "regime_confidence_filter", options: { name: "regime_confidence_filter", enableRegimeConfidenceFilter: true } },
-      combo_quality: {
-        name: "combo_quality",
+      short_unpaired_timeout: {
+        name: "short_unpaired_timeout",
         options: {
-          name: "combo_quality",
-          firstLegMultiplier: 0.20,
-          firstLegMinShares: 24,
-          firstLegMaxShares: 36,
-          enableHedgeabilityGate: true,
-          enableBalancingOnlyMode: true,
-          unpairedTimeoutS: 18,
-          lateWindowNoNewUnpairedS: 90,
+          name: "short_unpaired_timeout",
+          unpairedTimeoutS: 15,
+          enableHedgeabilityGate: false,
+          enableBalancingOnlyMode: false,
         },
       },
-      combo_tail_guard: {
-        name: "combo_tail_guard",
+      baseline_plus_short_timeout: {
+        name: "baseline_plus_short_timeout",
         options: {
-          name: "combo_tail_guard",
-          firstLegMultiplier: 0.16,
-          firstLegMinShares: 20,
-          firstLegMaxShares: 31,
+          name: "baseline_plus_short_timeout",
+          unpairedTimeoutS: 15,
+        },
+      },
+      baseline_plus_short_timeout_plus_mild_hedge_gate: {
+        name: "baseline_plus_short_timeout_plus_mild_hedge_gate",
+        options: {
+          name: "baseline_plus_short_timeout_plus_mild_hedge_gate",
+          unpairedTimeoutS: 15,
           enableHedgeabilityGate: true,
-          enableBalancingOnlyMode: true,
-          unpairedTimeoutS: 12,
-          lateWindowNoNewUnpairedS: 120,
-          enableRegimeConfidenceFilter: true,
+          useMildHedgeabilityGate: true,
         },
       },
     };

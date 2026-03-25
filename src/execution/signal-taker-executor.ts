@@ -40,6 +40,7 @@ export interface SignalExecutorVariantOptions {
   unpairedTimeoutS?: number;
   lateWindowNoNewUnpairedS?: number;
   enableRegimeConfidenceFilter?: boolean;
+  useMildHedgeabilityGate?: boolean;
 }
 
 /**
@@ -188,7 +189,12 @@ export class SignalTakerExecutor {
       return result;
     }
     if (this.variant.enableHedgeabilityGate !== false) {
-      const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
+      const feasible = this.assessHedgeFeasibility(
+        window,
+        chunkSize,
+        observation,
+        this.variant.useMildHedgeabilityGate === true,
+      );
       if (!feasible.ok) {
         result.skipped = true;
         result.skipReason = feasible.reason;
@@ -787,23 +793,34 @@ export class SignalTakerExecutor {
     return { regime, avgUpSpreadCents, avgDnSpreadCents, upDepthWithinBand, dnDepthWithinBand, reversals, distanceToOpenPct, refillScore };
   }
 
-  private assessHedgeFeasibility(window: WindowInfo, chunkSize: number, observation: ObservationResult): { ok: boolean; reason?: string } {
+  private assessHedgeFeasibility(
+    window: WindowInfo,
+    chunkSize: number,
+    observation: ObservationResult,
+    mildGate: boolean,
+  ): { ok: boolean; reason?: string } {
     const secondsLeft = Math.max(0, (window.endTime - Date.now()) / 1000);
-    const requiredSeconds = Math.max(this.config.stopBuyingBeforeEndS + 20, 75);
+    const requiredSeconds = mildGate
+      ? Math.max(this.config.stopBuyingBeforeEndS + 10, 60)
+      : Math.max(this.config.stopBuyingBeforeEndS + 20, 75);
     if (secondsLeft < requiredSeconds) return { ok: false, reason: "Too little time left for safe hedging" };
     if (observation.avgUpSpreadCents > this.config.maxSpreadCents || observation.avgDnSpreadCents > this.config.maxSpreadCents) {
       return { ok: false, reason: "Spread quality too poor for chunked hedge" };
     }
-    const minDepthNeed = Math.max(20, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT);
+    const minDepthNeed = mildGate
+      ? Math.max(15, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT * 0.8)
+      : Math.max(20, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT);
     if (observation.upDepthWithinBand < minDepthNeed || observation.dnDepthWithinBand < minDepthNeed) {
       return { ok: false, reason: "Insufficient depth in intended hedge band" };
     }
-    if (observation.refillScore < 0.25) {
+    const refillThreshold = mildGate ? 0.18 : 0.25;
+    if (observation.refillScore < refillThreshold) {
       return { ok: false, reason: "Book refill resilience too weak" };
     }
     const hedgeableChunksUp = observation.upDepthWithinBand / minDepthNeed;
     const hedgeableChunksDn = observation.dnDepthWithinBand / minDepthNeed;
-    if (Math.min(hedgeableChunksUp, hedgeableChunksDn) < SignalTakerExecutor.MIN_HEDGEABLE_CHUNKS) {
+    const minHedgeableChunks = mildGate ? 1.2 : SignalTakerExecutor.MIN_HEDGEABLE_CHUNKS;
+    if (Math.min(hedgeableChunksUp, hedgeableChunksDn) < minHedgeableChunks) {
       return { ok: false, reason: "Opposite side not hedgeable in chunks" };
     }
     return { ok: true };
