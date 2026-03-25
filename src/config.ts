@@ -115,6 +115,10 @@ export interface Config {
   budgetReservePct: number;
   /** Hard safety cap for rebalance (e.g. 0.99 = 99¢) */
   rebalanceMaxPrice: number;
+  /** Enable parallel dry-run executor experiments on identical windows/data */
+  signalExperimentMode: boolean;
+  /** Comma-separated variant ids for experiment runner */
+  signalExperimentVariants: string;
 
   // Merge-Arb Strategy parameters (merge-arb mode, V3 spec)
   /** Fraction of balance to allocate per window (e.g. 0.80 = 80%) */
@@ -373,6 +377,9 @@ export const loadConfig = (): Config => {
   const targetCombinedCents = parseNumber("TARGET_COMBINED_CENTS", 95);
   const budgetReservePct = parseNumber("BUDGET_RESERVE_PCT", 0.50);
   const rebalanceMaxPrice = parseNumber("REBALANCE_MAX_PRICE", 0.99);
+  const signalExperimentMode = parseBoolean("SIGNAL_EXPERIMENT_MODE", false);
+  const signalExperimentVariants = getEnv("SIGNAL_EXPERIMENT_VARIANTS")
+    ?? "baseline,small_first_leg,hedgeability_gate_only,balancing_only_only,short_unpaired_timeout,late_window_no_new_unpaired,regime_confidence_filter,combo_quality,combo_tail_guard";
 
   // V9 Regime Detection
   const observationPeriodS = parseNumber("OBSERVATION_PERIOD_S", 15);
@@ -487,6 +494,8 @@ export const loadConfig = (): Config => {
     targetCombinedCents,
     budgetReservePct,
     rebalanceMaxPrice,
+    signalExperimentMode,
+    signalExperimentVariants,
     observationPeriodS,
     oscillationThreshold,
     trendSkipThreshold,

@@ -30,6 +30,18 @@ interface ObservationResult {
   refillScore: number;
 }
 
+export interface SignalExecutorVariantOptions {
+  name?: string;
+  firstLegMultiplier?: number;
+  firstLegMinShares?: number;
+  firstLegMaxShares?: number;
+  enableHedgeabilityGate?: boolean;
+  enableBalancingOnlyMode?: boolean;
+  unpairedTimeoutS?: number;
+  lateWindowNoNewUnpairedS?: number;
+  enableRegimeConfidenceFilter?: boolean;
+}
+
 /**
  * SignalTakerExecutor V10: Regime-aware pair construction with hard tail-loss control.
  */
@@ -70,6 +82,7 @@ export class SignalTakerExecutor {
     private config: Config,
     private logger: Logger,
     private telegram: TelegramNotifier,
+    private variant: SignalExecutorVariantOptions = {},
   ) {}
 
   /**
@@ -123,9 +136,12 @@ export class SignalTakerExecutor {
     }
 
     const chunkSize = this.getSessionChunkSize(balance);
+    const firstLegMultiplier = this.variant.firstLegMultiplier ?? SignalTakerExecutor.FIRST_LEG_MULTIPLIER;
+    const firstLegMinShares = this.variant.firstLegMinShares ?? SignalTakerExecutor.FIRST_LEG_MIN_SHARES;
+    const firstLegMaxShares = this.variant.firstLegMaxShares ?? SignalTakerExecutor.FIRST_LEG_MAX_SHARES;
     const firstLegChunk = Math.min(
-      SignalTakerExecutor.FIRST_LEG_MAX_SHARES,
-      Math.max(SignalTakerExecutor.FIRST_LEG_MIN_SHARES, Math.floor(chunkSize * SignalTakerExecutor.FIRST_LEG_MULTIPLIER)),
+      firstLegMaxShares,
+      Math.max(firstLegMinShares, Math.floor(chunkSize * firstLegMultiplier)),
     );
     const budget = balance * this.config.equityPerWindow;
     let availableBudget = budget;
@@ -149,6 +165,7 @@ export class SignalTakerExecutor {
     let rollingLow = btcOpen;
 
     this.logger.info("=== V10 Regime Window Start ===", {
+      variant: this.variant.name ?? "baseline",
       btc: `$${btcOpen.toFixed(0)}`,
       budget: `$${budget.toFixed(0)}`,
       chunk: chunkSize,
@@ -170,11 +187,23 @@ export class SignalTakerExecutor {
       this.telegram.send("⏭️ Skip: one-sided extreme book (hedge toxicity)");
       return result;
     }
-    const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
-    if (!feasible.ok) {
+    if (this.variant.enableHedgeabilityGate !== false) {
+      const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
+      if (!feasible.ok) {
+        result.skipped = true;
+        result.skipReason = feasible.reason;
+        this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
+        return result;
+      }
+    }
+    if (
+      this.variant.enableRegimeConfidenceFilter &&
+      observation.regime === "TREND" &&
+      observation.reversals === 0 &&
+      observation.distanceToOpenPct > this.config.oscillationThreshold * 2
+    ) {
       result.skipped = true;
-      result.skipReason = feasible.reason;
-      this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
+      result.skipReason = "Low-confidence trend regime";
       return result;
     }
 
@@ -237,9 +266,16 @@ export class SignalTakerExecutor {
         window,
       );
       const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
-      if (!isFirstBuy && filledUp !== filledDn && nextSide !== shortSide) {
+      if (this.variant.enableBalancingOnlyMode !== false && !isFirstBuy && filledUp !== filledDn && nextSide !== shortSide) {
         // Balancing-only mode: once unpaired inventory exists, prioritize hedge completion.
         nextSide = shortSide;
+      }
+      if (
+        this.variant.lateWindowNoNewUnpairedS &&
+        filledUp !== filledDn &&
+        timeRemainingS <= this.variant.lateWindowNoNewUnpairedS
+      ) {
+        break;
       }
 
       // Dynamic interval: momentum-aware timing (no hard gate!)
@@ -407,10 +443,11 @@ export class SignalTakerExecutor {
           });
           break;
         }
-        if (unpairedStartMs !== null && Date.now() - unpairedStartMs > this.config.maxNakedDurationS * 1000) {
+        const unpairedTimeoutS = this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS;
+        if (unpairedStartMs !== null && Date.now() - unpairedStartMs > unpairedTimeoutS * 1000) {
           this.logger.warn("TAIL GUARD: unpaired exposure duration exceeded", {
             unpairedForS: ((Date.now() - unpairedStartMs) / 1000).toFixed(1),
-            limitS: this.config.maxNakedDurationS,
+            limitS: unpairedTimeoutS,
             up: filledUp.toFixed(0),
             dn: filledDn.toFixed(0),
           });
