@@ -427,15 +427,21 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Safety cap
-      const sidePriceCap = this.getPriceCap(
+      // Safety cap (3-tier: entry / balancing / trend_first)
+      const { cap: sidePriceCap, type: capType } = this.getPriceCap(
         observation.regime, isFirstBuy, nextSide,
         filledUp, filledDn, costUp, costDn,
       );
       if (bestAsk >= sidePriceCap) {
+        this.logger.debug("Price cap blocked", {
+          side: nextSide, capType,
+          ask: `${(bestAsk * 100).toFixed(1)}¢`,
+          cap: `${(sidePriceCap * 100).toFixed(0)}¢`,
+          state: currentState,
+        });
         sm.recordDecision({
           tick: fillTick++, state: currentState, regime: observation.regime,
-          chosenSide: nextSide, reason: `ask=${(bestAsk*100).toFixed(1)}c >= cap=${(sidePriceCap*100).toFixed(0)}c`,
+          chosenSide: nextSide, reason: `${capType}_cap: ask=${(bestAsk*100).toFixed(1)}c >= ${(sidePriceCap*100).toFixed(0)}c`,
           altReason: sideReason, pairBand: combinedCents !== Infinity ? classifyPairQuality(combinedCents) : null,
           filledUp, filledDn, combinedCents,
           imbalanceRatio: Math.min(filledUp, filledDn) > 0 ? Math.max(filledUp, filledDn) / Math.min(filledUp, filledDn) : 0,
@@ -894,7 +900,7 @@ export class SignalTakerExecutor {
       const prefToken = preferred === "Up" ? window.upTokenId : window.downTokenId;
       const prefBook = this.getBook(prefToken);
       const prefAsk = this.getAskPrice(prefBook);
-      const cap = this.getPriceCap(regime, false, preferred, filledUp, filledDn, costUp, costDn);
+      const { cap } = this.getPriceCap(regime, false, preferred, filledUp, filledDn, costUp, costDn);
       if (prefAsk !== null && prefAsk < cap) {
         return preferred;
       }
@@ -1111,7 +1117,7 @@ export class SignalTakerExecutor {
     for (const side of candidateSides) {
       const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
       const ask = this.getAskPrice(this.getBook(tokenId));
-      const sideCap = this.getPriceCap(regime, isFirstBuy, side, filledUp, filledDn, costUp, costDn);
+      const { cap: sideCap } = this.getPriceCap(regime, isFirstBuy, side, filledUp, filledDn, costUp, costDn);
       if (ask === null || ask >= sideCap) continue;
       const chunk = Math.max(10, Math.floor(chunkSize * this.config.probeChunkPct));
       const pair = this.projectPairState(side, ask, chunk, filledUp, filledDn, costUp, costDn);
@@ -1122,6 +1128,21 @@ export class SignalTakerExecutor {
     return best.side;
   }
 
+  /**
+   * 3-tier price cap system:
+   *
+   * 1. ENTRY CAP (first buy / long-side accumulation):
+   *    cheapThreshold (50¢) — value-seeking, don't overpay for entry
+   *    Exception: TREND first-leg allows up to 70¢ (secure expensive side)
+   *
+   * 2. BALANCING CAP (hedge/short side during accumulation):
+   *    target-implied cap: (target/100) - longAvg + buffer
+   *    Floored at 55¢, capped at SOFT_HEDGE_CAP (90¢)
+   *    Allows paying more to complete the pair — pair economics matter, not absolute price
+   *
+   * 3. EMERGENCY CAP (rebalance phase):
+   *    rebalanceMaxPrice (99¢) — last resort to avoid naked
+   */
   private getPriceCap(
     regime: Regime,
     isFirstBuy: boolean,
@@ -1130,24 +1151,42 @@ export class SignalTakerExecutor {
     filledDn: number,
     costUp: number,
     costDn: number,
-  ): number {
+  ): { cap: number; type: "entry" | "balancing" | "trend_first" } {
+    // Tier 1: TREND first-leg — secure the expensive side up to 70¢
     if (regime === "TREND" && isFirstBuy) {
-      return Math.max(this.config.cheapThreshold, SignalTakerExecutor.TREND_FIRST_LEG_MAX_PRICE);
+      return {
+        cap: Math.max(this.config.cheapThreshold, SignalTakerExecutor.TREND_FIRST_LEG_MAX_PRICE),
+        type: "trend_first",
+      };
     }
+
+    // Determine if this side is the balancing (hedge) side
     const isBalancingSide =
       (side === "Up" && filledUp < filledDn) ||
       (side === "Down" && filledDn < filledUp);
+
+    // Tier 2: BALANCING CAP — pair-economics-based, more generous
     if (!isFirstBuy && isBalancingSide) {
       const longAvg = side === "Up"
         ? (filledDn > 0 ? costDn / filledDn : 0)
         : (filledUp > 0 ? costUp / filledUp : 0);
-      // Balance-friendly cap: allow a little above target-implied hedge price
-      // to improve hedge completion without permitting expensive rescues.
-      const targetCap = (this.config.targetCombinedCents / 100) - longAvg + SignalTakerExecutor.BALANCE_PRICE_BUFFER;
-      const hedgeCap = Math.min(this.config.rebalanceMaxPrice, Math.max(this.config.cheapThreshold, targetCap));
-      return hedgeCap;
+      // How much can we pay for the hedge side?
+      // Use DEFENSIVE band (103¢) as ceiling — not target (95¢).
+      // Spec: "sub-100 is ideal, not mandatory. Slightly above 100¢ is acceptable."
+      // Example: longAvg=36¢ → can pay up to 103¢-36¢+3¢ = 70¢ for hedge
+      // Example: longAvg=44¢ → can pay up to 103¢-44¢+3¢ = 62¢ for hedge
+      const defensiveImplied = 1.03 - longAvg + SignalTakerExecutor.BALANCE_PRICE_BUFFER;
+      // Allow up to SOFT_HEDGE_CAP (90¢) — above that it's emergency/rebalance territory
+      // Floor at 55¢ to prevent being too restrictive
+      const balancingCap = Math.min(
+        SignalTakerExecutor.SOFT_HEDGE_CAP,
+        Math.max(0.55, defensiveImplied),
+      );
+      return { cap: balancingCap, type: "balancing" };
     }
-    return this.config.cheapThreshold;
+
+    // Tier 1: ENTRY CAP — value-seeking
+    return { cap: this.config.cheapThreshold, type: "entry" };
   }
 
   private isOneSidedToxic(window: WindowInfo): boolean {
