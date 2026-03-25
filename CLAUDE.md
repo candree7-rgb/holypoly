@@ -107,6 +107,8 @@ BTC-Abstand vom Window-Open: `|btcNow - btcOpen| / btcOpen`
 - Momentum-Timing: Up kaufen wenn BTC fällt, Down wenn BTC steigt
 - **Mid-Window Merge:** Bei MERGE_READY + GOOD+ Qualität + genug Zeit → merge + capital recyclen
 - Probing Phase: erste 30s kleinere Chunks (25%), dann volle Größe
+- **Paired Quality Trailing:** Schützt gewonnene Pair-Qualität vor Verschlechterung
+- **Pre-Entry Combined Check:** Skip wenn combined > 106¢ (unheidgeable)
 
 #### Phase 2: REBALANCE
 - Short Side kaufen mit Dynamic Cap (breakeven + 3¢)
@@ -125,12 +127,14 @@ BTC-Abstand vom Window-Open: `|btcNow - btcOpen| / btcOpen`
 
 | Guard | Beschreibung |
 |---|---|
-| Cheap Threshold | Max 50¢ pro Seite |
+| **3-Tier Price Cap** | Entry: 50¢ / Balancing: pair-economics (55-90¢) / Emergency: 99¢ |
+| Pre-Entry Combined | Skip wenn combined > 106¢ (unheidgeable Window) |
 | Imbalance Guard | Max 2:1 Ratio |
 | Budget Reserve | Max 50% auf eine Seite bis andere ≥1 Fill |
-| Projected Combined | Nur kaufen wenn Combined sich verbessert |
-| Circuit Breaker | Stopp bei combined > 99¢ nach 5+ Fills |
-| Tail Guard | Stopp wenn marginal pair cost > 108¢ |
+| 3-Layer Economics | Projected avg → block nur bei TOXIC (≥103¢), nicht bei jeder Verschlechterung |
+| Circuit Breaker | Stopp bei weighted avg > 103¢ nach 5+ Fills |
+| Tail Guard | Stopp wenn marginal pair > 108¢ UND weighted avg DEFENSIVE/TOXIC |
+| **Paired Quality Trailing** | Trail best paired avg, stop wenn Verschlechterung > Band (3-5¢) |
 | Observation Phase | 15/25s warten vor erstem Kauf |
 | Trend-Skip | Skip bei BTC > 0.10% vom Open |
 | One-Sided Toxicity | Skip wenn eine Seite ≤ 20¢ und andere ≥ 80¢ |
