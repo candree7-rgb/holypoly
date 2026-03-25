@@ -105,7 +105,7 @@ export class SignalTakerExperimentRunner {
   async executeWindow(window: WindowInfo, balance: number): Promise<WindowExecutionResult> {
     const variants = this.activeVariants();
     this.logger.info("Signal experiment window start", {
-      variants: variants.map((v) => v.name),
+      variants: variants.map((v) => ({ name: v.name, options: v.options })),
       window: `${new Date(window.startTime).toISOString()}-${new Date(window.endTime).toISOString()}`,
     });
 

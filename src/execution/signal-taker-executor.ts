@@ -159,6 +159,20 @@ export class SignalTakerExecutor {
     let lastBuyTime = 0;
     let combinedCents = Infinity;
     let unpairedStartMs: number | null = null;
+    const audit = {
+      variant: this.variant.name ?? "baseline",
+      hedgeGateEnabled: this.variant.enableHedgeabilityGate !== false,
+      hedgeGateMode: this.variant.useMildHedgeabilityGate ? "mild" : "standard",
+      balancingOnlyEnabled: this.variant.enableBalancingOnlyMode !== false,
+      unpairedTimeoutS: this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS,
+      lateWindowNoNewUnpairedS: this.variant.lateWindowNoNewUnpairedS ?? null,
+      firstLegLateBlocked: false,
+      hedgeGateSkippedWindow: false,
+      lateUnpairedStopTriggered: false,
+      unpairedTimeoutTriggered: false,
+      finalAction: "unknown" as "trade" | "skip" | "no_fill",
+      finalReason: "none",
+    };
 
     // Price momentum state: rolling window of recent BTC prices
     const priceHistory: number[] = [btcOpen];
@@ -167,6 +181,13 @@ export class SignalTakerExecutor {
 
     this.logger.info("=== V10 Regime Window Start ===", {
       variant: this.variant.name ?? "baseline",
+      flags: {
+        hedgeGateEnabled: audit.hedgeGateEnabled,
+        hedgeGateMode: audit.hedgeGateMode,
+        balancingOnlyEnabled: audit.balancingOnlyEnabled,
+        unpairedTimeoutS: audit.unpairedTimeoutS,
+        lateWindowNoNewUnpairedS: audit.lateWindowNoNewUnpairedS,
+      },
       btc: `$${btcOpen.toFixed(0)}`,
       budget: `$${budget.toFixed(0)}`,
       chunk: chunkSize,
@@ -198,6 +219,10 @@ export class SignalTakerExecutor {
       if (!feasible.ok) {
         result.skipped = true;
         result.skipReason = feasible.reason;
+        audit.hedgeGateSkippedWindow = true;
+        audit.finalAction = "skip";
+        audit.finalReason = feasible.reason ?? "hedge_gate_skip";
+        this.logger.info("Variant decision audit", audit);
         this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
         return result;
       }
@@ -210,6 +235,9 @@ export class SignalTakerExecutor {
     ) {
       result.skipped = true;
       result.skipReason = "Low-confidence trend regime";
+      audit.finalAction = "skip";
+      audit.finalReason = result.skipReason;
+      this.logger.info("Variant decision audit", audit);
       return result;
     }
 
@@ -248,6 +276,7 @@ export class SignalTakerExecutor {
         ? SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_OSC_S
         : SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_S;
       if (isFirstBuy && timeRemainingS < minTimeForFirstLeg) {
+        audit.firstLegLateBlocked = true;
         this.logger.info("Skip late first-leg opening", { timeRemainingS: timeRemainingS.toFixed(1) });
         break;
       }
@@ -281,6 +310,7 @@ export class SignalTakerExecutor {
         filledUp !== filledDn &&
         timeRemainingS <= this.variant.lateWindowNoNewUnpairedS
       ) {
+        audit.lateUnpairedStopTriggered = true;
         break;
       }
 
@@ -451,6 +481,7 @@ export class SignalTakerExecutor {
         }
         const unpairedTimeoutS = this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS;
         if (unpairedStartMs !== null && Date.now() - unpairedStartMs > unpairedTimeoutS * 1000) {
+          audit.unpairedTimeoutTriggered = true;
           this.logger.warn("TAIL GUARD: unpaired exposure duration exceeded", {
             unpairedForS: ((Date.now() - unpairedStartMs) / 1000).toFixed(1),
             limitS: unpairedTimeoutS,
@@ -586,6 +617,9 @@ export class SignalTakerExecutor {
       profit: `$${totalMergeProfit.toFixed(2)}`,
       pairedProfit: `$${pairedProfit.toFixed(2)}`,
     });
+    audit.finalAction = orderCount > 0 ? "trade" : (result.skipped ? "skip" : "no_fill");
+    audit.finalReason = result.skipReason ?? (orderCount > 0 ? "filled" : "no_fill");
+    this.logger.info("Variant decision audit", audit);
 
     // ── SINGLE TG MESSAGE ──
     if (totalMerged > 0) {
