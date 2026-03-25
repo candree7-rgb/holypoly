@@ -45,6 +45,7 @@ export class SignalTakerExecutor {
   private static readonly FIRST_LEG_MAX_SHARES = 46;
   private static readonly REBALANCE_CHUNK_PCT = 0.35;
   private static readonly SOFT_HEDGE_CAP = 0.90;
+  private static readonly TREND_FIRST_LEG_MAX_PRICE = 0.70;
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -202,7 +203,17 @@ export class SignalTakerExecutor {
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
-      nextSide = this.resolveSideByPairQuality(nextSide, filledUp, filledDn, costUp, costDn, chunkSize, window);
+      nextSide = this.resolveSideByPairQuality(
+        nextSide,
+        observation.regime,
+        isFirstBuy,
+        filledUp,
+        filledDn,
+        costUp,
+        costDn,
+        chunkSize,
+        window,
+      );
 
       // Dynamic interval: momentum-aware timing (no hard gate!)
       // Good momentum → short interval (aggressive). No signal → normal interval. Near target → longer.
@@ -233,11 +244,14 @@ export class SignalTakerExecutor {
       // Safety cap: prevent buying a side so expensive that combined > $1 (guaranteed loss).
       // The projectedCombined check (below) handles the softer target check.
       // cheapThreshold is the absolute max we'll pay for any single side.
-      if (bestAsk >= this.config.cheapThreshold) {
+      const sidePriceCap = this.getPriceCap(observation.regime, isFirstBuy);
+      if (bestAsk >= sidePriceCap) {
         this.logger.debug("Ask above safety cap", {
           side: nextSide,
           ask: `${(bestAsk * 100).toFixed(1)}¢`,
-          cap: `${(this.config.cheapThreshold * 100).toFixed(0)}¢`,
+          cap: `${(sidePriceCap * 100).toFixed(0)}¢`,
+          regime: observation.regime,
+          isFirstBuy,
         });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
@@ -480,7 +494,7 @@ export class SignalTakerExecutor {
     result.takerFees = totalTakerFees;
     result.inventory = inventory;
 
-    this.logger.info("=== V9 Window Summary ===", {
+    this.logger.info("=== V10 Window Summary ===", {
       fills: orderCount,
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
@@ -550,7 +564,8 @@ export class SignalTakerExecutor {
       const prefToken = preferred === "Up" ? window.upTokenId : window.downTokenId;
       const prefBook = this.getBook(prefToken);
       const prefAsk = this.getAskPrice(prefBook);
-      if (prefAsk !== null && prefAsk < this.config.cheapThreshold) {
+      const cap = this.getPriceCap(regime, false);
+      if (prefAsk !== null && prefAsk < cap) {
         return preferred;
       }
       // Preferred side too expensive — wait. Do NOT fall through to buy the other side,
@@ -744,6 +759,8 @@ export class SignalTakerExecutor {
 
   private resolveSideByPairQuality(
     preferredSide: TradeSide,
+    regime: Regime,
+    isFirstBuy: boolean,
     filledUp: number,
     filledDn: number,
     costUp: number,
@@ -756,7 +773,8 @@ export class SignalTakerExecutor {
     for (const side of candidateSides) {
       const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
       const ask = this.getAskPrice(this.getBook(tokenId));
-      if (ask === null || ask >= this.config.cheapThreshold) continue;
+      const sideCap = this.getPriceCap(regime, isFirstBuy);
+      if (ask === null || ask >= sideCap) continue;
       const chunk = Math.max(10, Math.floor(chunkSize * this.config.probeChunkPct));
       const pair = this.projectPairState(side, ask, chunk, filledUp, filledDn, costUp, costDn);
       const imbalancePenalty = side === "Up" ? Math.max(0, (filledUp + chunk) - filledDn) : Math.max(0, (filledDn + chunk) - filledUp);
@@ -764,6 +782,13 @@ export class SignalTakerExecutor {
       if (score < best.score) best = { side, score };
     }
     return best.side;
+  }
+
+  private getPriceCap(regime: Regime, isFirstBuy: boolean): number {
+    if (regime === "TREND" && isFirstBuy) {
+      return Math.max(this.config.cheapThreshold, SignalTakerExecutor.TREND_FIRST_LEG_MAX_PRICE);
+    }
+    return this.config.cheapThreshold;
   }
 
   private async chunkedRebalance(
