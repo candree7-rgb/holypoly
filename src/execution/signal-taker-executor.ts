@@ -15,6 +15,7 @@ import type {
   TradeSide,
 } from "../types.js";
 import { DryRunEngine } from "./dry-run-engine.js";
+import { InventoryStateMachine, classifyPairQuality, type FillDecision, type PairQualityBand } from "./inventory-state-machine.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
 type Regime = "OSCILLATION" | "TREND" | "SKIP";
@@ -44,7 +45,8 @@ export interface SignalExecutorVariantOptions {
 }
 
 /**
- * SignalTakerExecutor V10: Regime-aware pair construction with hard tail-loss control.
+ * SignalTakerExecutor V11: Inventory state machine + pair quality bands.
+ * Two-sided inventory engine with fast alternation per executor_spec.md.
  */
 export class SignalTakerExecutor {
   private dryRunEngine: DryRunEngine | null = null;
@@ -87,7 +89,7 @@ export class SignalTakerExecutor {
   ) {}
 
   /**
-   * Execute V7 adaptive strategy for one 5-minute window.
+   * Execute V11 state-machine-driven strategy for one 5-minute window.
    */
   async executeWindow(window: WindowInfo, balance: number): Promise<WindowExecutionResult> {
     const result: WindowExecutionResult = {
@@ -159,6 +161,18 @@ export class SignalTakerExecutor {
     let lastBuyTime = 0;
     let combinedCents = Infinity;
     let unpairedStartMs: number | null = null;
+
+    // ── Inventory State Machine ──
+    const sm = new InventoryStateMachine({
+      nearBalancedRatio: 1.3,
+      defensiveUnpairedS: this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS,
+      stopBuildTimeS: this.config.stopBuyingBeforeEndS,
+      mergeReadyMinShares: this.config.mergeMinSize,
+      stopBuildCombinedCents: 103,
+      defensiveCombinedCents: 100,
+    });
+    let fillTick = 0;
+
     const audit = {
       variant: this.variant.name ?? "baseline",
       hedgeGateEnabled: this.variant.enableHedgeabilityGate !== false,
@@ -179,7 +193,7 @@ export class SignalTakerExecutor {
     let rollingHigh = btcOpen;
     let rollingLow = btcOpen;
 
-    this.logger.info("=== V10 Regime Window Start ===", {
+    this.logger.info("=== V11 Regime Window Start ===", {
       variant: this.variant.name ?? "baseline",
       flags: {
         hedgeGateEnabled: audit.hedgeGateEnabled,
@@ -242,8 +256,8 @@ export class SignalTakerExecutor {
     }
 
     // ═══════════════════════════════════════════════════
-    // PHASE 1: MOMENTUM-BASED ACCUMULATION
-    // Strict alternation, price-reversal timed, combined-improving
+    // PHASE 1: STATE-MACHINE-DRIVEN ACCUMULATION
+    // Two-sided inventory engine with fast alternation
     // ═══════════════════════════════════════════════════
     const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
     const windowStartTime = Date.now();
@@ -272,6 +286,27 @@ export class SignalTakerExecutor {
       const bounceFromLow = (btcNow - rollingLow) / rollingLow;   // +ve when rising
       const isFirstBuy = orderCount === 0;
       const timeRemainingS = Math.max(0, (window.endTime - Date.now()) / 1000);
+
+      // ── EVALUATE STATE MACHINE ──
+      const currentState = sm.evaluate({
+        filledUp, filledDn, costUp, costDn,
+        unpairedStartMs, timeRemainingS,
+        mergeMinSize: this.config.mergeMinSize,
+        tick: fillTick,
+      });
+      const allowed = sm.getAllowedActions();
+
+      // STOP_BUILD: no more accumulation
+      if (currentState === "STOP_BUILD" && !allowed.canAccumulate) {
+        this.logger.info("State machine: STOP_BUILD — exiting accumulation", {
+          variant: this.variant.name ?? "baseline",
+          state: currentState,
+          timeRemainingS: timeRemainingS.toFixed(0),
+        });
+        break;
+      }
+
+      // Late first-leg check
       const minTimeForFirstLeg = observation.regime === "OSCILLATION"
         ? SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_OSC_S
         : SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_S;
@@ -281,30 +316,54 @@ export class SignalTakerExecutor {
         break;
       }
 
-      // Determine which side to buy (strict alternation + balance + momentum)
+      // ── SIDE SELECTION (state-machine-aware) ──
       let nextSide = this.chooseNextSide(
         observation.regime, lastBuySide, filledUp, filledDn, costUp, costDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
       );
+      let sideReason = "chooseNextSide";
+      let altReason: string | null = null;
+
       if (!nextSide) {
+        // Record skip decision
+        sm.recordDecision({
+          tick: fillTick++, state: currentState, regime: observation.regime,
+          chosenSide: null, reason: "no_side_available", altReason: null,
+          pairBand: combinedCents !== Infinity ? classifyPairQuality(combinedCents) : null,
+          filledUp, filledDn, combinedCents,
+          imbalanceRatio: Math.min(filledUp, filledDn) > 0 ? Math.max(filledUp, filledDn) / Math.min(filledUp, filledDn) : 0,
+          unpairedDurationMs: unpairedStartMs ? Date.now() - unpairedStartMs : 0,
+          timeRemainingS,
+        });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
-      nextSide = this.resolveSideByPairQuality(
-        nextSide,
-        observation.regime,
-        isFirstBuy,
-        filledUp,
-        filledDn,
-        costUp,
-        costDn,
-        chunkSize,
-        window,
-      );
-      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
-      if (this.variant.enableBalancingOnlyMode !== false && !isFirstBuy && filledUp !== filledDn && nextSide !== shortSide) {
-        // Balancing-only mode: once unpaired inventory exists, prioritize hedge completion.
+
+      // State-machine overrides on side selection
+      const shortSide = sm.getShortSide(filledUp, filledDn);
+      if (allowed.mustPrioritizeShortSide && shortSide && nextSide !== shortSide) {
+        altReason = `state=${currentState} forced short_side=${shortSide} (was ${nextSide})`;
         nextSide = shortSide;
+        sideReason = "sm_priority_short";
+      } else if (!isFirstBuy && !allowed.canAccumulateLongSide && shortSide && nextSide !== shortSide) {
+        altReason = `state=${currentState} blocked long_side=${nextSide}`;
+        nextSide = shortSide;
+        sideReason = "sm_blocked_long";
       }
+
+      // Pair quality resolution (may switch side for better pair economics)
+      const resolvedSide = this.resolveSideByPairQuality(
+        nextSide, observation.regime, isFirstBuy,
+        filledUp, filledDn, costUp, costDn, chunkSize, window,
+      );
+      if (resolvedSide !== nextSide) {
+        // Only allow pair-quality override if state permits long-side accumulation
+        if (allowed.canAccumulateLongSide || resolvedSide === shortSide) {
+          sideReason = `pair_quality_resolve: ${nextSide}->${resolvedSide}`;
+          nextSide = resolvedSide;
+        }
+      }
+
+      // Late window unpaired stop
       if (
         this.variant.lateWindowNoNewUnpairedS &&
         filledUp !== filledDn &&
@@ -314,15 +373,13 @@ export class SignalTakerExecutor {
         break;
       }
 
-      // Dynamic interval: momentum-aware timing (no hard gate!)
-      // Good momentum → short interval (aggressive). No signal → normal interval. Near target → longer.
+      // Dynamic interval: momentum-aware timing
       const hasBothSides = filledUp > 0 && filledDn > 0;
       const hasMomentum = this.isGoodTimeToBuy(nextSide, dipFromHigh, bounceFromLow);
       const baseInterval = this.computeInterval(combinedCents);
-      // Momentum bonus: buy faster when BTC favors this side, slower when not
       const minInterval = hasBothSides && !hasMomentum
-        ? Math.max(baseInterval, 3000)  // no signal → at least 3s, but still buy!
-        : baseInterval;                  // momentum aligned or first buys → use base
+        ? Math.max(baseInterval, 3000)
+        : baseInterval;
       const now = Date.now();
       if (now - lastBuyTime < minInterval) {
         await sleep(this.config.signalCheckIntervalMs);
@@ -340,32 +397,26 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Safety cap: prevent buying a side so expensive that combined > $1 (guaranteed loss).
-      // The projectedCombined check (below) handles the softer target check.
-      // cheapThreshold is the absolute max we'll pay for any single side.
+      // Safety cap
       const sidePriceCap = this.getPriceCap(
-        observation.regime,
-        isFirstBuy,
-        nextSide,
-        filledUp,
-        filledDn,
-        costUp,
-        costDn,
+        observation.regime, isFirstBuy, nextSide,
+        filledUp, filledDn, costUp, costDn,
       );
       if (bestAsk >= sidePriceCap) {
-        this.logger.debug("Ask above safety cap", {
-          side: nextSide,
-          ask: `${(bestAsk * 100).toFixed(1)}¢`,
-          cap: `${(sidePriceCap * 100).toFixed(0)}¢`,
-          regime: observation.regime,
-          isFirstBuy,
+        sm.recordDecision({
+          tick: fillTick++, state: currentState, regime: observation.regime,
+          chosenSide: nextSide, reason: `ask=${(bestAsk*100).toFixed(1)}c >= cap=${(sidePriceCap*100).toFixed(0)}c`,
+          altReason: sideReason, pairBand: combinedCents !== Infinity ? classifyPairQuality(combinedCents) : null,
+          filledUp, filledDn, combinedCents,
+          imbalanceRatio: Math.min(filledUp, filledDn) > 0 ? Math.max(filledUp, filledDn) / Math.min(filledUp, filledDn) : 0,
+          unpairedDurationMs: unpairedStartMs ? Date.now() - unpairedStartMs : 0,
+          timeRemainingS,
         });
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
 
-      // Imbalance guard: never let one side exceed MAX_IMBALANCE_RATIO× the other side's shares.
-      // This prevents the runaway accumulation bug where cheap side is bought endlessly.
+      // Imbalance guard
       const thisSideShares = nextSide === "Up" ? filledUp : filledDn;
       const otherSideShares = nextSide === "Up" ? filledDn : filledUp;
       if (otherSideShares > 0 && thisSideShares >= otherSideShares * this.config.maxImbalanceRatio) {
@@ -379,7 +430,7 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Budget-reserve: max 50% on one side until other side has ≥1 fill
+      // Budget-reserve
       const thisSideCost = nextSide === "Up" ? costUp : costDn;
       if (otherSideShares === 0 && thisSideCost >= budget * this.config.budgetReservePct) {
         this.logger.debug("Budget-reserve: waiting for other side", {
@@ -391,12 +442,11 @@ export class SignalTakerExecutor {
         continue;
       }
 
-      // Projected combined check: only buy if it improves (or is first buy on a side)
+      // Projected combined check
       if (filledUp > 0 && filledDn > 0) {
         const projected = this.projectCombined(
           nextSide, bestAsk, chunkSize, filledUp, filledDn, costUp, costDn,
         );
-        // Only block if we're already at/below target and this would worsen it
         if (projected > combinedCents && combinedCents <= this.config.targetCombinedCents) {
           this.logger.debug("Skip: would worsen combined past target", {
             projected: `${projected.toFixed(1)}¢`,
@@ -458,20 +508,57 @@ export class SignalTakerExecutor {
           combinedCents = (avgUp + avgDn) * 100;
         }
 
-        const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
+        // Update unpaired tracking
         const isUnpaired = filledUp !== filledDn;
         if (isUnpaired && unpairedStartMs === null) unpairedStartMs = Date.now();
         if (!isUnpaired) unpairedStartMs = null;
-        this.logger.info("V10 fill", {
+
+        // Re-evaluate state after fill
+        const postFillState = sm.evaluate({
+          filledUp, filledDn, costUp, costDn,
+          unpairedStartMs, timeRemainingS,
+          mergeMinSize: this.config.mergeMinSize,
+          tick: fillTick,
+        });
+        const pairBand = combinedCents !== Infinity && filledUp > 0 && filledDn > 0
+          ? classifyPairQuality(combinedCents) : null;
+
+        // Record decision with full context
+        sm.recordDecision({
+          tick: fillTick++, state: postFillState, regime: observation.regime,
+          chosenSide: nextSide,
+          reason: `FILL ${sideReason} @${(fill.avgPrice*100).toFixed(1)}c x${fill.filledSize.toFixed(0)}`,
+          altReason,
+          pairBand,
+          filledUp, filledDn, combinedCents,
+          imbalanceRatio: Math.min(filledUp, filledDn) > 0 ? Math.max(filledUp, filledDn) / Math.min(filledUp, filledDn) : 1,
+          unpairedDurationMs: unpairedStartMs ? Date.now() - unpairedStartMs : 0,
+          timeRemainingS,
+        });
+
+        const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
+        this.logger.info("V11 fill", {
+          variant: this.variant.name ?? "baseline",
+          state: postFillState,
           side: nextSide,
+          sideReason,
           price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
           size: fill.filledSize.toFixed(0),
           combined: combinedCents === Infinity ? "—" : `${combinedCents.toFixed(1)}¢`,
+          pairBand: pairBand ?? "—",
           marginalPair: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
           balance: `Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
         });
 
-        // Early tail-loss kill-switch: stop if marginal rescue is exploding.
+        // STOP conditions driven by state machine
+        if (postFillState === "STOP_BUILD") {
+          this.logger.info("State machine: STOP_BUILD after fill — exiting", {
+            variant: this.variant.name ?? "baseline",
+          });
+          break;
+        }
+
+        // Tail guard: marginal pair cost explosion
         if (pairState.projectedMarginalPairCostCents > 108 && orderCount >= 3) {
           this.logger.warn("TAIL GUARD: stopping accumulation due to expensive marginal pair", {
             marginal: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
@@ -479,19 +566,8 @@ export class SignalTakerExecutor {
           });
           break;
         }
-        const unpairedTimeoutS = this.variant.unpairedTimeoutS ?? this.config.maxNakedDurationS;
-        if (unpairedStartMs !== null && Date.now() - unpairedStartMs > unpairedTimeoutS * 1000) {
-          audit.unpairedTimeoutTriggered = true;
-          this.logger.warn("TAIL GUARD: unpaired exposure duration exceeded", {
-            unpairedForS: ((Date.now() - unpairedStartMs) / 1000).toFixed(1),
-            limitS: unpairedTimeoutS,
-            up: filledUp.toFixed(0),
-            dn: filledDn.toFixed(0),
-          });
-          break;
-        }
 
-        // Circuit breaker: stop if combined > threshold after enough fills
+        // Circuit breaker
         if (
           combinedCents > this.config.circuitBreakerCents &&
           orderCount >= 5 &&
@@ -508,7 +584,7 @@ export class SignalTakerExecutor {
           break;
         }
 
-        // Check if target reached
+        // Target reached notification (keep accumulating)
         if (
           combinedCents <= this.config.targetCombinedCents &&
           filledUp > 0 && filledDn > 0
@@ -517,8 +593,6 @@ export class SignalTakerExecutor {
             combined: `${combinedCents.toFixed(1)}¢`,
             target: `${this.config.targetCombinedCents}¢`,
           });
-          // Keep going — try to accumulate more pairs at good prices
-          // But the dynamic interval will slow us down near target
         }
       }
 
@@ -606,17 +680,51 @@ export class SignalTakerExecutor {
     result.takerFees = totalTakerFees;
     result.inventory = inventory;
 
-    this.logger.info("=== V10 Window Summary ===", {
+    // State machine final summary
+    const smSummary = sm.summary(filledUp, filledDn, costUp, costDn);
+    this.logger.info("=== V11 Window Summary ===", {
+      variant: this.variant.name ?? "baseline",
       fills: orderCount,
       up: `${filledUp.toFixed(0)}@${(avgUp * 100).toFixed(1)}¢`,
       dn: `${filledDn.toFixed(0)}@${(avgDn * 100).toFixed(1)}¢`,
       combined: `${finalCombined.toFixed(1)}¢`,
+      pairBand: smSummary.pairBand ?? "—",
+      finalState: smSummary.state,
+      stateTransitions: smSummary.transitionCount,
       paired: `${pairedShares.toFixed(0)}sh @${pairedCombinedAvgCents.toFixed(1)}¢`,
       unpaired: `Up=${unpairedUp.toFixed(0)} Dn=${unpairedDn.toFixed(0)}`,
       merged: totalMerged.toFixed(0),
       profit: `$${totalMergeProfit.toFixed(2)}`,
       pairedProfit: `$${pairedProfit.toFixed(2)}`,
     });
+
+    // Log all state transitions for this window
+    if (sm.transitions.length > 0) {
+      this.logger.info("State transitions", {
+        variant: this.variant.name ?? "baseline",
+        transitions: sm.transitions.map(t => `${t.from}->${t.to} (${t.reason})`),
+      });
+    }
+
+    // Log decision summary (how many fills, skips, and reasons)
+    const decisions = sm.decisions;
+    const fillDecisions = decisions.filter(d => d.chosenSide !== null && d.reason.startsWith("FILL"));
+    const skipDecisions = decisions.filter(d => d.chosenSide === null || !d.reason.startsWith("FILL"));
+    if (decisions.length > 0) {
+      const sideReasons = fillDecisions.reduce((acc, d) => {
+        const key = d.reason.split(" ")[1] ?? "unknown"; // extract sideReason
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      }, {} as Record<string, number>);
+      this.logger.info("Fill decision summary", {
+        variant: this.variant.name ?? "baseline",
+        totalDecisions: decisions.length,
+        fills: fillDecisions.length,
+        skips: skipDecisions.length,
+        sideReasons,
+      });
+    }
+
     audit.finalAction = orderCount > 0 ? "trade" : (result.skipped ? "skip" : "no_fill");
     audit.finalReason = result.skipReason ?? (orderCount > 0 ? "filled" : "no_fill");
     this.logger.info("Variant decision audit", audit);
