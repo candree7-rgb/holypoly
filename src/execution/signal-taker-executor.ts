@@ -40,8 +40,11 @@ export class SignalTakerExecutor {
 
   private static readonly OBSERVATION_SAMPLE_MS = 500;
   private static readonly MIN_HEDGEABLE_CHUNKS = 2;
-  private static readonly FIRST_LEG_MULTIPLIER = 0.40;
+  private static readonly FIRST_LEG_MULTIPLIER = 0.25;
+  private static readonly FIRST_LEG_MIN_SHARES = 31;
+  private static readonly FIRST_LEG_MAX_SHARES = 46;
   private static readonly REBALANCE_CHUNK_PCT = 0.35;
+  private static readonly SOFT_HEDGE_CAP = 0.90;
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -111,7 +114,10 @@ export class SignalTakerExecutor {
     }
 
     const chunkSize = this.getSessionChunkSize(balance);
-    const firstLegChunk = Math.max(10, Math.floor(chunkSize * SignalTakerExecutor.FIRST_LEG_MULTIPLIER));
+    const firstLegChunk = Math.min(
+      SignalTakerExecutor.FIRST_LEG_MAX_SHARES,
+      Math.max(SignalTakerExecutor.FIRST_LEG_MIN_SHARES, Math.floor(chunkSize * SignalTakerExecutor.FIRST_LEG_MULTIPLIER)),
+    );
     const budget = balance * this.config.equityPerWindow;
     let availableBudget = budget;
 
@@ -126,6 +132,7 @@ export class SignalTakerExecutor {
     let lastBuySide: TradeSide | null = null;
     let lastBuyTime = 0;
     let combinedCents = Infinity;
+    let unpairedStartMs: number | null = null;
 
     // Price momentum state: rolling window of recent BTC prices
     const priceHistory: number[] = [btcOpen];
@@ -188,13 +195,14 @@ export class SignalTakerExecutor {
       const isFirstBuy = orderCount === 0;
 
       // Determine which side to buy (strict alternation + balance + momentum)
-      const nextSide = this.chooseNextSide(
+      let nextSide = this.chooseNextSide(
         observation.regime, lastBuySide, filledUp, filledDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
       );
       if (!nextSide) {
         await sleep(this.config.signalCheckIntervalMs);
         continue;
       }
+      nextSide = this.resolveSideByPairQuality(nextSide, filledUp, filledDn, costUp, costDn, chunkSize, window);
 
       // Dynamic interval: momentum-aware timing (no hard gate!)
       // Good momentum → short interval (aggressive). No signal → normal interval. Near target → longer.
@@ -327,6 +335,9 @@ export class SignalTakerExecutor {
         }
 
         const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
+        const isUnpaired = filledUp !== filledDn;
+        if (isUnpaired && unpairedStartMs === null) unpairedStartMs = Date.now();
+        if (!isUnpaired) unpairedStartMs = null;
         this.logger.info("V10 fill", {
           side: nextSide,
           price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
@@ -341,6 +352,15 @@ export class SignalTakerExecutor {
           this.logger.warn("TAIL GUARD: stopping accumulation due to expensive marginal pair", {
             marginal: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
             fills: orderCount,
+          });
+          break;
+        }
+        if (unpairedStartMs !== null && Date.now() - unpairedStartMs > this.config.maxNakedDurationS * 1000) {
+          this.logger.warn("TAIL GUARD: unpaired exposure duration exceeded", {
+            unpairedForS: ((Date.now() - unpairedStartMs) / 1000).toFixed(1),
+            limitS: this.config.maxNakedDurationS,
+            up: filledUp.toFixed(0),
+            dn: filledDn.toFixed(0),
           });
           break;
         }
@@ -722,6 +742,30 @@ export class SignalTakerExecutor {
     return { projectedMarginalPairCostCents: marginal };
   }
 
+  private resolveSideByPairQuality(
+    preferredSide: TradeSide,
+    filledUp: number,
+    filledDn: number,
+    costUp: number,
+    costDn: number,
+    chunkSize: number,
+    window: WindowInfo,
+  ): TradeSide {
+    const candidateSides: TradeSide[] = preferredSide === "Up" ? ["Up", "Down"] : ["Down", "Up"];
+    let best: { side: TradeSide; score: number } = { side: preferredSide, score: Number.POSITIVE_INFINITY };
+    for (const side of candidateSides) {
+      const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
+      const ask = this.getAskPrice(this.getBook(tokenId));
+      if (ask === null || ask >= this.config.cheapThreshold) continue;
+      const chunk = Math.max(10, Math.floor(chunkSize * this.config.probeChunkPct));
+      const pair = this.projectPairState(side, ask, chunk, filledUp, filledDn, costUp, costDn);
+      const imbalancePenalty = side === "Up" ? Math.max(0, (filledUp + chunk) - filledDn) : Math.max(0, (filledDn + chunk) - filledUp);
+      const score = pair.projectedMarginalPairCostCents + imbalancePenalty * 0.08;
+      if (score < best.score) best = { side, score };
+    }
+    return best.side;
+  }
+
   private async chunkedRebalance(
     window: WindowInfo,
     state: {
@@ -739,7 +783,8 @@ export class SignalTakerExecutor {
       const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
       const chunk = Math.max(10, Math.min(imbalance, Math.floor(chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT)));
       const longSideAvg = shortSide === "Down" ? (filledUp > 0 ? costUp / filledUp : 0) : (filledDn > 0 ? costDn / filledDn : 0);
-      const softCap = Math.min(1 - longSideAvg + SignalTakerExecutor.REBALANCE_OVERPAY, this.config.rebalanceMaxPrice - 0.05);
+      const dynamicSoftCap = 1 - longSideAvg + SignalTakerExecutor.REBALANCE_OVERPAY;
+      const softCap = Math.min(dynamicSoftCap, SignalTakerExecutor.SOFT_HEDGE_CAP);
       const hardCap = this.config.rebalanceMaxPrice;
 
       const book = await this.getRebalanceBook(shortToken);
@@ -757,6 +802,13 @@ export class SignalTakerExecutor {
       availableBudget -= fill.totalCost;
       orderFills.push({ orderNum: orderCount++, side: shortSide, filledSize: fill.filledSize, avgPrice: fill.avgPrice, totalCost: fill.totalCost, fee, timestamp: Date.now() });
       this.telegram.send(`🔒 Hedged: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`);
+      this.logger.info("Chunked hedge fill", {
+        shortSide,
+        chunk: chunk.toFixed(0),
+        ask: `${(ask * 100).toFixed(1)}¢`,
+        softCap: `${(softCap * 100).toFixed(1)}¢`,
+        hardCap: `${(hardCap * 100).toFixed(1)}¢`,
+      });
       if (ask > softCap) await sleep(1200);
     }
 
