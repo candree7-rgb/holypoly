@@ -17,24 +17,31 @@ import type {
 import { DryRunEngine } from "./dry-run-engine.js";
 import { sleep, polymarketCryptoFee } from "../utils.js";
 
+type Regime = "OSCILLATION" | "TREND" | "SKIP";
+
+interface ObservationResult {
+  regime: Regime;
+  avgUpSpreadCents: number;
+  avgDnSpreadCents: number;
+  upDepthWithinBand: number;
+  dnDepthWithinBand: number;
+  reversals: number;
+  distanceToOpenPct: number;
+  refillScore: number;
+}
+
 /**
- * SignalTakerExecutor V8: Price-Momentum Accumulation Strategy.
- *
- * KEY INSIGHT: Buy both sides alternately, timed by direct BTC price reversals.
- * Only buy when it IMPROVES the combined avg cost. Stop when target reached.
- *
- * - First buy: immediate, pick cheaper side from orderbook (no signal needed)
- * - Strict alternation: never buy the same side twice in a row
- * - Price momentum: track BTC rolling high/low, buy on reversals (dip→Up, bounce→Down)
- * - Projected combined check: only buy if it lowers or maintains combined cost
- * - Dynamic intervals: aggressive when far from target, cautious when close
- * - Rebalance: always buy short side at end, dynamic cap (breakeven + 3¢)
- * - Single TG message per window with P&L
+ * SignalTakerExecutor V10: Regime-aware pair construction with hard tail-loss control.
  */
 export class SignalTakerExecutor {
   private dryRunEngine: DryRunEngine | null = null;
   private sessionChunkSize: number | null = null;
   private sessionChunkDate: string | null = null;
+
+  private static readonly OBSERVATION_SAMPLE_MS = 500;
+  private static readonly MIN_HEDGEABLE_CHUNKS = 2;
+  private static readonly FIRST_LEG_MULTIPLIER = 0.40;
+  private static readonly REBALANCE_CHUNK_PCT = 0.35;
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -104,6 +111,7 @@ export class SignalTakerExecutor {
     }
 
     const chunkSize = this.getSessionChunkSize(balance);
+    const firstLegChunk = Math.max(10, Math.floor(chunkSize * SignalTakerExecutor.FIRST_LEG_MULTIPLIER));
     const budget = balance * this.config.equityPerWindow;
     let availableBudget = budget;
 
@@ -124,12 +132,29 @@ export class SignalTakerExecutor {
     let rollingHigh = btcOpen;
     let rollingLow = btcOpen;
 
-    this.logger.info("=== V8 Momentum Window Start ===", {
+    this.logger.info("=== V10 Regime Window Start ===", {
       btc: `$${btcOpen.toFixed(0)}`,
       budget: `$${budget.toFixed(0)}`,
       chunk: chunkSize,
+      firstLegChunk,
       target: `${this.config.targetCombinedCents}¢`,
     });
+
+    // Phase A/B gate: observe + classify + hedge-feasibility before first fill.
+    const observation = await this.observeAndClassify(window, btcOpen, chunkSize);
+    if (observation.regime === "SKIP") {
+      result.skipped = true;
+      result.skipReason = `Regime skip (${(observation.distanceToOpenPct * 100).toFixed(3)}% from open)`;
+      this.telegram.send(`⏭️ Skip: regime=SKIP dist=${(observation.distanceToOpenPct * 100).toFixed(3)}%`);
+      return result;
+    }
+    const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
+    if (!feasible.ok) {
+      result.skipped = true;
+      result.skipReason = feasible.reason;
+      this.telegram.send(`⏭️ Skip: ${feasible.reason}`);
+      return result;
+    }
 
     // ═══════════════════════════════════════════════════
     // PHASE 1: MOMENTUM-BASED ACCUMULATION
@@ -164,7 +189,7 @@ export class SignalTakerExecutor {
 
       // Determine which side to buy (strict alternation + balance + momentum)
       const nextSide = this.chooseNextSide(
-        lastBuySide, filledUp, filledDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
+        observation.regime, lastBuySide, filledUp, filledDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
       );
       if (!nextSide) {
         await sleep(this.config.signalCheckIntervalMs);
@@ -253,9 +278,20 @@ export class SignalTakerExecutor {
         }
       }
 
+      const orderSize = orderCount === 0 ? firstLegChunk : this.getAdaptiveChunk(windowStartTime, chunkSize);
+      const projectedPair = this.projectPairState(nextSide, bestAsk, orderSize, filledUp, filledDn, costUp, costDn);
+      if (projectedPair.projectedMarginalPairCostCents > 110) {
+        this.logger.warn("Skip expensive rescue leg", {
+          side: nextSide,
+          projectedMarginalPairCost: `${projectedPair.projectedMarginalPairCostCents.toFixed(1)}¢`,
+        });
+        await sleep(this.config.signalCheckIntervalMs);
+        continue;
+      }
+
       // ── BUY! ──
       const buyPrice = bestAsk + this.config.slippageBuffer;
-      const fill = await this.buyOrder(tokenId, chunkSize, buyPrice, nextSide);
+      const fill = await this.buyOrder(tokenId, orderSize, buyPrice, nextSide);
 
       if (fill.filled) {
         const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
@@ -290,13 +326,24 @@ export class SignalTakerExecutor {
           combinedCents = (avgUp + avgDn) * 100;
         }
 
-        this.logger.info("V8 fill", {
+        const pairState = this.projectPairState(nextSide, fill.avgPrice, fill.filledSize, filledUp, filledDn, costUp, costDn);
+        this.logger.info("V10 fill", {
           side: nextSide,
           price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
           size: fill.filledSize.toFixed(0),
           combined: combinedCents === Infinity ? "—" : `${combinedCents.toFixed(1)}¢`,
+          marginalPair: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
           balance: `Up=${filledUp.toFixed(0)} Dn=${filledDn.toFixed(0)}`,
         });
+
+        // Early tail-loss kill-switch: stop if marginal rescue is exploding.
+        if (pairState.projectedMarginalPairCostCents > 108 && orderCount >= 3) {
+          this.logger.warn("TAIL GUARD: stopping accumulation due to expensive marginal pair", {
+            marginal: `${pairState.projectedMarginalPairCostCents.toFixed(1)}¢`,
+            fills: orderCount,
+          });
+          break;
+        }
 
         // Circuit breaker: stop if combined > threshold after enough fills
         if (
@@ -332,160 +379,11 @@ export class SignalTakerExecutor {
       await sleep(this.config.signalCheckIntervalMs);
     }
 
-    // ═══════════════════════════════════════════════════
-    // PHASE 2: REBALANCE
-    // Always buy short side. Dynamic cap = breakeven + 3¢.
-    // ═══════════════════════════════════════════════════
-    const imbalance = Math.abs(filledUp - filledDn);
-    if (imbalance > 0 && availableBudget > 0) {
-      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
-      const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
-
-      // Dynamic cap: breakeven + 3¢ overpay, clamped to safety max
-      const longSideAvg = shortSide === "Down"
-        ? (filledUp > 0 ? costUp / filledUp : 0)
-        : (filledDn > 0 ? costDn / filledDn : 0);
-      const breakeven = 1.00 - longSideAvg;
-      const dynamicCap = Math.min(
-        breakeven + SignalTakerExecutor.REBALANCE_OVERPAY,
-        this.config.rebalanceMaxPrice,
-      );
-
-      this.logger.info("Phase 2: Rebalance", {
-        shortSide,
-        imbalance: imbalance.toFixed(0),
-        longAvg: `${(longSideAvg * 100).toFixed(1)}¢`,
-        breakeven: `${(breakeven * 100).toFixed(1)}¢`,
-        cap: `${(dynamicCap * 100).toFixed(1)}¢`,
-      });
-
-      const book = await this.getRebalanceBook(shortToken);
-      const bestAsk = this.getAskPrice(book);
-
-      if (bestAsk === null) {
-        this.logger.warn("Rebalance: no ask price available (book empty)");
-      } else if (bestAsk <= dynamicCap) {
-        const rebalancePrice = bestAsk + this.config.slippageBuffer;
-        const fill = await this.buyOrder(shortToken, imbalance, rebalancePrice, shortSide);
-
-        if (fill.filled) {
-          const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
-          totalTakerFees += fee;
-          if (shortSide === "Up") {
-            filledUp += fill.filledSize;
-            costUp += fill.totalCost;
-          } else {
-            filledDn += fill.filledSize;
-            costDn += fill.totalCost;
-          }
-          availableBudget -= fill.totalCost;
-          orderFills.push({
-            orderNum: orderCount,
-            side: shortSide,
-            filledSize: fill.filledSize,
-            avgPrice: fill.avgPrice,
-            totalCost: fill.totalCost,
-            fee,
-            timestamp: Date.now(),
-          });
-          orderCount++;
-
-          this.logger.info("Rebalance filled", {
-            side: shortSide,
-            size: fill.filledSize.toFixed(0),
-            price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
-          });
-        }
-      } else {
-        this.logger.warn("Rebalance: ask exceeds dynamic cap", {
-          ask: `${(bestAsk * 100).toFixed(1)}¢`,
-          cap: `${(dynamicCap * 100).toFixed(1)}¢`,
-        });
-      }
-    }
-
-    // ═══════════════════════════════════════════════════
-    // PHASE 2b: MUST-HEDGE REBALANCE — NO NAKED ALLOWED
-    // If still imbalanced after Phase 2a, MUST hedge at any price
-    // up to rebalanceMaxPrice (99¢). We NEVER leave naked positions.
-    // 3 attempts with 1.5s intervals, escalating price tolerance.
-    // ═══════════════════════════════════════════════════
-    const emergencyImbalance = Math.abs(filledUp - filledDn);
-    if (emergencyImbalance > 0 && availableBudget > 0) {
-      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
-      const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
-
-      this.logger.warn("Phase 2b: MUST-HEDGE rebalance (NO NAKED policy)", {
-        shortSide,
-        imbalance: emergencyImbalance.toFixed(0),
-        hardCap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
-      });
-
-      // 3 attempts — each time we use the hard safety cap (99¢)
-      let filled = false;
-      for (let attempt = 0; attempt < 3 && !filled; attempt++) {
-        if (attempt > 0) await sleep(1500);
-
-        const book = await this.getRebalanceBook(shortToken);
-        const ask = this.getAskPrice(book);
-
-        if (ask !== null && ask <= this.config.rebalanceMaxPrice) {
-          const buyPrice = ask + this.config.slippageBuffer;
-          const fill = await this.buyOrder(shortToken, emergencyImbalance, buyPrice, shortSide);
-
-          if (fill.filled) {
-            filled = true;
-            const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
-            totalTakerFees += fee;
-            if (shortSide === "Up") {
-              filledUp += fill.filledSize;
-              costUp += fill.totalCost;
-            } else {
-              filledDn += fill.filledSize;
-              costDn += fill.totalCost;
-            }
-            availableBudget -= fill.totalCost;
-            orderFills.push({
-              orderNum: orderCount,
-              side: shortSide,
-              filledSize: fill.filledSize,
-              avgPrice: fill.avgPrice,
-              totalCost: fill.totalCost,
-              fee,
-              timestamp: Date.now(),
-            });
-            orderCount++;
-
-            const projCombined = ((costUp / (filledUp || 1)) + (costDn / (filledDn || 1))) * 100;
-            this.logger.warn(`MUST-HEDGE filled (attempt ${attempt + 1})`, {
-              side: shortSide,
-              size: fill.filledSize.toFixed(0),
-              price: `${(fill.avgPrice * 100).toFixed(1)}¢`,
-              combined: `${projCombined.toFixed(1)}¢`,
-            });
-            this.telegram.send(
-              `🔒 Hedged: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`,
-            );
-          }
-        } else {
-          this.logger.warn(`MUST-HEDGE attempt ${attempt + 1}: ask above hard cap`, {
-            ask: ask !== null ? `${(ask * 100).toFixed(1)}¢` : "N/A",
-            cap: `${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
-          });
-        }
-      }
-
-      if (!filled) {
-        // This should be extremely rare — orderbook is completely empty or >99¢
-        this.logger.error("HEDGE FAILED — no liquidity below 99¢ after 3 attempts", {
-          nakedShares: emergencyImbalance.toFixed(0),
-          nakedSide: shortSide === "Up" ? "Down" : "Up",
-        });
-        this.telegram.send(
-          `🔴 HEDGE FAILED: ${emergencyImbalance.toFixed(0)}sh ${shortSide === "Up" ? "Down" : "Up"} — NO liquidity below ${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`,
-        );
-      }
-    }
+    ({ filledUp, filledDn, costUp, costDn, availableBudget, totalTakerFees, orderCount } =
+      await this.chunkedRebalance(
+        window,
+        { filledUp, filledDn, costUp, costDn, availableBudget, totalTakerFees, orderCount, orderFills, chunkSize },
+      ));
 
     // ═══════════════════════════════════════════════════
     // PHASE 3: MERGE
@@ -599,6 +497,7 @@ export class SignalTakerExecutor {
    * Priority: 1) side behind, 2) alternate from last, 3) cheaper ask (first buy), 4) momentum.
    */
   private chooseNextSide(
+    regime: Regime,
     lastBuySide: TradeSide | null,
     filledUp: number,
     filledDn: number,
@@ -614,12 +513,15 @@ export class SignalTakerExecutor {
     else if (lastBuySide === "Up") preferred = "Down";
     else if (lastBuySide === "Down") preferred = "Up";
 
-    // First buy ever: pick the cheaper side from the orderbook (no signal needed!)
+    // First buy order is regime-aware: oscillation=cheaper-first, trend=expensive-first.
     if (isFirstBuy) {
       const upBook = this.getBook(window.upTokenId);
       const dnBook = this.getBook(window.downTokenId);
       const upAsk = this.getAskPrice(upBook) ?? 1.0;
       const dnAsk = this.getAskPrice(dnBook) ?? 1.0;
+      if (regime === "TREND") {
+        return dnAsk > upAsk ? "Down" : "Up";
+      }
       return dnAsk < upAsk ? "Down" : "Up";
     }
 
@@ -701,6 +603,180 @@ export class SignalTakerExecutor {
     }
 
     return (newAvgUp + newAvgDn) * 100;
+  }
+
+  private async observeAndClassify(window: WindowInfo, btcOpen: number, chunkSize: number): Promise<ObservationResult> {
+    const until = Date.now() + this.config.observationPeriodS * 1000;
+    const prices: number[] = [btcOpen];
+    let reversals = 0;
+    let lastDir = 0;
+    let upSpreadSum = 0;
+    let dnSpreadSum = 0;
+    let samples = 0;
+    let upDepthSum = 0;
+    let dnDepthSum = 0;
+    let refillHits = 0;
+    let lastUpDepth = 0;
+    let lastDnDepth = 0;
+
+    while (Date.now() < until) {
+      const btcNow = this.binance.price;
+      if (btcNow) {
+        const prev = prices[prices.length - 1] ?? btcNow;
+        const delta = (btcNow - prev) / prev;
+        const dir = delta > 0 ? 1 : delta < 0 ? -1 : 0;
+        if (dir !== 0 && lastDir !== 0 && dir !== lastDir && Math.abs(delta) >= SignalTakerExecutor.REVERSAL_THRESHOLD / 3) {
+          reversals++;
+        }
+        if (dir !== 0) lastDir = dir;
+        prices.push(btcNow);
+      }
+
+      const upBook = this.getBook(window.upTokenId);
+      const dnBook = this.getBook(window.downTokenId);
+      const upSpread = this.getSpreadCents(upBook);
+      const dnSpread = this.getSpreadCents(dnBook);
+      if (upSpread !== null) upSpreadSum += upSpread;
+      if (dnSpread !== null) dnSpreadSum += dnSpread;
+
+      const upDepth = this.depthWithinBand(upBook, this.getAskPrice(upBook), 0.02);
+      const dnDepth = this.depthWithinBand(dnBook, this.getAskPrice(dnBook), 0.02);
+      upDepthSum += upDepth;
+      dnDepthSum += dnDepth;
+      if (upDepth > lastUpDepth * 0.95 || dnDepth > lastDnDepth * 0.95) refillHits++;
+      lastUpDepth = upDepth;
+      lastDnDepth = dnDepth;
+      samples++;
+      await sleep(SignalTakerExecutor.OBSERVATION_SAMPLE_MS);
+    }
+
+    const btcNow = this.binance.price ?? btcOpen;
+    const distanceToOpenPct = Math.abs(btcNow - btcOpen) / btcOpen;
+    const avgUpSpreadCents = samples > 0 ? upSpreadSum / samples : 99;
+    const avgDnSpreadCents = samples > 0 ? dnSpreadSum / samples : 99;
+    const upDepthWithinBand = samples > 0 ? upDepthSum / samples : 0;
+    const dnDepthWithinBand = samples > 0 ? dnDepthSum / samples : 0;
+    const refillScore = samples > 0 ? refillHits / samples : 0;
+
+    let regime: Regime;
+    if (distanceToOpenPct >= this.config.trendSkipThreshold) regime = "SKIP";
+    else if (distanceToOpenPct <= this.config.oscillationThreshold && reversals >= 2) regime = "OSCILLATION";
+    else regime = "TREND";
+
+    this.logger.info("Observation complete", {
+      regime,
+      distance: `${(distanceToOpenPct * 100).toFixed(3)}%`,
+      reversals,
+      spread: `Up=${avgUpSpreadCents.toFixed(2)}¢ Dn=${avgDnSpreadCents.toFixed(2)}¢`,
+      depth: `Up=${upDepthWithinBand.toFixed(0)} Dn=${dnDepthWithinBand.toFixed(0)}`,
+      probeChunk: Math.max(10, Math.floor(chunkSize * this.config.probeChunkPct)),
+    });
+
+    return { regime, avgUpSpreadCents, avgDnSpreadCents, upDepthWithinBand, dnDepthWithinBand, reversals, distanceToOpenPct, refillScore };
+  }
+
+  private assessHedgeFeasibility(window: WindowInfo, chunkSize: number, observation: ObservationResult): { ok: boolean; reason?: string } {
+    const secondsLeft = Math.max(0, (window.endTime - Date.now()) / 1000);
+    if (secondsLeft < 120) return { ok: false, reason: "Too little time left for safe hedging" };
+    if (observation.avgUpSpreadCents > this.config.maxSpreadCents || observation.avgDnSpreadCents > this.config.maxSpreadCents) {
+      return { ok: false, reason: "Spread quality too poor for chunked hedge" };
+    }
+    const minDepthNeed = Math.max(20, chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT);
+    if (observation.upDepthWithinBand < minDepthNeed || observation.dnDepthWithinBand < minDepthNeed) {
+      return { ok: false, reason: "Insufficient depth in intended hedge band" };
+    }
+    if (observation.refillScore < 0.35) {
+      return { ok: false, reason: "Book refill resilience too weak" };
+    }
+    const hedgeableChunksUp = observation.upDepthWithinBand / minDepthNeed;
+    const hedgeableChunksDn = observation.dnDepthWithinBand / minDepthNeed;
+    if (Math.min(hedgeableChunksUp, hedgeableChunksDn) < SignalTakerExecutor.MIN_HEDGEABLE_CHUNKS) {
+      return { ok: false, reason: "Opposite side not hedgeable in chunks" };
+    }
+    return { ok: true };
+  }
+
+  private getAdaptiveChunk(windowStartTime: number, baseChunk: number): number {
+    const elapsedS = (Date.now() - windowStartTime) / 1000;
+    if (elapsedS <= this.config.probePhaseEndS) {
+      return Math.max(10, Math.floor(baseChunk * this.config.probeChunkPct));
+    }
+    return baseChunk;
+  }
+
+  private projectPairState(
+    side: TradeSide,
+    askPrice: number,
+    size: number,
+    filledUp: number,
+    filledDn: number,
+    costUp: number,
+    costDn: number,
+  ): { projectedMarginalPairCostCents: number } {
+    const beforePaired = Math.min(filledUp, filledDn);
+    const projectedUp = side === "Up" ? filledUp + size : filledUp;
+    const projectedDn = side === "Down" ? filledDn + size : filledDn;
+    const projectedPaired = Math.min(projectedUp, projectedDn);
+    const newPairs = Math.max(0, projectedPaired - beforePaired);
+    const marginal = newPairs > 0 ? askPrice * 100 : (askPrice + 0.60) * 100;
+    return { projectedMarginalPairCostCents: marginal };
+  }
+
+  private async chunkedRebalance(
+    window: WindowInfo,
+    state: {
+      filledUp: number; filledDn: number; costUp: number; costDn: number; availableBudget: number;
+      totalTakerFees: number; orderCount: number; orderFills: OrderFill[]; chunkSize: number;
+    },
+  ): Promise<{
+    filledUp: number; filledDn: number; costUp: number; costDn: number; availableBudget: number; totalTakerFees: number; orderCount: number;
+  }> {
+    let { filledUp, filledDn, costUp, costDn, availableBudget, totalTakerFees, orderCount, orderFills, chunkSize } = state;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const imbalance = Math.abs(filledUp - filledDn);
+      if (imbalance <= 0 || availableBudget <= 0) break;
+      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
+      const shortToken = shortSide === "Up" ? window.upTokenId : window.downTokenId;
+      const chunk = Math.max(10, Math.min(imbalance, Math.floor(chunkSize * SignalTakerExecutor.REBALANCE_CHUNK_PCT)));
+      const longSideAvg = shortSide === "Down" ? (filledUp > 0 ? costUp / filledUp : 0) : (filledDn > 0 ? costDn / filledDn : 0);
+      const softCap = Math.min(1 - longSideAvg + SignalTakerExecutor.REBALANCE_OVERPAY, this.config.rebalanceMaxPrice - 0.05);
+      const hardCap = this.config.rebalanceMaxPrice;
+
+      const book = await this.getRebalanceBook(shortToken);
+      const ask = this.getAskPrice(book);
+      if (ask === null) continue;
+      const cap = ask <= softCap ? softCap : hardCap;
+      if (ask > cap) continue;
+
+      const fill = await this.buyOrder(shortToken, chunk, ask + this.config.slippageBuffer, shortSide);
+      if (!fill.filled) continue;
+      const fee = polymarketCryptoFee(fill.filledSize, fill.avgPrice);
+      totalTakerFees += fee;
+      if (shortSide === "Up") { filledUp += fill.filledSize; costUp += fill.totalCost; }
+      else { filledDn += fill.filledSize; costDn += fill.totalCost; }
+      availableBudget -= fill.totalCost;
+      orderFills.push({ orderNum: orderCount++, side: shortSide, filledSize: fill.filledSize, avgPrice: fill.avgPrice, totalCost: fill.totalCost, fee, timestamp: Date.now() });
+      this.telegram.send(`🔒 Hedged: ${fill.filledSize.toFixed(0)}sh ${shortSide} @${(fill.avgPrice * 100).toFixed(1)}¢`);
+      if (ask > softCap) await sleep(1200);
+    }
+
+    const rest = Math.abs(filledUp - filledDn);
+    if (rest > 0) {
+      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
+      this.telegram.send(`🔴 HEDGE FAILED: ${rest.toFixed(0)}sh ${shortSide} — NO liquidity below ${(this.config.rebalanceMaxPrice * 100).toFixed(0)}¢`);
+    }
+    return { filledUp, filledDn, costUp, costDn, availableBudget, totalTakerFees, orderCount };
+  }
+
+  private depthWithinBand(book: BookSnapshot | null, bestAsk: number | null, band: number): number {
+    if (!book || bestAsk === null) return 0;
+    const maxAsk = bestAsk + band;
+    return (book.asks ?? []).filter((a) => a.price <= maxAsk).reduce((s, a) => s + a.size, 0);
+  }
+
+  private getSpreadCents(book: BookSnapshot | null): number | null {
+    if (!book || book.bestAsk === null || book.bestBid === null) return null;
+    return Math.max(0, (book.bestAsk - book.bestBid) * 100);
   }
 
   // ─── PRIVATE METHODS (unchanged) ───
