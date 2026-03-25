@@ -49,9 +49,11 @@ export class SignalTakerExecutor {
   private static readonly BINANCE_BOOTSTRAP_WAIT_MS = 6000;
   private static readonly MAX_RESCUE_COMBINED_CENTS = 102;
   private static readonly MIN_TIME_FOR_NEW_FIRST_LEG_S = 120;
+  private static readonly MIN_TIME_FOR_NEW_FIRST_LEG_OSC_S = 80;
   private static readonly POST_TARGET_CHUNK_PCT = 0.25;
   private static readonly ONE_SIDED_EXTREME_LOW = 0.20;
   private static readonly ONE_SIDED_EXTREME_HIGH = 0.80;
+  private static readonly BALANCE_PRICE_BUFFER = 0.03; // +3¢ above target-implied hedge price
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -207,14 +209,17 @@ export class SignalTakerExecutor {
       const bounceFromLow = (btcNow - rollingLow) / rollingLow;   // +ve when rising
       const isFirstBuy = orderCount === 0;
       const timeRemainingS = Math.max(0, (window.endTime - Date.now()) / 1000);
-      if (isFirstBuy && timeRemainingS < SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_S) {
+      const minTimeForFirstLeg = observation.regime === "OSCILLATION"
+        ? SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_OSC_S
+        : SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_S;
+      if (isFirstBuy && timeRemainingS < minTimeForFirstLeg) {
         this.logger.info("Skip late first-leg opening", { timeRemainingS: timeRemainingS.toFixed(1) });
         break;
       }
 
       // Determine which side to buy (strict alternation + balance + momentum)
       let nextSide = this.chooseNextSide(
-        observation.regime, lastBuySide, filledUp, filledDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
+        observation.regime, lastBuySide, filledUp, filledDn, costUp, costDn, dipFromHigh, bounceFromLow, window, isFirstBuy,
       );
       if (!nextSide) {
         await sleep(this.config.signalCheckIntervalMs);
@@ -231,6 +236,11 @@ export class SignalTakerExecutor {
         chunkSize,
         window,
       );
+      const shortSide: TradeSide = filledUp > filledDn ? "Down" : "Up";
+      if (!isFirstBuy && filledUp !== filledDn && nextSide !== shortSide) {
+        // Balancing-only mode: once unpaired inventory exists, prioritize hedge completion.
+        nextSide = shortSide;
+      }
 
       // Dynamic interval: momentum-aware timing (no hard gate!)
       // Good momentum → short interval (aggressive). No signal → normal interval. Near target → longer.
@@ -261,7 +271,15 @@ export class SignalTakerExecutor {
       // Safety cap: prevent buying a side so expensive that combined > $1 (guaranteed loss).
       // The projectedCombined check (below) handles the softer target check.
       // cheapThreshold is the absolute max we'll pay for any single side.
-      const sidePriceCap = this.getPriceCap(observation.regime, isFirstBuy);
+      const sidePriceCap = this.getPriceCap(
+        observation.regime,
+        isFirstBuy,
+        nextSide,
+        filledUp,
+        filledDn,
+        costUp,
+        costDn,
+      );
       if (bestAsk >= sidePriceCap) {
         this.logger.debug("Ask above safety cap", {
           side: nextSide,
@@ -555,6 +573,8 @@ export class SignalTakerExecutor {
     lastBuySide: TradeSide | null,
     filledUp: number,
     filledDn: number,
+    costUp: number,
+    costDn: number,
     dipFromHigh: number,
     bounceFromLow: number,
     window: WindowInfo,
@@ -584,7 +604,7 @@ export class SignalTakerExecutor {
       const prefToken = preferred === "Up" ? window.upTokenId : window.downTokenId;
       const prefBook = this.getBook(prefToken);
       const prefAsk = this.getAskPrice(prefBook);
-      const cap = this.getPriceCap(regime, false);
+      const cap = this.getPriceCap(regime, false, preferred, filledUp, filledDn, costUp, costDn);
       if (prefAsk !== null && prefAsk < cap) {
         return preferred;
       }
@@ -732,7 +752,8 @@ export class SignalTakerExecutor {
 
   private assessHedgeFeasibility(window: WindowInfo, chunkSize: number, observation: ObservationResult): { ok: boolean; reason?: string } {
     const secondsLeft = Math.max(0, (window.endTime - Date.now()) / 1000);
-    if (secondsLeft < 120) return { ok: false, reason: "Too little time left for safe hedging" };
+    const requiredSeconds = Math.max(this.config.stopBuyingBeforeEndS + 20, 75);
+    if (secondsLeft < requiredSeconds) return { ok: false, reason: "Too little time left for safe hedging" };
     if (observation.avgUpSpreadCents > this.config.maxSpreadCents || observation.avgDnSpreadCents > this.config.maxSpreadCents) {
       return { ok: false, reason: "Spread quality too poor for chunked hedge" };
     }
@@ -740,7 +761,7 @@ export class SignalTakerExecutor {
     if (observation.upDepthWithinBand < minDepthNeed || observation.dnDepthWithinBand < minDepthNeed) {
       return { ok: false, reason: "Insufficient depth in intended hedge band" };
     }
-    if (observation.refillScore < 0.35) {
+    if (observation.refillScore < 0.25) {
       return { ok: false, reason: "Book refill resilience too weak" };
     }
     const hedgeableChunksUp = observation.upDepthWithinBand / minDepthNeed;
@@ -793,7 +814,7 @@ export class SignalTakerExecutor {
     for (const side of candidateSides) {
       const tokenId = side === "Up" ? window.upTokenId : window.downTokenId;
       const ask = this.getAskPrice(this.getBook(tokenId));
-      const sideCap = this.getPriceCap(regime, isFirstBuy);
+      const sideCap = this.getPriceCap(regime, isFirstBuy, side, filledUp, filledDn, costUp, costDn);
       if (ask === null || ask >= sideCap) continue;
       const chunk = Math.max(10, Math.floor(chunkSize * this.config.probeChunkPct));
       const pair = this.projectPairState(side, ask, chunk, filledUp, filledDn, costUp, costDn);
@@ -804,9 +825,30 @@ export class SignalTakerExecutor {
     return best.side;
   }
 
-  private getPriceCap(regime: Regime, isFirstBuy: boolean): number {
+  private getPriceCap(
+    regime: Regime,
+    isFirstBuy: boolean,
+    side: TradeSide,
+    filledUp: number,
+    filledDn: number,
+    costUp: number,
+    costDn: number,
+  ): number {
     if (regime === "TREND" && isFirstBuy) {
       return Math.max(this.config.cheapThreshold, SignalTakerExecutor.TREND_FIRST_LEG_MAX_PRICE);
+    }
+    const isBalancingSide =
+      (side === "Up" && filledUp < filledDn) ||
+      (side === "Down" && filledDn < filledUp);
+    if (!isFirstBuy && isBalancingSide) {
+      const longAvg = side === "Up"
+        ? (filledDn > 0 ? costDn / filledDn : 0)
+        : (filledUp > 0 ? costUp / filledUp : 0);
+      // Balance-friendly cap: allow a little above target-implied hedge price
+      // to improve hedge completion without permitting expensive rescues.
+      const targetCap = (this.config.targetCombinedCents / 100) - longAvg + SignalTakerExecutor.BALANCE_PRICE_BUFFER;
+      const hedgeCap = Math.min(this.config.rebalanceMaxPrice, Math.max(this.config.cheapThreshold, targetCap));
+      return hedgeCap;
     }
     return this.config.cheapThreshold;
   }
