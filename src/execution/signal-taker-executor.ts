@@ -258,7 +258,9 @@ export class SignalTakerExecutor {
     // ═══════════════════════════════════════════════════
     // PHASE 1: STATE-MACHINE-DRIVEN ACCUMULATION
     // Two-sided inventory engine with fast alternation
+    // Mid-window merge recycles capital (Stargate-style)
     // ═══════════════════════════════════════════════════
+    const merges: MergeResult[] = [];
     const stopBuyingTime = window.endTime - this.config.stopBuyingBeforeEndS * 1000;
     const windowStartTime = Date.now();
 
@@ -457,9 +459,16 @@ export class SignalTakerExecutor {
         }
       }
 
+      // Band-aware chunk sizing
+      const currentBand = (filledUp > 0 && filledDn > 0 && combinedCents !== Infinity)
+        ? classifyPairQuality(combinedCents) : null;
       let orderSize = orderCount === 0 ? firstLegChunk : this.getAdaptiveChunk(windowStartTime, chunkSize);
       if (combinedCents <= this.config.targetCombinedCents) {
         orderSize = Math.max(10, Math.floor(chunkSize * SignalTakerExecutor.POST_TARGET_CHUNK_PCT));
+      }
+      // In DEFENSIVE band: smaller chunks to limit damage
+      if (currentBand === "DEFENSIVE") {
+        orderSize = Math.max(10, Math.floor(orderSize * 0.5));
       }
       const projectedPair = this.projectPairState(nextSide, bestAsk, orderSize, filledUp, filledDn, costUp, costDn);
       if (projectedPair.projectedMarginalPairCostCents > 110) {
@@ -594,6 +603,68 @@ export class SignalTakerExecutor {
             target: `${this.config.targetCombinedCents}¢`,
           });
         }
+
+        // ── MID-WINDOW MERGE ──
+        // When MERGE_READY with GOOD+ quality and enough time left, merge now
+        // and recycle capital for more accumulation (Stargate-style capital recycling)
+        const postAllowed = sm.getAllowedActions();
+        if (
+          postAllowed.canMerge &&
+          (postFillState === "MERGE_READY" || postFillState === "NEAR_BALANCED") &&
+          pairBand !== null &&
+          (pairBand === "IDEAL" || pairBand === "GOOD" || pairBand === "ACCEPTABLE") &&
+          timeRemainingS > 120 // only if >2min left to keep accumulating
+        ) {
+          const midMatched = Math.min(filledUp, filledDn);
+          if (midMatched >= this.config.mergeMinSize) {
+            this.logger.info("Mid-window merge triggered", {
+              variant: this.variant.name ?? "baseline",
+              state: postFillState,
+              band: pairBand,
+              matched: midMatched.toFixed(0),
+              combined: `${combinedCents.toFixed(1)}¢`,
+              timeLeftS: timeRemainingS.toFixed(0),
+            });
+            const midMerge = await this.doMerge(
+              window, midMatched, filledUp, filledDn, costUp, costDn,
+            );
+            if (midMerge) {
+              merges.push(midMerge);
+              // Recycle: consume matched shares from both sides.
+              // Short side goes to 0. Long side keeps remainder with proportional cost.
+              const prevUp = filledUp;
+              const prevDn = filledDn;
+              const prevCostUp = costUp;
+              const prevCostDn = costDn;
+              // Both sides lose midMatched shares
+              filledUp -= midMatched;
+              filledDn -= midMatched;
+              // Adjust cost proportionally to remaining shares
+              costUp = prevUp > 0 ? prevCostUp * (filledUp / prevUp) : 0;
+              costDn = prevDn > 0 ? prevCostDn * (filledDn / prevDn) : 0;
+              // Recycle recovered capital back into budget
+              availableBudget += midMerge.recovered;
+              combinedCents = Infinity; // reset — need new fills to recalc
+              unpairedStartMs = (filledUp !== filledDn) ? Date.now() : null;
+              // Re-evaluate state after merge
+              sm.evaluate({
+                filledUp, filledDn, costUp, costDn,
+                unpairedStartMs, timeRemainingS,
+                mergeMinSize: this.config.mergeMinSize,
+                tick: fillTick,
+              });
+              this.logger.info("Mid-window merge complete — capital recycled", {
+                variant: this.variant.name ?? "baseline",
+                recovered: `$${midMerge.recovered.toFixed(2)}`,
+                profit: `$${midMerge.profit.toFixed(2)}`,
+                remainingUp: filledUp.toFixed(0),
+                remainingDn: filledDn.toFixed(0),
+                newBudget: `$${availableBudget.toFixed(2)}`,
+                newState: sm.state,
+              });
+            }
+          }
+        }
       }
 
       await sleep(this.config.signalCheckIntervalMs);
@@ -609,7 +680,6 @@ export class SignalTakerExecutor {
     // PHASE 3: MERGE
     // ═══════════════════════════════════════════════════
     const matched = Math.min(filledUp, filledDn);
-    const merges: MergeResult[] = [];
 
     if (matched >= this.config.mergeMinSize) {
       const avgUp = filledUp > 0 ? costUp / filledUp : 0;
