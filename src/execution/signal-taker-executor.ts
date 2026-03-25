@@ -48,6 +48,10 @@ export class SignalTakerExecutor {
   private static readonly TREND_FIRST_LEG_MAX_PRICE = 0.70;
   private static readonly BINANCE_BOOTSTRAP_WAIT_MS = 6000;
   private static readonly MAX_RESCUE_COMBINED_CENTS = 102;
+  private static readonly MIN_TIME_FOR_NEW_FIRST_LEG_S = 120;
+  private static readonly POST_TARGET_CHUNK_PCT = 0.25;
+  private static readonly ONE_SIDED_EXTREME_LOW = 0.20;
+  private static readonly ONE_SIDED_EXTREME_HIGH = 0.80;
 
   // Price momentum: rolling window of BTC prices for reversal detection
   private static readonly PRICE_HISTORY_SIZE = 8;            // ~4s of history at 500ms intervals
@@ -158,6 +162,12 @@ export class SignalTakerExecutor {
       this.telegram.send(`⏭️ Skip: regime=SKIP dist=${(observation.distanceToOpenPct * 100).toFixed(3)}%`);
       return result;
     }
+    if (this.isOneSidedToxic(window)) {
+      result.skipped = true;
+      result.skipReason = "One-sided book too extreme for safe sequential hedge";
+      this.telegram.send("⏭️ Skip: one-sided extreme book (hedge toxicity)");
+      return result;
+    }
     const feasible = this.assessHedgeFeasibility(window, chunkSize, observation);
     if (!feasible.ok) {
       result.skipped = true;
@@ -196,6 +206,11 @@ export class SignalTakerExecutor {
       const dipFromHigh = (rollingHigh - btcNow) / rollingHigh;   // +ve when falling
       const bounceFromLow = (btcNow - rollingLow) / rollingLow;   // +ve when rising
       const isFirstBuy = orderCount === 0;
+      const timeRemainingS = Math.max(0, (window.endTime - Date.now()) / 1000);
+      if (isFirstBuy && timeRemainingS < SignalTakerExecutor.MIN_TIME_FOR_NEW_FIRST_LEG_S) {
+        this.logger.info("Skip late first-leg opening", { timeRemainingS: timeRemainingS.toFixed(1) });
+        break;
+      }
 
       // Determine which side to buy (strict alternation + balance + momentum)
       let nextSide = this.chooseNextSide(
@@ -302,7 +317,10 @@ export class SignalTakerExecutor {
         }
       }
 
-      const orderSize = orderCount === 0 ? firstLegChunk : this.getAdaptiveChunk(windowStartTime, chunkSize);
+      let orderSize = orderCount === 0 ? firstLegChunk : this.getAdaptiveChunk(windowStartTime, chunkSize);
+      if (combinedCents <= this.config.targetCombinedCents) {
+        orderSize = Math.max(10, Math.floor(chunkSize * SignalTakerExecutor.POST_TARGET_CHUNK_PCT));
+      }
       const projectedPair = this.projectPairState(nextSide, bestAsk, orderSize, filledUp, filledDn, costUp, costDn);
       if (projectedPair.projectedMarginalPairCostCents > 110) {
         this.logger.warn("Skip expensive rescue leg", {
@@ -791,6 +809,16 @@ export class SignalTakerExecutor {
       return Math.max(this.config.cheapThreshold, SignalTakerExecutor.TREND_FIRST_LEG_MAX_PRICE);
     }
     return this.config.cheapThreshold;
+  }
+
+  private isOneSidedToxic(window: WindowInfo): boolean {
+    const upAsk = this.getAskPrice(this.getBook(window.upTokenId));
+    const dnAsk = this.getAskPrice(this.getBook(window.downTokenId));
+    if (upAsk === null || dnAsk === null) return false;
+    return (
+      (upAsk <= SignalTakerExecutor.ONE_SIDED_EXTREME_LOW && dnAsk >= SignalTakerExecutor.ONE_SIDED_EXTREME_HIGH) ||
+      (dnAsk <= SignalTakerExecutor.ONE_SIDED_EXTREME_LOW && upAsk >= SignalTakerExecutor.ONE_SIDED_EXTREME_HIGH)
+    );
   }
 
   private async awaitBinancePrice(): Promise<number | null> {
