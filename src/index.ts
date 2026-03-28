@@ -51,14 +51,12 @@ const main = async () => {
 
   const logger = createLogger(config.debug);
 
-  // PostgreSQL
-  const db = new Database(config.databaseUrl, logger);
-  await db.init();
-
   // === REDEEM-ONLY MODE ===
   if (config.redeemOnly) {
     logger.info("=== HolyPoly REDEEM-ONLY Mode ===");
     logger.info("Trading, WebSockets, and Telegram are disabled. Only auto-redeem is active.");
+
+    const REDEEM_ONLY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
     const dataApi = new DataApiClient(config.dataApiHost, logger);
     const redeemService = RedeemService.init(
@@ -77,38 +75,33 @@ const main = async () => {
 
     const shutdown = async () => {
       logger.info("Shutting down...");
-      await db.close();
       process.exit(0);
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
 
-    // Run redeem loop forever
+    // Run redeem loop forever — no DB needed, just redeem everything redeemable every 5min
     while (true) {
       try {
         const positions = await dataApi.getPositions(config.profileAddress, true);
-        const now = nowSec();
-        const eligible: typeof positions = [];
 
-        for (const pos of positions) {
-          const last = await db.getRedeemAttempt(pos.conditionId);
-          if (now - last > REDEEM_COOLDOWN_SEC) eligible.push(pos);
-        }
-
-        if (eligible.length) {
-          logger.info("Redeeming positions", { count: eligible.length });
-          await redeemService.redeemPositions(eligible);
-          for (const pos of eligible) {
-            await db.markRedeemAttempt(pos.conditionId);
-          }
+        if (positions.length) {
+          logger.info("Redeeming positions", { count: positions.length });
+          await redeemService.redeemPositions(positions);
+        } else {
+          logger.info("No redeemable positions found");
         }
       } catch (err) {
         logger.error("Redeem loop error", { error: (err as Error).message });
       }
 
-      await sleep(REDEEM_POLL_INTERVAL_MS);
+      await sleep(REDEEM_ONLY_INTERVAL_MS);
     }
   }
+
+  // PostgreSQL
+  const db = new Database(config.databaseUrl, logger);
+  await db.init();
 
   // Telegram notifications
   const telegram = new TelegramNotifier(

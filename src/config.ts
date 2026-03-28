@@ -332,11 +332,11 @@ export const loadConfig = (): Config => {
   const losingStreakPause = parseNumber("LOSING_STREAK_PAUSE", 5);
   const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50);
 
-  // Database
-  const databaseUrl = requireEnv("DATABASE_URL");
-
   // Redeem-only mode
   const redeemOnly = parseBoolean("REDEEM_ONLY", false);
+
+  // Database (optional in redeem-only mode)
+  const databaseUrl = redeemOnly ? (getEnv("DATABASE_URL") ?? "") : requireEnv("DATABASE_URL");
 
   // Auto-redeem
   const autoRedeem = redeemOnly ? true : parseBoolean("AUTO_REDEEM", true);
