@@ -85,6 +85,9 @@ export interface Config {
   // Database
   databaseUrl: string;
 
+  // Redeem-only mode (disables all trading, WebSockets, Telegram)
+  redeemOnly: boolean;
+
   // Auto-redeem
   autoRedeem: boolean;
   relayerUrl: string;
@@ -332,8 +335,11 @@ export const loadConfig = (): Config => {
   // Database
   const databaseUrl = requireEnv("DATABASE_URL");
 
+  // Redeem-only mode
+  const redeemOnly = parseBoolean("REDEEM_ONLY", false);
+
   // Auto-redeem
-  const autoRedeem = parseBoolean("AUTO_REDEEM", true);
+  const autoRedeem = redeemOnly ? true : parseBoolean("AUTO_REDEEM", true);
   const relayerUrl = getEnv("RELAYER_URL") ?? "https://relayer-v2.polymarket.com";
   const relayerTxType = (getEnv("RELAYER_TX_TYPE") ?? "PROXY").toUpperCase() as "SAFE" | "PROXY";
 
@@ -480,6 +486,7 @@ export const loadConfig = (): Config => {
     losingStreakPause,
     minBalanceFloorUsd,
     databaseUrl,
+    redeemOnly,
     autoRedeem,
     relayerUrl,
     relayerTxType,

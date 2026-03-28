@@ -55,6 +55,61 @@ const main = async () => {
   const db = new Database(config.databaseUrl, logger);
   await db.init();
 
+  // === REDEEM-ONLY MODE ===
+  if (config.redeemOnly) {
+    logger.info("=== HolyPoly REDEEM-ONLY Mode ===");
+    logger.info("Trading, WebSockets, and Telegram are disabled. Only auto-redeem is active.");
+
+    const dataApi = new DataApiClient(config.dataApiHost, logger);
+    const redeemService = RedeemService.init(
+      {
+        relayerUrl: config.relayerUrl,
+        chainId: config.chainId,
+        privateKey: config.privateKey,
+        rpcUrl: config.rpcUrl!,
+        txType: config.relayerTxType,
+        builderCreds: config.builderCreds,
+        builderSigningUrl: config.builderSigningUrl,
+        builderSigningToken: config.builderSigningToken,
+      },
+      logger,
+    );
+
+    const shutdown = async () => {
+      logger.info("Shutting down...");
+      await db.close();
+      process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+
+    // Run redeem loop forever
+    while (true) {
+      try {
+        const positions = await dataApi.getPositions(config.profileAddress, true);
+        const now = nowSec();
+        const eligible: typeof positions = [];
+
+        for (const pos of positions) {
+          const last = await db.getRedeemAttempt(pos.conditionId);
+          if (now - last > REDEEM_COOLDOWN_SEC) eligible.push(pos);
+        }
+
+        if (eligible.length) {
+          logger.info("Redeeming positions", { count: eligible.length });
+          await redeemService.redeemPositions(eligible);
+          for (const pos of eligible) {
+            await db.markRedeemAttempt(pos.conditionId);
+          }
+        }
+      } catch (err) {
+        logger.error("Redeem loop error", { error: (err as Error).message });
+      }
+
+      await sleep(REDEEM_POLL_INTERVAL_MS);
+    }
+  }
+
   // Telegram notifications
   const telegram = new TelegramNotifier(
     config.telegramBotToken,
