@@ -80,22 +80,57 @@ const main = async () => {
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
 
-    // Run redeem loop forever — no DB needed, just redeem everything redeemable every 5min
+    // Run redeem at xx:04, xx:09, xx:14, xx:19, ... (1 min before each 5-min mark)
+    // Track redeemed conditions in-memory to avoid re-submitting
+    const redeemedConditions = new Set<string>();
+    let rateLimitedUntil = 0;
+
+    const msUntilNextRun = () => {
+      const now = Date.now();
+      if (rateLimitedUntil > now) return rateLimitedUntil - now;
+      // Schedule at xx:04, xx:09, xx:14, xx:19, ... (1 min before each 5-min mark)
+      const d = new Date(now);
+      const min = d.getMinutes();
+      const mod = min % 5;
+      const offset = mod <= 4 ? (4 - mod) : (4 - mod + 5); // minutes until next min%5===4
+      const target = new Date(d);
+      target.setMinutes(min + (offset === 0 ? 5 : offset), 0, 0); // if exactly on xx:04, go to next
+      const ms = target.getTime() - now;
+      logger.info(`Next redeem at ${target.toISOString()} (in ${Math.round(ms / 1000)}s)`);
+      return ms;
+    };
+
     while (true) {
+      await sleep(msUntilNextRun());
+
+      if (Date.now() < rateLimitedUntil) continue;
+
       try {
         const positions = await dataApi.getPositions(config.profileAddress, true);
+        const pending = positions.filter((p) => !redeemedConditions.has(p.conditionId));
 
-        if (positions.length) {
-          logger.info("Redeeming positions", { count: positions.length });
-          await redeemService.redeemPositions(positions);
+        if (pending.length) {
+          logger.info("Redeeming positions", { count: pending.length, alreadyRedeemed: redeemedConditions.size });
+          const txHashes = await redeemService.redeemPositions(pending);
+
+          if (txHashes.length > 0) {
+            for (const pos of pending) redeemedConditions.add(pos.conditionId);
+            logger.info("Redeem submitted", { txHashes: txHashes.length, tracked: redeemedConditions.size });
+          }
         } else {
-          logger.info("No redeemable positions found");
+          logger.info("No new redeemable positions", { tracked: redeemedConditions.size });
         }
       } catch (err) {
-        logger.error("Redeem loop error", { error: (err as Error).message });
+        const msg = (err as Error).message ?? "";
+        if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
+          const resetMatch = msg.match(/resets in (\d+)/);
+          const resetSec = resetMatch ? parseInt(resetMatch[1], 10) : 3600;
+          rateLimitedUntil = Date.now() + (resetSec + 60) * 1000;
+          logger.warn(`Rate limited — pausing until ${new Date(rateLimitedUntil).toISOString()}`);
+        } else {
+          logger.error("Redeem loop error", { error: msg });
+        }
       }
-
-      await sleep(REDEEM_ONLY_INTERVAL_MS);
     }
   }
 

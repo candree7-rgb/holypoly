@@ -147,7 +147,12 @@ export class RedeemService {
       if (!result?.transactionHash) return null;
       return result.transactionHash;
     } catch (err) {
-      this.logger.warn("Redeem transaction failed", { error: (err as Error).message });
+      const msg = (err as Error).message ?? "";
+      this.logger.warn("Redeem transaction failed", { error: msg });
+      // Re-throw rate limit errors so callers can back off
+      if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
+        throw err;
+      }
       return null;
     }
   }
@@ -183,6 +188,7 @@ export class RedeemService {
         ? this.createNegRiskRedeem(conditionId, this.buildNegRiskAmounts(group))
         : this.createCtfRedeem(conditionId);
 
+      // execute throws on 429 — let it propagate so caller can back off
       const txHash = await this.execute(tx, "redeem positions");
       if (txHash) {
         txHashes.push(txHash);
