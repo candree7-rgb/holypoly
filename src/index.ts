@@ -110,26 +110,33 @@ const main = async () => {
         const pending = positions.filter((p) => !redeemedConditions.has(p.conditionId));
 
         if (pending.length) {
-          logger.info("Redeeming positions", { count: pending.length, alreadyRedeemed: redeemedConditions.size });
-          const txHashes = await redeemService.redeemPositions(pending);
+          // Group by conditionId to know how many unique conditions we're sending
+          const uniqueConditions = [...new Set(pending.map((p) => p.conditionId))];
+          logger.info("Redeeming positions", { conditions: uniqueConditions.length, alreadyRedeemed: redeemedConditions.size });
 
-          if (txHashes.length > 0) {
+          try {
+            const txHashes = await redeemService.redeemPositions(pending);
+            // All succeeded — track everything
             for (const pos of pending) redeemedConditions.add(pos.conditionId);
             logger.info("Redeem submitted", { txHashes: txHashes.length, tracked: redeemedConditions.size });
+          } catch (err) {
+            const msg = (err as Error).message ?? "";
+            if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
+              // Some may have succeeded before the 429 — mark all as tracked to avoid re-spamming
+              for (const pos of pending) redeemedConditions.add(pos.conditionId);
+              const resetMatch = msg.match(/resets in (\d+)/);
+              const resetSec = resetMatch ? parseInt(resetMatch[1], 10) : 3600;
+              rateLimitedUntil = Date.now() + (resetSec + 60) * 1000;
+              logger.warn(`Rate limited — pausing until ${new Date(rateLimitedUntil).toISOString()}`);
+            } else {
+              throw err; // re-throw non-429 errors
+            }
           }
         } else {
           logger.info("No new redeemable positions", { tracked: redeemedConditions.size });
         }
       } catch (err) {
-        const msg = (err as Error).message ?? "";
-        if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
-          const resetMatch = msg.match(/resets in (\d+)/);
-          const resetSec = resetMatch ? parseInt(resetMatch[1], 10) : 3600;
-          rateLimitedUntil = Date.now() + (resetSec + 60) * 1000;
-          logger.warn(`Rate limited — pausing until ${new Date(rateLimitedUntil).toISOString()}`);
-        } else {
-          logger.error("Redeem loop error", { error: msg });
-        }
+        logger.error("Redeem loop error", { error: (err as Error).message });
       }
     }
   }

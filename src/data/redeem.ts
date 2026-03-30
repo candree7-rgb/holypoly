@@ -7,6 +7,8 @@ import { Logger } from "../logger.js";
 import type { Position } from "../types.js";
 import { toBaseUnits } from "../utils.js";
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
@@ -181,8 +183,10 @@ export class RedeemService {
       byCondition[pos.conditionId].push(pos);
     }
 
+    const entries = Object.entries(byCondition);
     const txHashes: string[] = [];
-    for (const [conditionId, group] of Object.entries(byCondition)) {
+    for (let i = 0; i < entries.length; i++) {
+      const [conditionId, group] = entries[i];
       const isNegRisk = group.some((p) => p.negativeRisk);
       const tx = isNegRisk
         ? this.createNegRiskRedeem(conditionId, this.buildNegRiskAmounts(group))
@@ -192,8 +196,11 @@ export class RedeemService {
       const txHash = await this.execute(tx, "redeem positions");
       if (txHash) {
         txHashes.push(txHash);
-        this.logger.info("Redeem executed", { conditionId, txHash });
+        this.logger.info("Redeem executed", { conditionId, txHash, remaining: entries.length - i - 1 });
       }
+
+      // Throttle: 3s pause between each relayer call to avoid burning quota
+      if (i < entries.length - 1) await sleep(3000);
     }
     return txHashes;
   }
