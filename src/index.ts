@@ -110,26 +110,32 @@ const main = async () => {
         const pending = positions.filter((p) => !redeemedConditions.has(p.conditionId));
 
         if (pending.length) {
-          // Group by conditionId to know how many unique conditions we're sending
+          // Max 5 conditions per run — rest goes in the next 5-min cycle
+          const MAX_PER_RUN = 5;
           const uniqueConditions = [...new Set(pending.map((p) => p.conditionId))];
-          logger.info("Redeeming positions", { conditions: uniqueConditions.length, alreadyRedeemed: redeemedConditions.size });
+          const batch = uniqueConditions.slice(0, MAX_PER_RUN);
+          const batchPositions = pending.filter((p) => batch.includes(p.conditionId));
+
+          logger.info("Redeeming positions", {
+            conditions: batch.length,
+            totalPending: uniqueConditions.length,
+            alreadyRedeemed: redeemedConditions.size,
+          });
 
           try {
-            const txHashes = await redeemService.redeemPositions(pending);
-            // All succeeded — track everything
-            for (const pos of pending) redeemedConditions.add(pos.conditionId);
+            const txHashes = await redeemService.redeemPositions(batchPositions);
+            for (const pos of batchPositions) redeemedConditions.add(pos.conditionId);
             logger.info("Redeem submitted", { txHashes: txHashes.length, tracked: redeemedConditions.size });
           } catch (err) {
             const msg = (err as Error).message ?? "";
             if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
-              // Some may have succeeded before the 429 — mark all as tracked to avoid re-spamming
-              for (const pos of pending) redeemedConditions.add(pos.conditionId);
+              for (const pos of batchPositions) redeemedConditions.add(pos.conditionId);
               const resetMatch = msg.match(/resets in (\d+)/);
               const resetSec = resetMatch ? parseInt(resetMatch[1], 10) : 3600;
               rateLimitedUntil = Date.now() + (resetSec + 60) * 1000;
               logger.warn(`Rate limited — pausing until ${new Date(rateLimitedUntil).toISOString()}`);
             } else {
-              throw err; // re-throw non-429 errors
+              throw err;
             }
           }
         } else {
