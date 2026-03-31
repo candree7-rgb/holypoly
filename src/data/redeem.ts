@@ -183,26 +183,36 @@ export class RedeemService {
       byCondition[pos.conditionId].push(pos);
     }
 
-    const entries = Object.entries(byCondition);
-    const txHashes: string[] = [];
-    for (let i = 0; i < entries.length; i++) {
-      const [conditionId, group] = entries[i];
+    // Build ALL transactions, then submit in a single relayer call (1 quota unit)
+    const txs: Transaction[] = [];
+    const conditionIds: string[] = [];
+    for (const [conditionId, group] of Object.entries(byCondition)) {
       const isNegRisk = group.some((p) => p.negativeRisk);
       const tx = isNegRisk
         ? this.createNegRiskRedeem(conditionId, this.buildNegRiskAmounts(group))
         : this.createCtfRedeem(conditionId);
-
-      // execute throws on 429 — let it propagate so caller can back off
-      const txHash = await this.execute(tx, "redeem positions");
-      if (txHash) {
-        txHashes.push(txHash);
-        this.logger.info("Redeem executed", { conditionId, txHash, remaining: entries.length - i - 1 });
-      }
-
-      // Throttle: 3s pause between each relayer call to avoid burning quota
-      if (i < entries.length - 1) await sleep(3000);
+      txs.push(tx);
+      conditionIds.push(conditionId);
     }
-    return txHashes;
+
+    if (txs.length === 0) return [];
+
+    this.logger.info("Submitting batched redeem", { conditions: txs.length, conditionIds });
+
+    try {
+      const response = await this.client.execute(txs, "redeem positions");
+      const result = await response.wait();
+      if (!result?.transactionHash) return [];
+      this.logger.info("Batch redeem executed", { txHash: result.transactionHash, conditions: txs.length });
+      return [result.transactionHash];
+    } catch (err) {
+      const msg = (err as Error).message ?? "";
+      this.logger.warn("Redeem transaction failed", { error: msg });
+      if (msg.includes("429") || msg.includes("Too Many") || msg.includes("quota exceeded")) {
+        throw err;
+      }
+      return [];
+    }
   }
 
   /**
