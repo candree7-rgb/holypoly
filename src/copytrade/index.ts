@@ -53,7 +53,10 @@ async function main() {
     target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
     detection: config.rpcWsUrl ? "WebSocket + API polling" : "API polling only",
     pollInterval: `${config.pollIntervalMs}ms`,
-    strategy: `GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
+    strategy: config.speedMode === "fast"
+      ? `FAST: Direct FOK +${config.maxSlippageCents}¢ (lowest latency)`
+      : `GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
+    speedMode: config.speedMode,
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
       : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
       : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
@@ -199,7 +202,7 @@ async function main() {
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
       `Detection: ${config.rpcWsUrl ? "WebSocket + API" : "API polling"}`,
-      `Strategy: GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
+      `Strategy: ${config.speedMode === "fast" ? `FAST FOK +${config.maxSlippageCents}¢` : `GTC → FOK +${config.maxSlippageCents}¢ → patient GTC`}`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
     ].join("\n"),
   );

@@ -291,73 +291,64 @@ export class TargetTracker {
         timestamp: Date.now(),
       });
 
-      // Resolve market metadata via Gamma API, THEN emit
-      this.resolveAndEmitChainEvent(eventId, tokenIdDecimal, shares);
+      // SPEED: Emit immediately with partial data (executor handles missing metadata).
+      // Gamma lookup runs in background to warm cache for future trades.
+      const immediateTrade: TargetTrade = {
+        id: eventId,
+        side: "BUY",
+        type: "TRADE",
+        conditionId: "",
+        tokenId: tokenIdDecimal,
+        outcome: "",
+        priceCents: 0, // executor will look up orderbook
+        shares,
+        usdValue: 0,
+        title: "",
+        timestamp: Date.now(),
+        source: "chain",
+      };
+
+      // Check cache first — if hit, enrich immediately (no network delay)
+      const cached = this.marketCache.get(tokenIdDecimal);
+      if (cached) {
+        immediateTrade.conditionId = cached.conditionId;
+        immediateTrade.title = cached.title;
+        immediateTrade.outcome = cached.outcome;
+        immediateTrade.tokenId = cached.clobTokenId;
+      }
+
+      if (this.onTrade) {
+        this.onTrade(immediateTrade);
+      }
+
+      // Warm cache in background for next time (fire-and-forget)
+      if (!cached) {
+        this.resolveAndCacheChainEvent(tokenIdDecimal);
+      }
     }
   }
 
   /**
-   * Resolve chain event metadata via Gamma API, then emit.
-   * If Gamma fails, emit with partial data (executor will use orderbook fallback).
+   * Resolve chain event metadata via Gamma API and cache it.
+   * Runs in background — does NOT block trade emission.
    */
-  private async resolveAndEmitChainEvent(eventId: string, tokenIdDecimal: string, shares: number): Promise<void> {
-    let conditionId = "";
-    let title = "";
-    let outcome = "";
-    let priceCents = 0;
-    let clobTokenId = tokenIdDecimal;
-
+  private async resolveAndCacheChainEvent(tokenIdDecimal: string): Promise<void> {
     try {
-      const cached = this.marketCache.get(tokenIdDecimal);
-      if (cached !== undefined) {
-        if (cached) {
-          conditionId = cached.conditionId;
-          title = cached.title;
-          outcome = cached.outcome;
-          clobTokenId = cached.clobTokenId;
-        }
+      const meta = await this.lookupMarketByTokenId(tokenIdDecimal);
+      this.marketCache.set(tokenIdDecimal, meta);
+      if (meta) {
+        this.logger.info("Gamma: Cached chain event metadata", {
+          tokenId: tokenIdDecimal.slice(0, 12) + "...",
+          market: meta.title.slice(0, 50),
+          outcome: meta.outcome,
+        });
       } else {
-        const meta = await this.lookupMarketByTokenId(tokenIdDecimal);
-        this.marketCache.set(tokenIdDecimal, meta);
-        if (meta) {
-          conditionId = meta.conditionId;
-          title = meta.title;
-          outcome = meta.outcome;
-          clobTokenId = meta.clobTokenId;
-
-          this.logger.info("Gamma: Resolved chain event", {
-            tokenId: tokenIdDecimal.slice(0, 12) + "...",
-            market: title.slice(0, 50),
-            outcome,
-            conditionId: conditionId.slice(0, 12) + "...",
-          });
-        } else {
-          this.logger.warn("Gamma: Could not resolve token ID", {
-            tokenId: tokenIdDecimal.slice(0, 16) + "...",
-          });
-        }
+        this.logger.warn("Gamma: Could not resolve token ID", {
+          tokenId: tokenIdDecimal.slice(0, 16) + "...",
+        });
       }
     } catch (err) {
-      this.logger.warn("Gamma lookup failed", { error: (err as Error).message });
-    }
-
-    const trade: TargetTrade = {
-      id: eventId,
-      side: "BUY",
-      type: "TRADE",
-      conditionId,
-      tokenId: clobTokenId,
-      outcome,
-      priceCents, // 0 = executor will look up orderbook
-      shares,
-      usdValue: 0,
-      title,
-      timestamp: Date.now(),
-      source: "chain",
-    };
-
-    if (this.onTrade) {
-      this.onTrade(trade);
+      this.logger.warn("Gamma background lookup failed", { error: (err as Error).message });
     }
   }
 
@@ -374,7 +365,7 @@ export class TargetTracker {
     const url = `${this.gammaHost}/markets?clob_token_ids=${encodeURIComponent(tokenId)}&limit=1`;
     const resp = await fetch(url, {
       headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(2000),
     });
 
     if (!resp.ok) return null;
@@ -450,7 +441,7 @@ export class TargetTracker {
             Accept: "application/json",
             "User-Agent": "holypoly-copytrade",
           },
-          signal: AbortSignal.timeout(5000),
+          signal: AbortSignal.timeout(3000),
         });
 
         if (!resp.ok) continue;
