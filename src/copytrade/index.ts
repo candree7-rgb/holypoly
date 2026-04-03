@@ -28,9 +28,9 @@ const BANNER = `
 ╔═══════════════════════════════════════════════╗
 ║  HolyPoly CopyTrader                         ║
 ║                                               ║
-║  Detection: CLOB WS + API Poll + Chain WS    ║
+║  Detection: RTDS + CLOB WS + API + Chain WS   ║
 ║  Orders:    Fast FOK / GTC Limit              ║
-║  Latency:   ~200-500ms (3-layer detection)    ║
+║  Latency:   ~100-300ms (4-layer detection)    ║
 ╚═══════════════════════════════════════════════╝
 `;
 
@@ -51,7 +51,7 @@ async function main() {
 
   logger.info("Config loaded", {
     target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
-    detection: "CLOB WS (trigger) + API Poll (primary) + Chain WS (backup)",
+    detection: "RTDS (fastest) + CLOB WS (trigger) + API Poll + Chain WS (backup)",
     pollInterval: `${config.pollIntervalMs}ms`,
     strategy: config.speedMode === "fast"
       ? `FAST: Direct FOK +${config.maxSlippageCents}¢ (lowest latency)`
@@ -201,7 +201,7 @@ async function main() {
       `*CopyTrader Started*`,
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
-      `Detection: CLOB WS + API Poll + Chain WS`,
+      `Detection: RTDS + CLOB WS + API + Chain WS`,
       `Strategy: ${config.speedMode === "fast" ? `FAST FOK +${config.maxSlippageCents}¢` : `GTC → FOK +${config.maxSlippageCents}¢ → patient GTC`}`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
     ].join("\n"),
@@ -215,6 +215,7 @@ async function main() {
     const ts = tracker.getStats();
     const es = executor.getStats();
     logger.info("Status", {
+      rtdsDetections: ts.rtdsDetections,
       chainEvents: ts.chainEvents,
       apiDetections: ts.apiDetections,
       clobWsTriggers: ts.clobWsTriggers,
