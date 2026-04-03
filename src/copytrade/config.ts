@@ -168,7 +168,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
 
   // Detection
   const rpcWsUrl = getEnv("RPC_WS_URL") ?? "wss://polygon-bor-rpc.publicnode.com";
-  const pollIntervalMs = parseNumber("COPY_POLL_INTERVAL_MS", 500);
+  const pollIntervalMs = parseNumber("COPY_POLL_INTERVAL_MS", 200);
 
   // Position sizing
   const sizingModeRaw = (getEnv("COPY_SIZING_MODE") ?? "portfolio").toLowerCase();

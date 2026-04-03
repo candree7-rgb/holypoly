@@ -277,6 +277,8 @@ async function notifyResult(
       statusLine = `DRY RUN · ${result.latencyMs}ms`;
     } else if (result.reason === "gtc_instant_fill") {
       statusLine = `GTC instant fill (0% fee) · ${result.latencyMs}ms`;
+    } else if (result.reason === "fast_fok_filled") {
+      statusLine = `FAST FOK filled · ${result.latencyMs}ms`;
     } else if (result.reason === "fok_filled") {
       statusLine = `FOK filled · ${result.latencyMs}ms`;
     } else if (result.reason === "gtc_pending") {

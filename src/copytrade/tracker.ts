@@ -422,10 +422,8 @@ export class TargetTracker {
     this.stats.totalPolls++;
 
     try {
-      // Try /activity first, then /trades as fallback (Polymarket has both endpoints)
-      let data: ActivityResponse[] = [];
-
-      for (const endpoint of ["/activity", "/trades"]) {
+      // SPEED: Query both endpoints IN PARALLEL — use whichever responds first with data
+      const makeUrl = (endpoint: string): string => {
         const url = new URL(`${this.dataApiHost}${endpoint}`);
         url.searchParams.set("user", this.targetAddress);
         if (endpoint === "/activity") {
@@ -435,21 +433,33 @@ export class TargetTracker {
         }
         url.searchParams.set("start", String(this.lastPollTimestamp));
         url.searchParams.set("limit", "100");
+        return url.toString();
+      };
 
-        const resp = await fetch(url.toString(), {
+      const fetchEndpoint = async (endpoint: string): Promise<ActivityResponse[]> => {
+        const resp = await fetch(makeUrl(endpoint), {
           headers: {
             Accept: "application/json",
             "User-Agent": "holypoly-copytrade",
           },
-          signal: AbortSignal.timeout(3000),
+          signal: AbortSignal.timeout(2000),
         });
-
-        if (!resp.ok) continue;
-
+        if (!resp.ok) return [];
         const body = await resp.json();
         const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
-        if (Array.isArray(items) && items.length > 0) {
-          data = items as ActivityResponse[];
+        return Array.isArray(items) ? items as ActivityResponse[] : [];
+      };
+
+      // Race both endpoints — first one with data wins
+      const results = await Promise.allSettled([
+        fetchEndpoint("/activity"),
+        fetchEndpoint("/trades"),
+      ]);
+
+      let data: ActivityResponse[] = [];
+      for (const r of results) {
+        if (r.status === "fulfilled" && r.value.length > 0) {
+          data = r.value;
           break;
         }
       }
