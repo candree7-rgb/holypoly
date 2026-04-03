@@ -45,16 +45,19 @@ const TRANSFER_SINGLE_TOPIC = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c08
 /** Pad an address to 32 bytes for topic filter */
 const padAddress = (addr: string): string => "0x" + addr.replace("0x", "").toLowerCase().padStart(64, "0");
 
-// ---------- On-chain tracker ----------
+// ---------- Multi-source tracker ----------
 
 /**
- * Real-time tracker using Polygon WebSocket.
+ * Ultra-fast tracker using 3 detection layers (per docs.polymarket.com):
  *
- * Subscribes to CTF TransferSingle events where `to == targetAddress`.
- * When the target receives tokens, it means they bought shares.
+ * 1. CLOB Market WS `last_trade_price` (~50ms) — instant trigger, but anonymous
+ *    → On trigger: immediately poll Data API to check if it was the target
+ * 2. Data API polling (~200ms interval) — shows target's trades with full metadata
+ * 3. Polygon Chain WS (2-4s) — reliable backup, confirms on-chain settlement
  *
- * Polygon block time is ~2s, so detection latency is 2-4s.
- * Combined with Data API polling fallback for metadata enrichment.
+ * The Market WS is the fastest signal that "something happened" on a market.
+ * We use it as a turbo-trigger to immediately hit the Data API instead of
+ * waiting for the next poll cycle.
  */
 export class TargetTracker {
   private dataApiHost: string;
@@ -64,7 +67,7 @@ export class TargetTracker {
   private seenIds: Set<string> = new Set();
   private onTrade: ((trade: TargetTrade) => void) | null = null;
 
-  // On-chain WebSocket
+  // On-chain WebSocket (layer 3 — reliable backup)
   private rpcWsUrl: string;
   private chainWs: WebSocket | null = null;
   private chainSubId: string | null = null;
@@ -72,7 +75,16 @@ export class TargetTracker {
   private chainReconnectDelay = 1000;
   private chainConnected = false;
 
-  // Data API polling (fallback + metadata enrichment)
+  // CLOB Market WebSocket (layer 1 — fastest trigger)
+  private clobWs: WebSocket | null = null;
+  private clobWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private clobWsReconnectDelay = 1000;
+  private clobWsConnected = false;
+  private clobWsPingTimer: ReturnType<typeof setInterval> | null = null;
+  /** Token IDs we're watching on the CLOB WS (from target's known markets) */
+  private watchedTokenIds: Set<string> = new Set();
+
+  // Data API polling (layer 2 — primary detection with metadata)
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollIntervalMs: number;
   private isPolling = false;
@@ -91,6 +103,7 @@ export class TargetTracker {
   private stats = {
     chainEvents: 0,
     apiDetections: 0,
+    clobWsTriggers: 0,
     totalPolls: 0,
     consecutiveErrors: 0,
   };
@@ -118,28 +131,48 @@ export class TargetTracker {
   }
 
   /**
-   * Start both detection methods:
-   * 1. Polygon WebSocket (primary, real-time)
-   * 2. Data API polling (fallback + metadata)
+   * Start all 3 detection layers:
+   * 1. CLOB Market WS (fastest trigger — last_trade_price events)
+   * 2. Data API polling (primary detection with metadata)
+   * 3. Polygon Chain WS (reliable backup)
    */
   start(): void {
-    this.logger.info("Tracker starting", {
+    this.logger.info("Tracker starting (3-layer detection)", {
       target: this.targetAddress.slice(0, 8) + "..." + this.targetAddress.slice(-6),
-      rpcWs: this.rpcWsUrl ? "enabled" : "disabled",
+      clobWs: "enabled (last_trade_price trigger)",
+      chainWs: this.rpcWsUrl ? "enabled (backup)" : "disabled",
       pollInterval: `${this.pollIntervalMs}ms`,
     });
 
-    // Start on-chain WebSocket
+    // Layer 1: CLOB Market WS (turbo-trigger)
+    this.connectClobWs();
+
+    // Layer 2: Data API polling (primary detection)
+    this.pollTimer = setInterval(() => this.poll(), this.pollIntervalMs);
+    this.poll(); // Immediate first poll
+
+    // Layer 3: On-chain WebSocket (backup)
     if (this.rpcWsUrl) {
       this.connectChainWs();
     }
-
-    // Start Data API polling (always — it provides metadata that chain events don't have)
-    this.pollTimer = setInterval(() => this.poll(), this.pollIntervalMs);
-    this.poll(); // Immediate first poll
   }
 
   stop(): void {
+    // Stop CLOB WS
+    if (this.clobWsReconnectTimer) {
+      clearTimeout(this.clobWsReconnectTimer);
+      this.clobWsReconnectTimer = null;
+    }
+    if (this.clobWsPingTimer) {
+      clearInterval(this.clobWsPingTimer);
+      this.clobWsPingTimer = null;
+    }
+    if (this.clobWs) {
+      this.clobWs.removeAllListeners();
+      this.clobWs.close();
+      this.clobWs = null;
+    }
+
     // Stop chain WS
     if (this.chainReconnectTimer) {
       clearTimeout(this.chainReconnectTimer);
@@ -162,7 +195,121 @@ export class TargetTracker {
 
   getStats() { return { ...this.stats }; }
 
-  // ==================== ON-CHAIN WEBSOCKET ====================
+  /**
+   * Add token IDs to watch on the CLOB Market WS.
+   * Called when we discover new markets the target trades on
+   * (from chain events or API detections).
+   */
+  watchTokenIds(tokenIds: string[]): void {
+    let newCount = 0;
+    for (const id of tokenIds) {
+      if (!this.watchedTokenIds.has(id)) {
+        this.watchedTokenIds.add(id);
+        newCount++;
+      }
+    }
+    if (newCount > 0 && this.clobWsConnected) {
+      this.subscribeClobWsTokens();
+    }
+  }
+
+  // ==================== CLOB MARKET WEBSOCKET (LAYER 1) ====================
+
+  private connectClobWs(): void {
+    this.logger.info("Connecting to CLOB Market WebSocket...");
+
+    this.clobWs = new WebSocket("wss://ws-subscriptions-clob.polymarket.com/ws/market");
+
+    this.clobWs.on("open", () => {
+      this.clobWsConnected = true;
+      this.clobWsReconnectDelay = 1000;
+      this.logger.info("CLOB Market WS connected");
+
+      // Subscribe to known tokens
+      if (this.watchedTokenIds.size > 0) {
+        this.subscribeClobWsTokens();
+      }
+
+      // Keepalive: PING every 10 seconds (Polymarket disconnects otherwise)
+      this.clobWsPingTimer = setInterval(() => {
+        if (this.clobWs?.readyState === WebSocket.OPEN) {
+          this.clobWs.send("PING");
+        }
+      }, 10_000);
+    });
+
+    this.clobWs.on("message", (data: WebSocket.Data) => {
+      const raw = data.toString();
+      if (raw === "PONG") return;
+
+      try {
+        const msg = JSON.parse(raw) as {
+          event_type?: string;
+          asset_id?: string;
+          price?: string;
+          size?: string;
+          side?: string;
+          timestamp?: string;
+        };
+
+        // last_trade_price = a trade just happened on this market!
+        // This is our turbo-trigger: immediately poll the Data API
+        // to check if it was our target trader.
+        if (msg.event_type === "last_trade_price" && msg.asset_id) {
+          this.stats.clobWsTriggers++;
+          this.logger.debug("CLOB WS: Trade on watched market", {
+            tokenId: msg.asset_id.slice(0, 12) + "...",
+            price: msg.price,
+            size: msg.size,
+            side: msg.side,
+          });
+
+          // TURBO: Immediately trigger a Data API poll (skip interval wait)
+          this.poll();
+        }
+      } catch {
+        // ignore parse errors
+      }
+    });
+
+    this.clobWs.on("close", () => {
+      this.clobWsConnected = false;
+      if (this.clobWsPingTimer) {
+        clearInterval(this.clobWsPingTimer);
+        this.clobWsPingTimer = null;
+      }
+      this.logger.warn("CLOB Market WS disconnected");
+      this.scheduleClobWsReconnect();
+    });
+
+    this.clobWs.on("error", (err: Error) => {
+      this.logger.error("CLOB Market WS error", { error: err.message });
+      this.clobWs?.close();
+    });
+  }
+
+  private subscribeClobWsTokens(): void {
+    if (!this.clobWs || this.clobWs.readyState !== WebSocket.OPEN) return;
+    if (this.watchedTokenIds.size === 0) return;
+
+    const msg = {
+      assets_ids: Array.from(this.watchedTokenIds),
+      type: "market",
+    };
+    this.clobWs.send(JSON.stringify(msg));
+    this.logger.info("CLOB WS: Subscribed to market tokens", {
+      count: this.watchedTokenIds.size,
+    });
+  }
+
+  private scheduleClobWsReconnect(): void {
+    this.clobWsReconnectTimer = setTimeout(() => {
+      this.connectClobWs();
+    }, this.clobWsReconnectDelay);
+    this.clobWsReconnectDelay = Math.min(this.clobWsReconnectDelay * 2, 30_000);
+  }
+
+  // ==================== ON-CHAIN WEBSOCKET (LAYER 3) ====================
 
   private connectChainWs(): void {
     this.logger.info("Connecting to Polygon WebSocket...", { url: this.rpcWsUrl });
@@ -316,6 +463,9 @@ export class TargetTracker {
         immediateTrade.outcome = cached.outcome;
         immediateTrade.tokenId = cached.clobTokenId;
       }
+
+      // Auto-learn: watch this token on CLOB WS for future trades
+      this.watchTokenIds([tokenIdDecimal]);
 
       if (this.onTrade) {
         this.onTrade(immediateTrade);
@@ -517,6 +667,11 @@ export class TargetTracker {
           usd: `$${trade.usdValue.toFixed(2)}`,
           market: trade.title.slice(0, 60),
         });
+
+        // Auto-learn: watch this token on CLOB WS for future trades
+        if (trade.tokenId) {
+          this.watchTokenIds([trade.tokenId]);
+        }
 
         if (this.onTrade) {
           this.onTrade(trade);
