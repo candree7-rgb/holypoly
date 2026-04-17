@@ -257,8 +257,8 @@ export class TargetTracker {
     // Layer 0: RTDS Activity WS (FASTEST — sub-second trade stream)
     this.connectRtdsWs();
 
-    // Layer 1: CLOB Market WS (turbo-trigger for known markets)
-    this.connectClobWs();
+    // Layer 1: CLOB Market WS — connects lazily when first token ID is learned
+    // (connecting with no subscriptions causes Polymarket to disconnect us)
 
     // Layer 2: Data API polling (always runs at pollIntervalMs as safety net)
     // CLOB WS triggers ADDITIONAL instant polls on top of this interval.
@@ -333,8 +333,14 @@ export class TargetTracker {
         newCount++;
       }
     }
-    if (newCount > 0 && this.clobWsConnected) {
+    if (newCount === 0) return;
+
+    if (this.clobWsConnected) {
       this.subscribeClobWsTokens();
+    } else if (!this.clobWs) {
+      // First token learned — connect CLOB WS now
+      this.logger.info("First token ID learned, connecting CLOB Market WS...");
+      this.connectClobWs();
     }
   }
 
