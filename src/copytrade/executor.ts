@@ -308,59 +308,58 @@ export class CopyExecutor {
 
     try {
       // ═══════════════════════════════════════════════════════
-      // FAST MODE: Direct FOK — skip GTC test entirely (~500ms saved)
+      // FAST MODE: GTC at worstPrice — instant partial fills + rest as limit
+      // Unlike FOK (all-or-nothing), GTC sweeps whatever liquidity exists
+      // and leaves the rest as a resting limit order.
       // ═══════════════════════════════════════════════════════
       if (isFastMode) {
-        try {
-          const fokResult = await this.clob.placeMarketOrderFOK({
+        const { orderId: fastId } = await this.clob.placeLimitOrder({
+          tokenId: trade.tokenId,
+          side,
+          price: worstPrice,
+          size: shares,
+        });
+
+        this.lastCopyTime = Date.now();
+        tracker.copies++;
+        tracker.totalUsd += copyUsd;
+        this.totalCopied++;
+        this.balance -= copyUsd;
+
+        // Track for fill monitoring + bumps
+        if (fastId) {
+          const now2 = Date.now();
+          this.pendingOrders.set(fastId, {
+            orderId: fastId,
             tokenId: trade.tokenId,
             side,
-            amount: shares * price,
-            worstPrice,
-          });
-
-          if (fokResult.filled) {
-            this.lastCopyTime = Date.now();
-            tracker.copies++;
-            tracker.totalUsd += copyUsd;
-            this.totalCopied++;
-            this.balance -= copyUsd;
-
-            this.logger.info("FAST FOK filled", {
-              side: trade.side,
-              outcome: trade.outcome || "?",
-              leaderPrice: `${priceCents}¢`,
-              worstPrice: `${Math.round(worstPrice * 100)}¢`,
-              shares: shares.toFixed(1),
-              latency: `${Date.now() - startMs}ms`,
-            });
-
-            if (this.onFilledCb) {
-              this.onFilledCb({
-                orderId: fokResult.orderIds[0] || "fok-fast",
-                trade,
-                filledShares: shares,
-                price: worstPrice,
-                usd: shares * worstPrice,
-                placedAt: Date.now(),
-                filledAt: Date.now(),
-              });
-            }
-
-            return {
-              success: true, trade, orderId: fokResult.orderIds[0],
-              executedPrice: worstPrice, executedShares: shares, executedUsd: copyUsd,
-              leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
-              latencyMs: Date.now() - startMs,
-              reason: "fast_fok_filled",
-            };
-          }
-        } catch (err) {
-          this.logger.info("Fast FOK failed, placing patient GTC", {
-            error: (err as Error).message,
+            price: worstPrice,
+            originalPrice: worstPrice,
+            size: shares,
+            placedAt: now2,
+            orderPlacedAt: now2,
+            bumpCount: 0,
+            trade,
           });
         }
-        // Fast mode FOK failed → fall through to patient GTC (Step 3)
+
+        this.logger.info("FAST GTC placed (sweeps + rests)", {
+          side: trade.side,
+          outcome: trade.outcome || "?",
+          leaderPrice: `${priceCents}¢`,
+          ourPrice: `${Math.round(worstPrice * 100)}¢`,
+          shares: shares.toFixed(1),
+          latency: `${Date.now() - startMs}ms`,
+          orderId: fastId ? fastId.slice(0, 12) + "..." : "?",
+        });
+
+        return {
+          success: true, trade, orderId: fastId ?? undefined,
+          executedPrice: worstPrice, executedShares: shares, executedUsd: copyUsd,
+          leaderPriceCents: trade.priceCents, leaderUsd: trade.usdValue, leaderShares: trade.shares,
+          latencyMs: Date.now() - startMs,
+          reason: "fast_gtc_placed",
+        };
       }
 
       // ═══════════════════════════════════════════════════════
