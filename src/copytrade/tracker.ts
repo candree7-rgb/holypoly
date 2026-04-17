@@ -174,11 +174,68 @@ export class TargetTracker {
   }
 
   /**
-   * Trigger an immediate poll from the CLOB WS.
-   * Separate from the regular interval — this is the speed boost.
+   * Instant check — dedicated fast-path triggered by CLOB WS.
+   * Has its own guard (not blocked by regular poll's isPolling).
+   * Only hits the fastest endpoint (/activity) for minimum latency.
    */
-  triggerInstantPoll(): void {
-    this.poll();
+  private isInstantChecking = false;
+  private async instantCheck(): Promise<void> {
+    if (this.isInstantChecking) return;
+    this.isInstantChecking = true;
+    try {
+      const url = new URL(`${this.dataApiHost}/activity`);
+      url.searchParams.set("user", this.targetAddress);
+      url.searchParams.set("type", "TRADE");
+      url.searchParams.set("sortBy", "TIMESTAMP");
+      url.searchParams.set("sortDirection", "ASC");
+      url.searchParams.set("start", String(this.lastPollTimestamp));
+      url.searchParams.set("limit", "10");
+
+      const resp = await fetch(url.toString(), {
+        headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+        signal: AbortSignal.timeout(1500),
+      });
+      if (!resp.ok) return;
+
+      const body = await resp.json();
+      const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
+      if (!Array.isArray(items) || items.length === 0) return;
+
+      for (const item of items as ActivityResponse[]) {
+        const trade = this.parseActivity(item);
+        if (!trade) continue;
+        if (trade.timestamp < this.startedAt - 5000) { this.seenIds.add(trade.id); continue; }
+        if (this.seenIds.has(trade.id)) continue;
+
+        this.seenIds.add(trade.id);
+        this.stats.apiDetections++;
+
+        const tradeSec = Math.floor(trade.timestamp / 1000);
+        if (tradeSec > this.lastPollTimestamp) {
+          this.lastPollTimestamp = tradeSec;
+        }
+
+        this.logger.info("INSTANT: Target trade detected (WS-triggered)", {
+          side: trade.side,
+          outcome: trade.outcome,
+          price: `${trade.priceCents}¢`,
+          shares: trade.shares.toFixed(1),
+          market: trade.title.slice(0, 60),
+        });
+
+        if (trade.tokenId) {
+          this.watchTokenIds([trade.tokenId]);
+        }
+
+        if (this.onTrade) {
+          this.onTrade(trade);
+        }
+      }
+    } catch {
+      // Non-critical — regular poll will catch it
+    } finally {
+      this.isInstantChecking = false;
+    }
   }
 
   /**
@@ -439,19 +496,10 @@ export class TargetTracker {
         };
 
         // last_trade_price = a trade just happened on this market!
-        // This is our turbo-trigger: immediately poll the Data API
-        // to check if it was our target trader.
+        // Instant check: dedicated fast-path that bypasses isPolling guard.
         if (msg.event_type === "last_trade_price" && msg.asset_id) {
           this.stats.clobWsTriggers++;
-          this.logger.debug("CLOB WS: Trade on watched market", {
-            tokenId: msg.asset_id.slice(0, 12) + "...",
-            price: msg.price,
-            size: msg.size,
-            side: msg.side,
-          });
-
-          // TURBO: Immediately trigger a Data API poll (skip interval wait)
-          this.poll();
+          this.instantCheck();
         }
       } catch {
         // ignore parse errors
