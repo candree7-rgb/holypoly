@@ -379,6 +379,50 @@ export class ClobService {
   }
 
   /**
+   * Place a FAK (Fill-And-Kill) market order — fills whatever is available, cancels rest.
+   * Unlike FOK (all-or-nothing), FAK allows partial fills.
+   * Per docs.polymarket.com: "Fills as many shares as available immediately,
+   * then cancels any unfilled remainder."
+   */
+  async placeMarketOrderFAK(params: {
+    tokenId: string;
+    side: Side;
+    amount: number; // USD amount for BUY, shares for SELL
+    worstPrice?: number; // slippage protection, not target price
+  }): Promise<{ filled: boolean; orderIds: string[] }> {
+    const meta = await this.getMarketMeta(params.tokenId);
+
+    try {
+      const resp = await this.client.createAndPostMarketOrder(
+        {
+          tokenID: params.tokenId,
+          side: params.side,
+          amount: params.amount,
+          ...(params.worstPrice ? { price: this.roundToTick(params.worstPrice, meta.tickSize, params.side) } : {}),
+        },
+        { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        OrderType.FAK,
+      );
+
+      const orderIds: string[] = [];
+      if (resp?.orderID) orderIds.push(resp.orderID);
+      const filled = !resp?.error && orderIds.length > 0;
+
+      this.logger.info("FAK order result", {
+        tokenId: params.tokenId.slice(0, 12) + "...",
+        side: params.side,
+        amount: params.amount,
+        filled,
+      });
+
+      return { filled, orderIds };
+    } catch (err) {
+      this.logger.warn("FAK order failed", { error: (err as Error).message });
+      return { filled: false, orderIds: [] };
+    }
+  }
+
+  /**
    * Place multiple limit orders in a single API call via POST /orders.
    * Signs all orders first, then posts them as one batch.
    * @param orderType - GTC (default) for resting orders, FOK for immediate fill

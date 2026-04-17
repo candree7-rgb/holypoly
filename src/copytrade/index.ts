@@ -276,8 +276,12 @@ async function notifyResult(
     let statusLine: string;
     if (result.reason === "dry_run") {
       statusLine = `DRY RUN · ${result.latencyMs}ms`;
-    } else if (result.reason === "fast_gtc_placed") {
-      statusLine = `FAST GTC placed (sweeps + rests) · ${result.latencyMs}ms`;
+    } else if (result.reason === "fast_fak_filled") {
+      statusLine = `FAK filled · ${result.latencyMs}ms`;
+    } else if (result.reason === "fast_fak_partial_gtc") {
+      statusLine = `FAK partial + GTC rest · ${result.latencyMs}ms`;
+    } else if (result.reason === "fast_fak_miss_gtc") {
+      statusLine = `FAK empty → GTC placed · ${result.latencyMs}ms`;
     } else if (result.reason === "gtc_instant_fill") {
       statusLine = `GTC instant fill (0% fee) · ${result.latencyMs}ms`;
     } else if (result.reason === "fast_fok_filled") {
