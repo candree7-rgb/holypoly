@@ -48,18 +48,16 @@ const padAddress = (addr: string): string => "0x" + addr.replace("0x", "").toLow
 // ---------- Multi-source tracker ----------
 
 /**
- * Ultra-fast tracker using 4 detection layers (per docs.polymarket.com):
+ * Ultra-fast tracker using 3 detection layers (per docs.polymarket.com):
  *
- * Layer 0: RTDS Activity WS (FASTEST — ~50ms after CLOB match)
- *   wss://ws-live-data.polymarket.com
- *   Streams ALL platform trades with `proxyWallet` field.
- *   Client-side filter by target address. No auth required.
+ * Layer 1: CLOB Market WS `last_trade_price` (~50ms after CLOB match)
+ *   wss://ws-subscriptions-clob.polymarket.com/ws/market
+ *   Anonymous but instant — triggers dedicated instantCheck().
+ *   Connects lazily after first token ID is learned.
  *
- * Layer 1: CLOB Market WS `last_trade_price` (~50ms)
- *   Anonymous but instant — triggers immediate Data API poll.
- *
- * Layer 2: Data API polling (~200ms interval)
+ * Layer 2: Data API polling (100ms interval)
  *   Queries /activity + /trades endpoints for target's trades.
+ *   Only source that identifies WHO traded.
  *
  * Layer 3: Polygon Chain WS (2-4s)
  *   Reliable backup — on-chain settlement confirmation.
@@ -68,17 +66,9 @@ export class TargetTracker {
   private dataApiHost: string;
   private gammaHost: string;
   private targetAddress: string;
-  /** Set of addresses to match (lowercase): includes target + any known proxy wallets */
-  private targetAddresses: Set<string> = new Set();
   private logger: Logger;
   private seenIds: Set<string> = new Set();
   private onTrade: ((trade: TargetTrade) => void) | null = null;
-
-  // RTDS WebSocket (layer 0 — FASTEST: streams all trades with proxyWallet)
-  private rtdsWs: WebSocket | null = null;
-  private rtdsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private rtdsReconnectDelay = 1000;
-  private rtdsConnected = false;
 
   // On-chain WebSocket (layer 3 — reliable backup)
   private rpcWsUrl: string;
@@ -114,7 +104,6 @@ export class TargetTracker {
 
   // Stats
   private stats = {
-    rtdsDetections: 0,
     chainEvents: 0,
     apiDetections: 0,
     clobWsTriggers: 0,
@@ -133,40 +122,11 @@ export class TargetTracker {
     this.dataApiHost = dataApiHost.replace(/\/$/, "");
     this.gammaHost = (gammaHost ?? "https://gamma-api.polymarket.com").replace(/\/$/, "");
     this.targetAddress = targetAddress.toLowerCase();
-    this.targetAddresses.add(this.targetAddress);
     this.rpcWsUrl = rpcWsUrl;
     this.pollIntervalMs = pollIntervalMs;
     this.logger = logger;
     this.startedAt = Date.now();
     this.lastPollTimestamp = Math.floor(Date.now() / 1000);
-
-    // Try to resolve proxy wallet in background (RTDS uses proxyWallet, not EOA)
-    this.resolveProxyWallet();
-  }
-
-  /**
-   * Resolve the target's proxy wallet address from Gamma API.
-   * RTDS activity events use `proxyWallet`, which may differ from the configured target address.
-   */
-  private async resolveProxyWallet(): Promise<void> {
-    try {
-      const resp = await fetch(
-        `${this.gammaHost}/profiles/${this.targetAddress}`,
-        { headers: { Accept: "application/json" }, signal: AbortSignal.timeout(3000) },
-      );
-      if (!resp.ok) return;
-      const data = await resp.json() as { proxyWallet?: string; proxy_wallet?: string };
-      const proxy = (data.proxyWallet || data.proxy_wallet || "").toLowerCase();
-      if (proxy && proxy !== this.targetAddress) {
-        this.targetAddresses.add(proxy);
-        this.logger.info("Resolved target proxy wallet", {
-          eoa: this.targetAddress.slice(0, 8) + "...",
-          proxy: proxy.slice(0, 8) + "...",
-        });
-      }
-    } catch {
-      // Non-critical — RTDS will still match on EOA
-    }
   }
 
   onNewTrade(cb: (trade: TargetTrade) => void): void {
@@ -239,23 +199,18 @@ export class TargetTracker {
   }
 
   /**
-   * Start all 4 detection layers:
-   * 0. RTDS Activity WS (FASTEST — streams all trades with proxyWallet)
-   * 1. CLOB Market WS (fast trigger — last_trade_price events)
-   * 2. Data API polling (reliable detection with metadata)
-   * 3. Polygon Chain WS (backup — on-chain settlement)
+   * Start all 3 detection layers:
+   * 1. CLOB Market WS (fast trigger — last_trade_price, connects on first token)
+   * 2. Data API polling (100ms — primary detection with user identity)
+   * 3. Polygon Chain WS (2-4s — backup, on-chain settlement)
    */
   start(): void {
-    this.logger.info("Tracker starting (4-layer detection)", {
+    this.logger.info("Tracker starting (3-layer detection)", {
       target: this.targetAddress.slice(0, 8) + "..." + this.targetAddress.slice(-6),
-      rtds: "enabled (activity/trades stream — FASTEST)",
-      clobWs: "enabled (last_trade_price trigger)",
+      clobWs: "lazy (connects on first token ID)",
       chainWs: this.rpcWsUrl ? "enabled (backup)" : "disabled",
       pollInterval: `${this.pollIntervalMs}ms`,
     });
-
-    // Layer 0: RTDS Activity WS (FASTEST — sub-second trade stream)
-    this.connectRtdsWs();
 
     // Layer 1: CLOB Market WS — connects lazily when first token ID is learned
     // (connecting with no subscriptions causes Polymarket to disconnect us)
@@ -272,17 +227,6 @@ export class TargetTracker {
   }
 
   stop(): void {
-    // Stop RTDS WS
-    if (this.rtdsReconnectTimer) {
-      clearTimeout(this.rtdsReconnectTimer);
-      this.rtdsReconnectTimer = null;
-    }
-    if (this.rtdsWs) {
-      this.rtdsWs.removeAllListeners();
-      this.rtdsWs.close();
-      this.rtdsWs = null;
-    }
-
     // Stop CLOB WS
     if (this.clobWsReconnectTimer) {
       clearTimeout(this.clobWsReconnectTimer);
@@ -342,124 +286,6 @@ export class TargetTracker {
       this.logger.info("First token ID learned, connecting CLOB Market WS...");
       this.connectClobWs();
     }
-  }
-
-  // ==================== RTDS ACTIVITY WEBSOCKET (LAYER 0 — FASTEST) ====================
-
-  private connectRtdsWs(): void {
-    this.logger.info("Connecting to RTDS Activity WebSocket (fastest detection)...");
-
-    this.rtdsWs = new WebSocket("wss://ws-live-data.polymarket.com");
-
-    this.rtdsWs.on("open", () => {
-      this.rtdsConnected = true;
-      this.rtdsReconnectDelay = 1000;
-      this.logger.info("RTDS WebSocket connected");
-
-      // Subscribe to all platform trades
-      this.rtdsWs!.send(JSON.stringify({
-        action: "subscribe",
-        subscriptions: [{ topic: "activity", type: "trades" }],
-      }));
-    });
-
-    this.rtdsWs.on("message", (data: WebSocket.Data) => {
-      const raw = data.toString();
-      if (raw === "pong" || raw === "PONG") return;
-
-      try {
-        const msg = JSON.parse(raw) as RtdsTradeEvent | { type?: string };
-
-        // Respond to server pings
-        if ((msg as { type?: string }).type === "ping") {
-          this.rtdsWs?.send(JSON.stringify({ type: "pong" }));
-          return;
-        }
-
-        // Check if this is a trade event from our target
-        const trade = msg as RtdsTradeEvent;
-        if (!trade.proxyWallet && !trade.proxy_wallet) return;
-
-        const wallet = (trade.proxyWallet || trade.proxy_wallet || "").toLowerCase();
-        if (!this.targetAddresses.has(wallet)) return;
-
-        // This IS our target trader!
-        const side = (trade.side || "").toUpperCase() as "BUY" | "SELL";
-        if (side !== "BUY" && side !== "SELL") return;
-
-        const tokenId = trade.asset || trade.asset_id || "";
-        const conditionId = trade.conditionId || trade.condition_id || "";
-        const priceCents = Math.round((parseFloat(trade.price || "0") || 0) * 100);
-        const shares = parseFloat(trade.size || "0") || 0;
-        const outcome = trade.outcome || trade.outcomeName || "";
-        const title = trade.title || trade.question || "";
-        const timestamp = trade.timestamp
-          ? (Number(trade.timestamp) > 1e12 ? Number(trade.timestamp) : Number(trade.timestamp) * 1000)
-          : Date.now();
-
-        const eventId = `rtds-${conditionId || tokenId}-${timestamp}-${side}`;
-        if (this.seenIds.has(eventId)) return;
-        this.seenIds.add(eventId);
-
-        // Skip trades from before bot started
-        if (timestamp < this.startedAt - 5000) return;
-
-        this.stats.rtdsDetections++;
-
-        this.logger.info("RTDS: Target trade detected (FASTEST)", {
-          side,
-          outcome,
-          price: `${priceCents}¢`,
-          shares: shares.toFixed(1),
-          market: title.slice(0, 60),
-          latency: `${Date.now() - timestamp}ms from match`,
-        });
-
-        // Auto-learn token ID for CLOB WS
-        if (tokenId) {
-          this.watchTokenIds([tokenId]);
-        }
-
-        const detectedTrade: TargetTrade = {
-          id: eventId,
-          side,
-          type: "TRADE",
-          conditionId,
-          tokenId,
-          outcome,
-          priceCents,
-          shares,
-          usdValue: shares * priceCents / 100,
-          title,
-          timestamp,
-          source: "api", // treat as API source (has full metadata)
-        };
-
-        if (this.onTrade) {
-          this.onTrade(detectedTrade);
-        }
-      } catch {
-        // ignore parse errors — RTDS sends various message types
-      }
-    });
-
-    this.rtdsWs.on("close", () => {
-      this.rtdsConnected = false;
-      this.logger.warn("RTDS WebSocket disconnected");
-      this.scheduleRtdsReconnect();
-    });
-
-    this.rtdsWs.on("error", (err: Error) => {
-      this.logger.error("RTDS WebSocket error", { error: err.message });
-      this.rtdsWs?.close();
-    });
-  }
-
-  private scheduleRtdsReconnect(): void {
-    this.rtdsReconnectTimer = setTimeout(() => {
-      this.connectRtdsWs();
-    }, this.rtdsReconnectDelay);
-    this.rtdsReconnectDelay = Math.min(this.rtdsReconnectDelay * 2, 30_000);
   }
 
   // ==================== CLOB MARKET WEBSOCKET (LAYER 1) ====================
@@ -970,25 +796,6 @@ export class TargetTracker {
       return null;
     }
   }
-}
-
-/** RTDS activity/trades event shape (per docs.polymarket.com RTDS docs) */
-interface RtdsTradeEvent {
-  proxyWallet?: string;
-  proxy_wallet?: string;
-  side?: string;
-  asset?: string;
-  asset_id?: string;
-  conditionId?: string;
-  condition_id?: string;
-  price?: string;
-  size?: string;
-  outcome?: string;
-  outcomeName?: string;
-  title?: string;
-  question?: string;
-  transactionHash?: string;
-  timestamp?: string | number;
 }
 
 interface ActivityResponse {
