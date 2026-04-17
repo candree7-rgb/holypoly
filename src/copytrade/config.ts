@@ -49,6 +49,8 @@ export interface CopyTradeConfig {
   maxSlippageCents: number;
   /** Max price willing to pay (cents). Skip if price > this */
   maxPriceCents: number;
+  /** Min price willing to pay (cents). Skip if price < this */
+  minPriceCents: number;
   /** Bump price after this many ms if GTC order not filled (0 = no bump) */
   bumpAfterMs: number;
   /** Max number of price bumps before giving up or falling back to FOK (default 3) */
@@ -187,7 +189,8 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
 
   // Slippage — FOK worst price = leader price + this (default 2¢)
   const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 2);
-  const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 95);
+  const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 98);
+  const minPriceCents = parseNumber("COPY_MIN_PRICE_CENTS", 2);
   const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 5 * 60_000); // 5 min — bump only if still unfilled after a long wait
   const maxBumps = parseNumber("COPY_MAX_BUMPS", 2); // up to 2 bumps (+1¢ each)
   const fokFallback = parseBoolean("COPY_FOK_FALLBACK", true); // FOK as last resort after bumps
@@ -256,6 +259,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     rpcUrl,
     maxSlippageCents,
     maxPriceCents,
+    minPriceCents,
     bumpAfterMs,
     maxBumps,
     fokFallback,

@@ -242,10 +242,14 @@ export class CopyExecutor {
       priceCents = trade.priceCents;
     }
 
-    // Max price check
+    // Price range check (default 2¢–98¢)
     if (priceCents > this.config.maxPriceCents) {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `price_too_high_${priceCents}c` };
+    }
+    if (priceCents < this.config.minPriceCents) {
+      this.totalSkipped++;
+      return { success: false, trade, latencyMs: Date.now() - startMs, reason: `price_too_low_${priceCents}c` };
     }
 
     // Calculate copy size — clamp to minimum rather than skipping
