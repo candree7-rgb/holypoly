@@ -174,24 +174,11 @@ export class TargetTracker {
   }
 
   /**
-   * Adaptive poll interval:
-   * - CLOB WS connected → slow heartbeat (5s) — WS triggers instant polls on trades
-   * - CLOB WS disconnected → fast polling (pollIntervalMs) — sole detection method
+   * Trigger an immediate poll from the CLOB WS.
+   * Separate from the regular interval — this is the speed boost.
    */
-  private getEffectivePollInterval(): number {
-    return this.clobWsConnected ? 5000 : this.pollIntervalMs;
-  }
-
-  private restartPollTimer(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-    }
-    const interval = this.getEffectivePollInterval();
-    this.pollTimer = setInterval(() => this.poll(), interval);
-    this.logger.info("Poll interval adjusted", {
-      interval: `${interval}ms`,
-      reason: this.clobWsConnected ? "WS connected (heartbeat mode)" : "WS disconnected (fast poll mode)",
-    });
+  triggerInstantPoll(): void {
+    this.poll();
   }
 
   /**
@@ -216,10 +203,9 @@ export class TargetTracker {
     // Layer 1: CLOB Market WS (turbo-trigger for known markets)
     this.connectClobWs();
 
-    // Layer 2: Data API heartbeat poll (slow fallback — WS triggers instant polls)
-    // When CLOB WS is connected, this only serves as a safety net (every 5s).
-    // When CLOB WS is disconnected, this switches to fast polling (pollIntervalMs).
-    this.pollTimer = setInterval(() => this.poll(), this.getEffectivePollInterval());
+    // Layer 2: Data API polling (always runs at pollIntervalMs as safety net)
+    // CLOB WS triggers ADDITIONAL instant polls on top of this interval.
+    this.pollTimer = setInterval(() => this.poll(), this.pollIntervalMs);
     this.poll(); // Immediate first poll
 
     // Layer 3: On-chain WebSocket (backup)
@@ -425,9 +411,6 @@ export class TargetTracker {
       this.clobWsReconnectDelay = 1000;
       this.logger.info("CLOB Market WS connected");
 
-      // Switch to slow heartbeat polling (WS handles instant triggers)
-      this.restartPollTimer();
-
       // Subscribe to known tokens
       if (this.watchedTokenIds.size > 0) {
         this.subscribeClobWsTokens();
@@ -482,9 +465,6 @@ export class TargetTracker {
         this.clobWsPingTimer = null;
       }
       this.logger.warn("CLOB Market WS disconnected");
-
-      // Switch to fast polling (WS is down, polling is sole detection)
-      this.restartPollTimer();
       this.scheduleClobWsReconnect();
     });
 
