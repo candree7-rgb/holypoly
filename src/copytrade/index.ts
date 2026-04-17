@@ -53,10 +53,7 @@ async function main() {
     target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
     detection: "CLOB WS (trigger) + API Poll (100ms) + Chain WS (backup)",
     pollInterval: `${config.pollIntervalMs}ms`,
-    strategy: config.speedMode === "fast"
-      ? `FAST: Direct FOK +${config.maxSlippageCents}¢ (lowest latency)`
-      : `GTC (500ms) → FOK +${config.maxSlippageCents}¢ → patient GTC`,
-    speedMode: config.speedMode,
+    strategy: `GTC (500ms) → FAK +${config.maxSlippageCents}¢ → patient GTC`,
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
       : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
       : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
@@ -202,7 +199,7 @@ async function main() {
       `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
       `Balance: $${balance.toFixed(2)}`,
       `Detection: CLOB WS + API Poll + Chain WS`,
-      `Strategy: ${config.speedMode === "fast" ? `FAST FOK +${config.maxSlippageCents}¢` : `GTC → FOK +${config.maxSlippageCents}¢ → patient GTC`}`,
+      `Strategy: GTC → FAK +${config.maxSlippageCents}¢ → patient GTC`,
       `Mode: ${config.dryRun ? "DRY RUN" : "LIVE"}`,
     ].join("\n"),
   );
@@ -276,18 +273,12 @@ async function notifyResult(
     let statusLine: string;
     if (result.reason === "dry_run") {
       statusLine = `DRY RUN · ${result.latencyMs}ms`;
-    } else if (result.reason === "fast_fak_filled") {
-      statusLine = `FAK filled · ${result.latencyMs}ms`;
-    } else if (result.reason === "fast_fak_partial_gtc") {
-      statusLine = `FAK partial + GTC rest · ${result.latencyMs}ms`;
-    } else if (result.reason === "fast_fak_miss_gtc") {
-      statusLine = `FAK empty → GTC placed · ${result.latencyMs}ms`;
     } else if (result.reason === "gtc_instant_fill") {
       statusLine = `GTC instant fill (0% fee) · ${result.latencyMs}ms`;
     } else if (result.reason === "fast_fok_filled") {
       statusLine = `FAST FOK filled · ${result.latencyMs}ms`;
-    } else if (result.reason === "fok_filled") {
-      statusLine = `FOK filled · ${result.latencyMs}ms`;
+    } else if (result.reason === "fak_filled") {
+      statusLine = `FAK filled · ${result.latencyMs}ms`;
     } else if (result.reason === "gtc_pending") {
       statusLine = `Patient GTC placed (0% fee) · ${result.latencyMs}ms`;
     } else {
