@@ -191,7 +191,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const maxSlippageCents = parseNumber("COPY_MAX_SLIPPAGE_CENTS", 3);
   const maxPriceCents = parseNumber("COPY_MAX_PRICE_CENTS", 98);
   const minPriceCents = parseNumber("COPY_MIN_PRICE_CENTS", 2);
-  const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 5 * 60_000); // 5 min — bump only if still unfilled after a long wait
+  const bumpAfterMs = parseNumber("COPY_BUMP_AFTER_MS", 60_000); // 60s — for 5-min markets, bump quickly
   const maxBumps = parseNumber("COPY_MAX_BUMPS", 2); // up to 2 bumps (+1¢ each)
   const fokFallback = parseBoolean("COPY_FOK_FALLBACK", true); // FOK as last resort after bumps
   const speedModeRaw = (getEnv("COPY_SPEED_MODE") ?? "normal").toLowerCase();

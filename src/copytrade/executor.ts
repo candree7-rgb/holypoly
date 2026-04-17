@@ -93,7 +93,7 @@ export class CopyExecutor {
   }> = new Map();
 
   /** Fill timeout — cancel unfilled orders after this many ms (default 15 min) */
-  private fillTimeoutMs = 15 * 60_000;
+  private fillTimeoutMs = 5 * 60_000;
   /** Fill check interval (ms) */
   private fillCheckIntervalMs = 3_000;
   /** Guard against overlapping checkPendingOrders runs */
@@ -325,7 +325,7 @@ export class CopyExecutor {
           const fakResult = await this.clob.placeMarketOrderFAK({
             tokenId: trade.tokenId,
             side,
-            amount: shares * price,
+            amount: shares * worstPrice,
             worstPrice,
           });
           fakOrderId = fakResult.orderIds[0] || null;
@@ -378,7 +378,8 @@ export class CopyExecutor {
           };
         }
 
-        // FAK partially filled or empty — GTC for remainder at leader price
+        // FAK partially filled or empty — GTC for remainder at worstPrice
+        // (leader already ate the level at `price`, so GTC must be above to fill)
         const remaining = shares - fakFilled;
 
         this.lastCopyTime = Date.now();
@@ -390,7 +391,7 @@ export class CopyExecutor {
         const { orderId: gtcId } = await this.clob.placeLimitOrder({
           tokenId: trade.tokenId,
           side,
-          price,
+          price: worstPrice,
           size: remaining,
         });
 
@@ -400,8 +401,8 @@ export class CopyExecutor {
             orderId: gtcId,
             tokenId: trade.tokenId,
             side,
-            price,
-            originalPrice: price,
+            price: worstPrice,
+            originalPrice: worstPrice,
             size: remaining,
             placedAt: now2,
             orderPlacedAt: now2,
@@ -416,7 +417,7 @@ export class CopyExecutor {
           fakFilled: fakFilled.toFixed(1),
           remaining: remaining.toFixed(1),
           fakPrice: `${Math.round(worstPrice * 100)}¢`,
-          gtcPrice: `${priceCents}¢`,
+          gtcPrice: `${Math.round(worstPrice * 100)}¢`,
           latency: `${Date.now() - startMs}ms`,
         });
 
