@@ -65,9 +65,20 @@ export class CopyExecutor {
   private clob: ClobService;
   private config: CopyTradeConfig;
   private logger: Logger;
-  private balance: number = 0; // Free USDC — what we can spend
-  private equity: number = 0; // Total portfolio (USDC + open positions) — for sizing math
+  private balance: number = 0; // Free USDC from CLOB (overwritten by refresh)
+  private equity: number = 0; // Total portfolio (USDC + open positions)
   private lastBalanceCheck: number = 0;
+  /**
+   * In-flight reservations. Kept separate from `balance` so that
+   * background `refreshBalance` can overwrite `balance` from truth
+   * without losing pending reservations. effective = balance - reservedBalance.
+   */
+  private reservedBalance: number = 0;
+
+  /** Free USDC minus any in-flight reservations */
+  private get effectiveBalance(): number {
+    return Math.max(0, this.balance - this.reservedBalance);
+  }
   private windowTrackers: Map<string, WindowTracker> = new Map();
   private lastCopyTime: number = 0;
   private totalCopied = 0;
@@ -83,6 +94,8 @@ export class CopyExecutor {
     orderId: string;
     tokenId: string;
     side: Side;
+    /** Called once when pendingOrder is removed (fill, timeout, or cancel) */
+    onFinalize?: () => void;
     price: number;
     /** Original price at first placement (for slippage tracking) */
     originalPrice: number;
@@ -194,9 +207,9 @@ export class CopyExecutor {
     ]);
 
     // Balance floor — only for BUYs (SELLs don't spend USDC)
-    if (trade.side === "BUY" && this.balance < this.config.minBalanceFloorUsd) {
+    if (trade.side === "BUY" && this.effectiveBalance < this.config.minBalanceFloorUsd) {
       this.totalSkipped++;
-      return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
+      return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.effectiveBalance.toFixed(0)}` };
     }
 
     // Determine price — maximize fill probability while staying maker (0% fee)
@@ -349,7 +362,7 @@ export class CopyExecutor {
       const totalExposure = Array.from(this.windowTrackers.values())
         .filter((w) => w.createdAt > expiryCutoff)
         .reduce((s, w) => s + w.totalUsd, 0);
-      const maxExposure = this.balance * (this.config.maxExposurePct / 100);
+      const maxExposure = this.effectiveBalance * (this.config.maxExposurePct / 100);
       if (totalExposure + copyUsd > maxExposure) {
         this.totalSkipped++;
         return { success: false, trade, latencyMs: Date.now() - startMs, reason: "exposure_limit" };
@@ -363,18 +376,27 @@ export class CopyExecutor {
     //   - Cooldown bypass (burst of trades all see stale lastCopyTime)
     // Must happen BEFORE any await. Rolled back on failure.
     // ═══════════════════════════════════════════════════════════════
-    const reserved = { copyUsd, isBuy: trade.side === "BUY", tracker, rolledBack: false };
+    const reserved = { copyUsd, isBuy: trade.side === "BUY", tracker, rolledBack: false, released: false };
     const rollback = () => {
-      if (reserved.rolledBack) return;
+      if (reserved.rolledBack || reserved.released) return;
       reserved.rolledBack = true;
       if (reserved.isBuy) {
-        this.balance += reserved.copyUsd;
+        this.reservedBalance = Math.max(0, this.reservedBalance - reserved.copyUsd);
         reserved.tracker.totalUsd -= reserved.copyUsd;
       }
       reserved.tracker.copies = Math.max(0, reserved.tracker.copies - 1);
     };
+    // Release reservation on successful fill — CLOB balance drops, refreshBalance
+    // will pick up truth. Until refresh, we stop subtracting this amount from effective.
+    const releaseReservation = () => {
+      if (reserved.released || reserved.rolledBack) return;
+      reserved.released = true;
+      if (reserved.isBuy) {
+        this.reservedBalance = Math.max(0, this.reservedBalance - reserved.copyUsd);
+      }
+    };
     if (reserved.isBuy) {
-      this.balance -= copyUsd;
+      this.reservedBalance += copyUsd;
       tracker.totalUsd += copyUsd;
     }
     tracker.copies++;
@@ -439,7 +461,8 @@ export class CopyExecutor {
 
       // Check if GTC filled instantly (best case: 0% fee)
       if (gtcFilled >= shares * 0.95) {
-        // Reservation already made at top of executeCopy — only count success
+        // Reservation already made at top of executeCopy — release it (CLOB drops balance)
+        releaseReservation();
         this.totalCopied++;
 
         this.logger.info("STEP 1: GTC filled (maker, 0% fee)", {
@@ -495,7 +518,8 @@ export class CopyExecutor {
 
           if (fakResult.filled) {
             const totalFilled = gtcFilled + remaining;
-            // Reservation already made — only count success
+            // Reservation already made — release it (order filled, CLOB balance drops)
+            releaseReservation();
             this.totalCopied++;
 
             this.logger.info("STEP 2: FAK filled", {
@@ -538,7 +562,8 @@ export class CopyExecutor {
       // ─── STEP 3: Patient GTC at leader price ───
       const gtcShares = shares - gtcFilled;
 
-      // Reservation already made at top of executeCopy — only count success
+      // Patient GTC placed — keep reservation live until it fills or times out
+      // (the checkPendingOrders timer handles fill tracking; reservation released in fill callback)
       this.totalCopied++;
 
       const { orderId: patientId } = await this.clob.placeLimitOrder({
@@ -561,6 +586,7 @@ export class CopyExecutor {
           orderPlacedAt: now2,
           bumpCount: 0,
           trade,
+          onFinalize: releaseReservation,
         });
       }
 
@@ -614,6 +640,7 @@ export class CopyExecutor {
         // FILLED (≥95% matched)
         if (filled >= order.size * 0.95) {
           this.pendingOrders.delete(key);
+          order.onFinalize?.();
 
           this.logger.info("Order FILLED (maker, 0% fee)", {
             orderId: order.orderId.slice(0, 12) + "...",
@@ -690,6 +717,9 @@ export class CopyExecutor {
                   orderPlacedAt: now,
                   bumpCount: order.bumpCount + 1,
                 });
+              } else {
+                // Bump re-placement failed — release reservation (no replacement order)
+                order.onFinalize?.();
               }
             } catch (err) {
               this.logger.warn("Bump order placement failed", { error: (err as Error).message });
@@ -706,6 +736,7 @@ export class CopyExecutor {
           now - order.orderPlacedAt >= this.config.bumpAfterMs
         ) {
           this.pendingOrders.delete(key);
+          order.onFinalize?.();
           await this.clob.cancelOrder(order.orderId);
 
           // Get final fill count after cancel
@@ -771,10 +802,7 @@ export class CopyExecutor {
 
           // FOK failed or not needed — emit unfilled/filled based on what we got
           const unfilled = order.size - finalFilled;
-          // Balance refund only for BUYs (we never deducted for SELLs)
-          if (unfilled > 0 && order.side === Side.BUY) {
-            this.balance += unfilled * order.originalPrice;
-          }
+          // Reservation already released via onFinalize; refreshBalance syncs truth from CLOB.
 
           if (finalFilled >= order.size * 0.95) {
             if (this.onFilledCb) {
@@ -807,6 +835,7 @@ export class CopyExecutor {
         // TIMEOUT: final safety net — cancel after fillTimeoutMs regardless
         if (now - order.placedAt >= this.fillTimeoutMs) {
           this.pendingOrders.delete(key);
+          order.onFinalize?.();
           await this.clob.cancelOrder(order.orderId);
 
           let finalFilled = filled;
@@ -824,10 +853,7 @@ export class CopyExecutor {
             elapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
           });
 
-          // Balance refund only for BUYs (we never deducted for SELLs)
-          if (unfilled > 0 && order.side === Side.BUY) {
-            this.balance += unfilled * order.originalPrice;
-          }
+          // Reservation already released via onFinalize; refreshBalance syncs truth from CLOB.
 
           if (finalFilled >= order.size * 0.95) {
             if (this.onFilledCb) {
@@ -907,7 +933,7 @@ export class CopyExecutor {
         const leaderCached = this.leaderBalances.get(trade.leaderAddress) ?? 0;
         const leaderEquity = leaderCached > 0 ? leaderCached : this.config.leaderPortfolioUsd;
         // Use our equity for sizing math, but cap by free USDC for actual spending.
-        const ourEquity = this.equity > 0 ? this.equity : this.balance;
+        const ourEquity = this.equity > 0 ? this.equity : this.effectiveBalance;
         if (leaderEquity > 0 && targetUsd > 0) {
           const leaderPct = targetUsd / leaderEquity;
           copyUsd = ourEquity * leaderPct * multiplier;
@@ -923,7 +949,7 @@ export class CopyExecutor {
 
     copyUsd = Math.min(copyUsd, this.config.maxTradeUsd);
     // Cap by FREE USDC (actual spending capacity) — can't spend locked capital
-    copyUsd = Math.min(copyUsd, this.balance * 0.9);
+    copyUsd = Math.min(copyUsd, this.effectiveBalance * 0.9);
     return Math.max(copyUsd, 0);
   }
 
