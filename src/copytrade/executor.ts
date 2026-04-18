@@ -112,6 +112,16 @@ export class CopyExecutor {
 
     // Always run fill checker — tracks fills AND handles bumps
     setInterval(() => this.checkPendingOrders(), this.fillCheckIntervalMs);
+
+    // Prime balance/equity on startup + refresh every 60s
+    // (hot path only calls refreshBalance when trades fire — without this,
+    // status log shows $0.00 until first trade detected)
+    this.refreshBalance().catch(() => {});
+    this.refreshLeaderBalance().catch(() => {});
+    setInterval(() => {
+      this.refreshBalance().catch(() => {});
+      this.refreshLeaderBalance().catch(() => {});
+    }, 60_000);
   }
 
   /** Register callback for when an order is filled */
