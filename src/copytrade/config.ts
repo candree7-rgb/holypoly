@@ -174,17 +174,33 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
 
   // Target traders — supports multi-leader via COPY_TARGETS=addr:mult,addr:mult
   // or legacy single-leader via COPY_TARGET_ADDRESS + COPY_MULTIPLIER.
+  // Multiplier optional per address (defaults to 1.0). Example:
+  //   COPY_TARGETS=0xAbc:2.0,0xDef,0xGhi:0.5
   const copyTargetsRaw = getEnv("COPY_TARGETS");
   let targets: Array<{ address: string; multiplier: number }> = [];
   if (copyTargetsRaw) {
+    const seen = new Set<string>();
     for (const entry of copyTargetsRaw.split(",")) {
-      const [addr, multStr] = entry.trim().split(":");
-      if (!addr) continue;
+      const parts = entry.split(":");
+      const addrRaw = (parts[0] || "").trim();
+      const multStr = parts[1] ? parts[1].trim() : "";
+      if (!addrRaw) continue;
+      // Validate it's a real Ethereum address
+      let addr: string;
+      try {
+        addr = utils.getAddress(addrRaw).toLowerCase();
+      } catch {
+        throw new ConfigError(`Invalid address in COPY_TARGETS: "${addrRaw}"`);
+      }
+      if (seen.has(addr)) {
+        throw new ConfigError(`Duplicate address in COPY_TARGETS: "${addr}"`);
+      }
+      seen.add(addr);
       const mult = multStr ? parseFloat(multStr) : 1.0;
       if (!Number.isFinite(mult) || mult <= 0) {
-        throw new ConfigError(`Invalid multiplier for target ${addr}: ${multStr}`);
+        throw new ConfigError(`Invalid multiplier for target ${addr}: "${multStr}"`);
       }
-      targets.push({ address: addr.toLowerCase(), multiplier: mult });
+      targets.push({ address: addr, multiplier: mult });
     }
   }
   if (targets.length === 0) {

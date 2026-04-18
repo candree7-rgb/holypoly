@@ -167,7 +167,8 @@ export class CopyExecutor {
     }
 
     // Per-window limit
-    const windowKey = trade.conditionId || trade.tokenId;
+    // Namespace by leader so different leaders don't share maxCopiesPerWindow budgets
+    const windowKey = `${trade.leaderAddress}:${trade.conditionId || trade.tokenId}`;
     const tracker = this.getWindowTracker(windowKey);
     if (tracker.copies >= this.config.maxCopiesPerWindow) {
       this.totalSkipped++;
@@ -355,11 +356,32 @@ export class CopyExecutor {
       }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // SYNCHRONOUS RESERVATION — prevents concurrent races on:
+    //   - Balance double-spend (two leaders sizing against same balance)
+    //   - Exposure limit bypass (two leaders both see 0 prior exposure)
+    //   - Cooldown bypass (burst of trades all see stale lastCopyTime)
+    // Must happen BEFORE any await. Rolled back on failure.
+    // ═══════════════════════════════════════════════════════════════
+    const reserved = { copyUsd, isBuy: trade.side === "BUY", tracker, rolledBack: false };
+    const rollback = () => {
+      if (reserved.rolledBack) return;
+      reserved.rolledBack = true;
+      if (reserved.isBuy) {
+        this.balance += reserved.copyUsd;
+        reserved.tracker.totalUsd -= reserved.copyUsd;
+      }
+      reserved.tracker.copies = Math.max(0, reserved.tracker.copies - 1);
+    };
+    if (reserved.isBuy) {
+      this.balance -= copyUsd;
+      tracker.totalUsd += copyUsd;
+    }
+    tracker.copies++;
+    this.lastCopyTime = startMs;
+
     // DRY RUN
     if (this.config.dryRun) {
-      this.lastCopyTime = Date.now();
-      tracker.copies++;
-      tracker.totalUsd += copyUsd;
       this.totalCopied++;
 
       this.logger.info("DRY RUN — would place GTC limit", {
@@ -417,11 +439,8 @@ export class CopyExecutor {
 
       // Check if GTC filled instantly (best case: 0% fee)
       if (gtcFilled >= shares * 0.95) {
-        this.lastCopyTime = Date.now();
-        tracker.copies++;
-        tracker.totalUsd += copyUsd;
+        // Reservation already made at top of executeCopy — only count success
         this.totalCopied++;
-        if (trade.side === "BUY") this.balance -= copyUsd;
 
         this.logger.info("STEP 1: GTC filled (maker, 0% fee)", {
           side: trade.side,
@@ -476,11 +495,8 @@ export class CopyExecutor {
 
           if (fakResult.filled) {
             const totalFilled = gtcFilled + remaining;
-            this.lastCopyTime = Date.now();
-            tracker.copies++;
-            tracker.totalUsd += copyUsd;
+            // Reservation already made — only count success
             this.totalCopied++;
-            if (trade.side === "BUY") this.balance -= copyUsd;
 
             this.logger.info("STEP 2: FAK filled", {
               side: trade.side,
@@ -522,11 +538,8 @@ export class CopyExecutor {
       // ─── STEP 3: Patient GTC at leader price ───
       const gtcShares = shares - gtcFilled;
 
-      this.lastCopyTime = Date.now();
-      tracker.copies++;
-      tracker.totalUsd += copyUsd;
+      // Reservation already made at top of executeCopy — only count success
       this.totalCopied++;
-      if (trade.side === "BUY") this.balance -= copyUsd;
 
       const { orderId: patientId } = await this.clob.placeLimitOrder({
         tokenId: trade.tokenId,
@@ -571,6 +584,7 @@ export class CopyExecutor {
       const msg = (err as Error).message;
       this.logger.warn("Order failed", { error: msg, outcome: trade.outcome });
       this.totalFailed++;
+      rollback(); // release reserved balance/exposure on failure
       return {
         success: false, trade,
         latencyMs: Date.now() - startMs,

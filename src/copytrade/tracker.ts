@@ -442,6 +442,8 @@ export class TargetTracker {
     // One eth_subscribe per target address (Polygon WS doesn't support OR on topic filters).
     // Each subscription's response ID maps back to the originating leader.
     this.chainSubIdToAddr.clear();
+    // Clear pending req map too — prevents stale req IDs from surviving reconnects
+    (this as unknown as { _pendingChainReqs?: Map<number, string> })._pendingChainReqs = new Map();
     this.targetAddresses.forEach((addr, idx) => {
       const reqId = idx + 1;
       const subscribeMsg = {
@@ -504,8 +506,16 @@ export class TargetTracker {
       const log = msg.params.result;
       if (!log.topics || log.topics.length < 4 || !log.data) return;
 
-      // Resolve which leader this subscription belongs to
-      const leaderAddress = this.chainSubIdToAddr.get(msg.params.subscription || "") ?? this.targetAddress;
+      // Resolve which leader this subscription belongs to.
+      // If unresolved (race: event arrived before subscribe confirmation),
+      // drop the event — the API poll will catch it. Falling back to
+      // targets[0] would misattribute the trade and apply wrong multiplier.
+      const subId = msg.params.subscription || "";
+      const leaderAddress = this.chainSubIdToAddr.get(subId);
+      if (!leaderAddress) {
+        this.logger.warn("Chain event with unresolved subscription — dropping (API poll will catch it)", { subId });
+        return;
+      }
 
       // Decode TransferSingle data: (uint256 id, uint256 value)
       const data = log.data.replace("0x", "");
@@ -748,9 +758,12 @@ export class TargetTracker {
           // Also check if we have a pending chain event for this token (same leader)
           let chainPendingKey: string | null = null;
           for (const [k, p] of this.pendingChainEvents) {
-            if (p.leaderAddress === trade.leaderAddress &&
-              (p.tokenId === trade.tokenId
-                || (Math.abs(p.shares - trade.shares) < 0.1 && Date.now() - p.timestamp < 60000))) {
+            // Require leader + tokenId match AND recent timestamp.
+            // (The old shares-only fallback could drop genuinely distinct trades
+            // on different markets with similar size.)
+            if (p.leaderAddress === trade.leaderAddress
+              && p.tokenId === trade.tokenId
+              && Date.now() - p.timestamp < 60000) {
               chainPendingKey = k;
               break;
             }
