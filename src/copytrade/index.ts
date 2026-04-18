@@ -21,6 +21,7 @@ import { loadCopyTradeConfig } from "./config.js";
 import { TargetTracker } from "./tracker.js";
 import { CopyExecutor, type CopyResult, type FillEvent, type UnfilledEvent } from "./executor.js";
 import { CopyTradeDB } from "./db.js";
+import { ResolutionTracker } from "./resolution.js";
 import { sleep } from "../utils.js";
 import type { Logger } from "../logger.js";
 
@@ -139,6 +140,7 @@ async function main() {
               await db.recordPlacement({
                 orderId: result.orderId,
                 tradeId: trade.id,
+                leaderAddress: trade.leaderAddress,
                 side: trade.side,
                 marketTitle: trade.title,
                 outcome: trade.outcome,
@@ -155,10 +157,11 @@ async function main() {
                 dryRun: result.reason === "dry_run",
               });
             } else if (result.reason && result.reason.startsWith("order_failed")) {
-              await db.recordFailed(trade.id, trade.side, trade.title, result.reason);
+              await db.recordFailed(trade.id, trade.leaderAddress, trade.side, trade.title, result.reason);
             } else if (result.reason && !["cooldown", "sell_filtered", "market_filtered"].includes(result.reason)) {
               await db.recordSkip({
-                tradeId: trade.id, side: trade.side, marketTitle: trade.title,
+                tradeId: trade.id, leaderAddress: trade.leaderAddress,
+                side: trade.side, marketTitle: trade.title,
                 outcome: trade.outcome, reason: result.reason, source: trade.source,
               });
             }
@@ -226,11 +229,70 @@ async function main() {
     });
   }, 60_000);
 
+  // Resolution tracker: polls markets for resolution, updates PNL
+  let resolution: ResolutionTracker | null = null;
+  if (db) {
+    resolution = new ResolutionTracker(db, config.gammaHost, logger);
+    resolution.start(60_000); // check every 60s
+  }
+
+  // Per-leader PNL summary — log every 15min, Telegram every 6h
+  let lastTelegramSummary = Date.now();
+  const pnlInterval = setInterval(async () => {
+    if (!db) return;
+    try {
+      const stats = await db.getLeaderStats();
+      if (stats.length === 0) return;
+
+      // Console log (every 15min)
+      const totalPnl = stats.reduce((s, x) => s + x.realizedPnl, 0);
+      const totalOpen = stats.reduce((s, x) => s + x.openPositionsUsd, 0);
+      logger.info("Per-leader PNL", {
+        totalRealized: `$${totalPnl.toFixed(2)}`,
+        totalOpen: `$${totalOpen.toFixed(2)}`,
+        leaders: stats.map((s) => ({
+          addr: s.leaderAddress.slice(0, 8) + "...",
+          copies: s.copies,
+          spent: `$${s.totalSpentUsd.toFixed(2)}`,
+          pnl: `$${s.realizedPnl.toFixed(2)}`,
+          winRate: `${(s.winRate * 100).toFixed(0)}%`,
+          open: `$${s.openPositionsUsd.toFixed(2)}`,
+        })),
+      });
+
+      // Telegram summary every 6h
+      if (Date.now() - lastTelegramSummary >= 6 * 60 * 60_000) {
+        const lines = [
+          `*📊 PNL Report (per Leader)*`,
+          ``,
+          `Total Realized: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
+          `Open Positions: $${totalOpen.toFixed(2)}`,
+          ``,
+        ];
+        for (const s of stats) {
+          const pnlStr = s.realizedPnl >= 0 ? `+$${s.realizedPnl.toFixed(2)}` : `-$${Math.abs(s.realizedPnl).toFixed(2)}`;
+          lines.push(
+            `\`${s.leaderAddress.slice(0, 8)}...${s.leaderAddress.slice(-4)}\``,
+            `  ${s.filled}/${s.copies} filled · spent $${s.totalSpentUsd.toFixed(0)}`,
+            `  PNL: ${pnlStr} · ${(s.winRate * 100).toFixed(0)}% wins · open $${s.openPositionsUsd.toFixed(0)}`,
+            ``,
+          );
+        }
+        await telegram.send(lines.join("\n"), "pnl_summary");
+        lastTelegramSummary = Date.now();
+      }
+    } catch (err) {
+      logger.warn("PNL summary failed", { error: (err as Error).message });
+    }
+  }, 15 * 60_000);
+
   // Graceful shutdown
   const shutdown = async () => {
     logger.info("Shutting down...");
     tracker.stop();
     clearInterval(statusInterval);
+    clearInterval(pnlInterval);
+    resolution?.stop();
 
     const es = executor.getStats();
     await telegram.send(
@@ -288,9 +350,13 @@ async function notifyResult(
       statusLine = `${result.reason} · ${result.latencyMs}ms`;
     }
 
+    const leaderAddr = result.trade.leaderAddress
+      ? `\`${result.trade.leaderAddress.slice(0, 8)}...${result.trade.leaderAddress.slice(-4)}\``
+      : "?";
     await telegram.send(
       [
         `*Copy Trade ${result.trade.side}${dryTag}*`,
+        `Leader: ${leaderAddr}`,
         `Market: ${result.trade.title.slice(0, 60) || "?"}`,
         `Outcome: ${result.trade.outcome || "?"}`,
         ``,
