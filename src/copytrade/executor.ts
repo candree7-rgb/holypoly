@@ -269,28 +269,26 @@ export class CopyExecutor {
       //   - HTTP error/timeout → skip the trade (safety: no 100% dumps on flaky API)
       //   - HTTP 200 but no matching position → leader closed 100%
       //
-      // Track which case we're in separately.
-      let leaderQueryOk = false;
-      let leaderSize = 0;
-      let ourQueryOk = false;
-      let ourSize = 0;
+      // Query both positions IN PARALLEL to minimize race window
+      // (sequential queries add ~1-2s where leader can do more trades).
+      const [leaderRes, ourRes] = await Promise.allSettled([
+        getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost),
+        getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost),
+      ]);
 
-      try {
-        const pos = await getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost);
-        leaderQueryOk = true;
-        leaderSize = pos?.size || 0;
-      } catch (err) {
+      const leaderQueryOk = leaderRes.status === "fulfilled";
+      const ourQueryOk = ourRes.status === "fulfilled";
+      const leaderSize = leaderQueryOk ? (leaderRes.value?.size || 0) : 0;
+      const ourSize = ourQueryOk ? (ourRes.value?.size || 0) : 0;
+
+      if (!leaderQueryOk) {
         this.logger.warn("Leader position query failed — skipping SELL for safety", {
-          error: (err as Error).message,
+          error: (leaderRes.reason as Error)?.message,
         });
       }
-      try {
-        const pos = await getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost);
-        ourQueryOk = true;
-        ourSize = pos?.size || 0;
-      } catch (err) {
+      if (!ourQueryOk) {
         this.logger.warn("Own position query failed — skipping SELL for safety", {
-          error: (err as Error).message,
+          error: (ourRes.reason as Error)?.message,
         });
       }
 
@@ -318,10 +316,12 @@ export class CopyExecutor {
         ourSellShares: shares.toFixed(1),
       });
 
-      // Don't dust-sell (<1 share)
-      if (shares < 1) {
+      // Don't dust-sell: respect market's min order size (fallback 1 share)
+      const meta = await this.clob.getMarketMeta(trade.tokenId).catch(() => null);
+      const minSize = meta?.minOrderSize || 1;
+      if (shares < minSize) {
         this.totalSkipped++;
-        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "sell_size_dust" };
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: `sell_size_below_min_${minSize}` };
       }
     } else {
       // BUY: standard portfolio/percentage/fixed sizing
@@ -442,9 +442,13 @@ export class CopyExecutor {
         };
       }
 
-      // Cancel GTC before FAK attempt
+      // Cancel GTC before FAK attempt, then re-query fills to avoid double-fill
+      // (fills could have landed between the first check and the cancel)
       if (step1OrderId) {
         await this.clob.cancelOrder(step1OrderId);
+        try {
+          gtcFilled = await this.clob.getFilledShares(step1OrderId);
+        } catch { /* keep previous value */ }
       }
       const remaining = shares - gtcFilled;
 
@@ -743,7 +747,8 @@ export class CopyExecutor {
 
           // FOK failed or not needed — emit unfilled/filled based on what we got
           const unfilled = order.size - finalFilled;
-          if (unfilled > 0) {
+          // Balance refund only for BUYs (we never deducted for SELLs)
+          if (unfilled > 0 && order.side === Side.BUY) {
             this.balance += unfilled * order.originalPrice;
           }
 
@@ -795,7 +800,8 @@ export class CopyExecutor {
             elapsed: `${((now - order.placedAt) / 1000).toFixed(0)}s`,
           });
 
-          if (unfilled > 0) {
+          // Balance refund only for BUYs (we never deducted for SELLs)
+          if (unfilled > 0 && order.side === Side.BUY) {
             this.balance += unfilled * order.originalPrice;
           }
 
