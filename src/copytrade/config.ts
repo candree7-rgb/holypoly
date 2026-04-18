@@ -14,8 +14,15 @@ export interface CopyTradeConfig {
   profileAddress: string;
   apiCreds?: { key: string; secret: string; passphrase: string };
 
-  // Target trader to copy
+  // Target trader(s) to copy
+  /** Legacy single-leader address (kept for backwards compat; equals targets[0].address) */
   targetAddress: string;
+  /**
+   * List of leaders to copy. Each has an address and a multiplier.
+   * Parsed from COPY_TARGETS=0xAddr1:2.0,0xAddr2:1.0 or falls back to
+   * COPY_TARGET_ADDRESS + COPY_MULTIPLIER (single-leader legacy mode).
+   */
+  targets: Array<{ address: string; multiplier: number }>;
 
   // Detection
   /** Polygon WebSocket RPC URL for real-time on-chain detection */
@@ -165,8 +172,28 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     ? { key: apiKey, secret: apiSecret, passphrase: apiPassphrase }
     : undefined;
 
-  // Target trader
-  const targetAddress = requireEnv("COPY_TARGET_ADDRESS").toLowerCase();
+  // Target traders — supports multi-leader via COPY_TARGETS=addr:mult,addr:mult
+  // or legacy single-leader via COPY_TARGET_ADDRESS + COPY_MULTIPLIER.
+  const copyTargetsRaw = getEnv("COPY_TARGETS");
+  let targets: Array<{ address: string; multiplier: number }> = [];
+  if (copyTargetsRaw) {
+    for (const entry of copyTargetsRaw.split(",")) {
+      const [addr, multStr] = entry.trim().split(":");
+      if (!addr) continue;
+      const mult = multStr ? parseFloat(multStr) : 1.0;
+      if (!Number.isFinite(mult) || mult <= 0) {
+        throw new ConfigError(`Invalid multiplier for target ${addr}: ${multStr}`);
+      }
+      targets.push({ address: addr.toLowerCase(), multiplier: mult });
+    }
+  }
+  if (targets.length === 0) {
+    // Legacy single-leader mode
+    const singleAddr = requireEnv("COPY_TARGET_ADDRESS").toLowerCase();
+    const singleMult = parseNumber("COPY_MULTIPLIER", 1.0);
+    targets = [{ address: singleAddr, multiplier: singleMult }];
+  }
+  const targetAddress = targets[0].address; // backwards-compat alias
 
   // Detection
   const rpcWsUrl = getEnv("RPC_WS_URL") ?? "wss://polygon-bor-rpc.publicnode.com";
@@ -246,6 +273,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     profileAddress,
     apiCreds,
     targetAddress,
+    targets,
     rpcWsUrl,
     pollIntervalMs,
     sizingMode,

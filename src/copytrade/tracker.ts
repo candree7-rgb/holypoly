@@ -2,11 +2,13 @@ import WebSocket from "ws";
 import type { Logger } from "../logger.js";
 
 /**
- * A single detected trade from the target trader.
+ * A single detected trade from a target trader.
  */
 export interface TargetTrade {
   /** Unique ID for dedup */
   id: string;
+  /** Address of the leader who made this trade (lowercase) */
+  leaderAddress: string;
   /** BUY or SELL */
   side: "BUY" | "SELL";
   /** TRADE, REDEEM, etc. */
@@ -65,15 +67,20 @@ const padAddress = (addr: string): string => "0x" + addr.replace("0x", "").toLow
 export class TargetTracker {
   private dataApiHost: string;
   private gammaHost: string;
+  /** All target addresses to watch (lowercase) */
+  private targetAddresses: string[];
+  /** First address for logging / backwards-compat with single-leader paths */
   private targetAddress: string;
   private logger: Logger;
   private seenIds: Set<string> = new Set();
   private onTrade: ((trade: TargetTrade) => void) | null = null;
+  /** Per-address last poll cursor (Unix seconds) */
+  private lastPollTimestamps: Map<string, number> = new Map();
 
   // On-chain WebSocket (layer 3 — reliable backup)
   private rpcWsUrl: string;
   private chainWs: WebSocket | null = null;
-  private chainSubId: string | null = null;
+  // chain subscription IDs per leader live in chainSubIdToAddr below
   private chainReconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private chainReconnectDelay = 1000;
   private chainConnected = false;
@@ -91,10 +98,10 @@ export class TargetTracker {
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private pollIntervalMs: number;
   private isPolling = false;
-  private lastPollTimestamp: number = 0;
+  // per-address cursors live in lastPollTimestamps below
 
-  // Pending on-chain events waiting for metadata from API
-  private pendingChainEvents: Map<string, { tokenId: string; shares: number; timestamp: number }> = new Map();
+  // Pending on-chain events waiting for metadata from API (keyed by unique eventId)
+  private pendingChainEvents: Map<string, { leaderAddress: string; tokenId: string; shares: number; timestamp: number }> = new Map();
 
   // Cache: token ID → market metadata (avoid repeated Gamma lookups)
   private marketCache: Map<string, { conditionId: string; title: string; outcome: string; clobTokenId: string } | null> = new Map();
@@ -113,7 +120,8 @@ export class TargetTracker {
 
   constructor(
     dataApiHost: string,
-    targetAddress: string,
+    /** Single target address (backwards-compat) OR array of addresses */
+    targetAddresses: string | string[],
     rpcWsUrl: string,
     pollIntervalMs: number,
     logger: Logger,
@@ -121,12 +129,17 @@ export class TargetTracker {
   ) {
     this.dataApiHost = dataApiHost.replace(/\/$/, "");
     this.gammaHost = (gammaHost ?? "https://gamma-api.polymarket.com").replace(/\/$/, "");
-    this.targetAddress = targetAddress.toLowerCase();
+
+    const addrs = Array.isArray(targetAddresses) ? targetAddresses : [targetAddresses];
+    this.targetAddresses = addrs.map((a) => a.toLowerCase());
+    this.targetAddress = this.targetAddresses[0];
+
     this.rpcWsUrl = rpcWsUrl;
     this.pollIntervalMs = pollIntervalMs;
     this.logger = logger;
     this.startedAt = Date.now();
-    this.lastPollTimestamp = Math.floor(Date.now() / 1000);
+    const startSec = Math.floor(Date.now() / 1000);
+    for (const a of this.targetAddresses) this.lastPollTimestamps.set(a, startSec);
   }
 
   onNewTrade(cb: (trade: TargetTrade) => void): void {
@@ -143,52 +156,62 @@ export class TargetTracker {
     if (this.isInstantChecking) return;
     this.isInstantChecking = true;
     try {
-      const url = new URL(`${this.dataApiHost}/activity`);
-      url.searchParams.set("user", this.targetAddress);
-      url.searchParams.set("type", "TRADE");
-      url.searchParams.set("sortBy", "TIMESTAMP");
-      url.searchParams.set("sortDirection", "ASC");
-      url.searchParams.set("start", String(this.lastPollTimestamp));
-      url.searchParams.set("limit", "10");
-
-      const resp = await fetch(url.toString(), {
-        headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
-        signal: AbortSignal.timeout(1500),
-      });
-      if (!resp.ok) return;
-
-      const body = await resp.json();
-      const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
-      if (!Array.isArray(items) || items.length === 0) return;
-
-      for (const item of items as ActivityResponse[]) {
-        const trade = this.parseActivity(item);
-        if (!trade) continue;
-        if (trade.timestamp < this.startedAt - 5000) { this.seenIds.add(trade.id); continue; }
-        if (this.seenIds.has(trade.id)) continue;
-
-        this.seenIds.add(trade.id);
-        this.stats.apiDetections++;
-
-        const tradeSec = Math.floor(trade.timestamp / 1000);
-        if (tradeSec > this.lastPollTimestamp) {
-          this.lastPollTimestamp = tradeSec;
-        }
-
-        this.logger.info("INSTANT: Target trade detected (WS-triggered)", {
-          side: trade.side,
-          outcome: trade.outcome,
-          price: `${trade.priceCents}¢`,
-          shares: trade.shares.toFixed(1),
-          market: trade.title.slice(0, 60),
+      // Query all target addresses in parallel
+      const fetchForAddr = async (addr: string): Promise<{ addr: string; items: ActivityResponse[] }> => {
+        const startSec = this.lastPollTimestamps.get(addr) ?? Math.floor(Date.now() / 1000);
+        const url = new URL(`${this.dataApiHost}/activity`);
+        url.searchParams.set("user", addr);
+        url.searchParams.set("type", "TRADE");
+        url.searchParams.set("sortBy", "TIMESTAMP");
+        url.searchParams.set("sortDirection", "ASC");
+        url.searchParams.set("start", String(startSec));
+        url.searchParams.set("limit", "10");
+        const resp = await fetch(url.toString(), {
+          headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+          signal: AbortSignal.timeout(1500),
         });
+        if (!resp.ok) return { addr, items: [] };
+        const body = await resp.json();
+        const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
+        return { addr, items: Array.isArray(items) ? items as ActivityResponse[] : [] };
+      };
 
-        if (trade.tokenId) {
-          this.watchTokenIds([trade.tokenId]);
-        }
+      const results = await Promise.allSettled(this.targetAddresses.map(fetchForAddr));
 
-        if (this.onTrade) {
-          this.onTrade(trade);
+      for (const settled of results) {
+        if (settled.status !== "fulfilled") continue;
+        const { addr, items } = settled.value;
+        if (items.length === 0) continue;
+
+        for (const item of items) {
+          const trade = this.parseActivity(item, addr);
+          if (!trade) continue;
+          if (trade.timestamp < this.startedAt - 5000) { this.seenIds.add(trade.id); continue; }
+          if (this.seenIds.has(trade.id)) continue;
+
+          this.seenIds.add(trade.id);
+          this.stats.apiDetections++;
+
+          const tradeSec = Math.floor(trade.timestamp / 1000);
+          const prev = this.lastPollTimestamps.get(addr) ?? 0;
+          if (tradeSec > prev) this.lastPollTimestamps.set(addr, tradeSec);
+
+          this.logger.info("INSTANT: Target trade detected (WS-triggered)", {
+            leader: addr.slice(0, 8) + "...",
+            side: trade.side,
+            outcome: trade.outcome,
+            price: `${trade.priceCents}¢`,
+            shares: trade.shares.toFixed(1),
+            market: trade.title.slice(0, 60),
+          });
+
+          if (trade.tokenId) {
+            this.watchTokenIds([trade.tokenId]);
+          }
+
+          if (this.onTrade) {
+            this.onTrade(trade);
+          }
         }
       }
     } catch {
@@ -410,35 +433,43 @@ export class TargetTracker {
     });
   }
 
+  /** Map subscription ID → leader address for multi-target chain WS */
+  private chainSubIdToAddr: Map<string, string> = new Map();
+
   private subscribeChainEvents(): void {
     if (!this.chainWs || this.chainWs.readyState !== WebSocket.OPEN) return;
 
-    // Subscribe to TransferSingle events where to == targetAddress
-    // topic[0] = TransferSingle sig
-    // topic[1] = operator (any)
-    // topic[2] = from (any)
-    // topic[3] = to (our target)
-    const subscribeMsg = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_subscribe",
-      params: [
-        "logs",
-        {
-          address: CTF_ADDRESS,
-          topics: [
-            TRANSFER_SINGLE_TOPIC,
-            null, // operator: any
-            null, // from: any
-            padAddress(this.targetAddress), // to: target address
-          ],
-        },
-      ],
-    };
+    // One eth_subscribe per target address (Polygon WS doesn't support OR on topic filters).
+    // Each subscription's response ID maps back to the originating leader.
+    this.chainSubIdToAddr.clear();
+    this.targetAddresses.forEach((addr, idx) => {
+      const reqId = idx + 1;
+      const subscribeMsg = {
+        jsonrpc: "2.0",
+        id: reqId,
+        method: "eth_subscribe",
+        params: [
+          "logs",
+          {
+            address: CTF_ADDRESS,
+            topics: [
+              TRANSFER_SINGLE_TOPIC,
+              null, // operator: any
+              null, // from: any
+              padAddress(addr), // to: this specific target
+            ],
+          },
+        ],
+      };
+      this.chainWs!.send(JSON.stringify(subscribeMsg));
+      // Stash the mapping; handler will populate by req ID
+      (this as unknown as { _pendingChainReqs: Map<number, string> })._pendingChainReqs ??= new Map();
+      (this as unknown as { _pendingChainReqs: Map<number, string> })._pendingChainReqs.set(reqId, addr);
+    });
 
-    this.chainWs.send(JSON.stringify(subscribeMsg));
     this.logger.info("Subscribed to CTF TransferSingle events", {
-      target: this.targetAddress.slice(0, 8) + "...",
+      targets: this.targetAddresses.length,
+      addresses: this.targetAddresses.map((a) => a.slice(0, 8) + "...").join(","),
     });
   }
 
@@ -456,10 +487,15 @@ export class TargetTracker {
       subscription?: string;
     };
   }): void {
-    // Subscription confirmation
-    if (msg.id === 1 && msg.result) {
-      this.chainSubId = msg.result;
-      this.logger.info("Chain subscription active", { subId: this.chainSubId });
+    // Subscription confirmation (per-target)
+    if (typeof msg.id === "number" && msg.result) {
+      const pending = (this as unknown as { _pendingChainReqs?: Map<number, string> })._pendingChainReqs;
+      const addr = pending?.get(msg.id);
+      if (addr) {
+        this.chainSubIdToAddr.set(msg.result, addr);
+        pending!.delete(msg.id);
+        this.logger.info("Chain subscription active", { subId: msg.result, leader: addr.slice(0, 8) + "..." });
+      }
       return;
     }
 
@@ -468,8 +504,10 @@ export class TargetTracker {
       const log = msg.params.result;
       if (!log.topics || log.topics.length < 4 || !log.data) return;
 
+      // Resolve which leader this subscription belongs to
+      const leaderAddress = this.chainSubIdToAddr.get(msg.params.subscription || "") ?? this.targetAddress;
+
       // Decode TransferSingle data: (uint256 id, uint256 value)
-      // data = id (32 bytes) + value (32 bytes)
       const data = log.data.replace("0x", "");
       if (data.length < 128) return;
 
@@ -477,13 +515,12 @@ export class TargetTracker {
       const tokenIdBigInt = BigInt("0x" + data.slice(0, 64));
       const tokenIdDecimal = tokenIdBigInt.toString();
       const rawValue = BigInt("0x" + data.slice(64, 128));
-      // CTF tokens use 6 decimals (like USDC)
       const shares = Number(rawValue) / 1e6;
 
       if (shares <= 0) return;
 
       const txHash = log.transactionHash || "";
-      const eventId = `chain-${txHash}-${tokenIdDecimal}`;
+      const eventId = `chain-${leaderAddress}-${txHash}-${tokenIdDecimal}`;
 
       if (this.seenIds.has(eventId)) return;
       this.seenIds.add(eventId);
@@ -491,23 +528,25 @@ export class TargetTracker {
       this.stats.chainEvents++;
 
       this.logger.info("ON-CHAIN: Target received tokens", {
+        leader: leaderAddress.slice(0, 8) + "...",
         tokenId: tokenIdDecimal.slice(0, 16) + "...",
         shares: shares.toFixed(1),
         tx: txHash.slice(0, 12) + "...",
         latency: "~2s (block time)",
       });
 
-      // Store pending event for API dedup (use eventId as key to avoid collision on repeated buys)
+      // Store pending event for API dedup
       this.pendingChainEvents.set(eventId, {
+        leaderAddress,
         tokenId: tokenIdDecimal,
         shares,
         timestamp: Date.now(),
       });
 
       // SPEED: Emit immediately with partial data (executor handles missing metadata).
-      // Gamma lookup runs in background to warm cache for future trades.
       const immediateTrade: TargetTrade = {
         id: eventId,
+        leaderAddress,
         side: "BUY",
         type: "TRADE",
         conditionId: "",
@@ -638,109 +677,116 @@ export class TargetTracker {
     this.stats.totalPolls++;
 
     try {
-      // SPEED: Query both endpoints IN PARALLEL — use whichever responds first with data
-      const makeUrl = (endpoint: string): string => {
+      // For each target address, query /activity and /trades in parallel
+      const makeUrl = (endpoint: string, user: string, startSec: number): string => {
         const url = new URL(`${this.dataApiHost}${endpoint}`);
-        url.searchParams.set("user", this.targetAddress);
+        url.searchParams.set("user", user);
         if (endpoint === "/activity") {
           url.searchParams.set("type", "TRADE");
           url.searchParams.set("sortBy", "TIMESTAMP");
           url.searchParams.set("sortDirection", "ASC");
         }
-        url.searchParams.set("start", String(this.lastPollTimestamp));
+        url.searchParams.set("start", String(startSec));
         url.searchParams.set("limit", "100");
         return url.toString();
       };
 
-      const fetchEndpoint = async (endpoint: string): Promise<ActivityResponse[]> => {
-        const resp = await fetch(makeUrl(endpoint), {
-          headers: {
-            Accept: "application/json",
-            "User-Agent": "holypoly-copytrade",
-          },
-          signal: AbortSignal.timeout(2000),
-        });
-        if (!resp.ok) return [];
-        const body = await resp.json();
-        const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
-        return Array.isArray(items) ? items as ActivityResponse[] : [];
-      };
-
-      // Race both endpoints — first one with data wins
-      const results = await Promise.allSettled([
-        fetchEndpoint("/activity"),
-        fetchEndpoint("/trades"),
-      ]);
-
-      let data: ActivityResponse[] = [];
-      for (const r of results) {
-        if (r.status === "fulfilled" && r.value.length > 0) {
-          data = r.value;
-          break;
-        }
-      }
-
-      if (data.length === 0) {
-        this.stats.consecutiveErrors = 0;
-        return;
-      }
-      this.stats.consecutiveErrors = 0;
-
-      for (const item of data) {
-        const trade = this.parseActivity(item);
-        if (!trade) continue;
-
-        // Skip historical trades from before bot started
-        if (trade.timestamp < this.startedAt - 5000) {
-          this.seenIds.add(trade.id);
-          continue;
-        }
-
-        // Dedup — may have already been detected via chain WS
-        if (this.seenIds.has(trade.id)) continue;
-
-        // Also check if we have a pending chain event for this token
-        // Search by tokenId match OR fuzzy shares+time match
-        let chainPendingKey: string | null = null;
-        for (const [k, p] of this.pendingChainEvents) {
-          if (p.tokenId === trade.tokenId
-            || (Math.abs(p.shares - trade.shares) < 0.1 && Date.now() - p.timestamp < 60000)) {
-            chainPendingKey = k;
+      const fetchForAddress = async (addr: string): Promise<{ addr: string; items: ActivityResponse[] }> => {
+        const startSec = this.lastPollTimestamps.get(addr) ?? Math.floor(Date.now() / 1000);
+        const fetchEndpoint = async (endpoint: string): Promise<ActivityResponse[]> => {
+          const resp = await fetch(makeUrl(endpoint, addr, startSec), {
+            headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!resp.ok) return [];
+          const body = await resp.json();
+          const items = Array.isArray(body) ? body : (body as Record<string, unknown>).data;
+          return Array.isArray(items) ? items as ActivityResponse[] : [];
+        };
+        const results = await Promise.allSettled([
+          fetchEndpoint("/activity"),
+          fetchEndpoint("/trades"),
+        ]);
+        let items: ActivityResponse[] = [];
+        for (const r of results) {
+          if (r.status === "fulfilled" && r.value.length > 0) {
+            items = r.value;
             break;
           }
         }
-        if (chainPendingKey) {
-          // Already emitted via chain — skip API duplicate
-          this.pendingChainEvents.delete(chainPendingKey);
-          this.seenIds.add(trade.id);
+        return { addr, items };
+      };
+
+      // Poll all target addresses in parallel
+      const perAddrResults = await Promise.allSettled(
+        this.targetAddresses.map((addr) => fetchForAddress(addr)),
+      );
+
+      this.stats.consecutiveErrors = 0;
+
+      for (const settled of perAddrResults) {
+        if (settled.status !== "fulfilled") {
+          this.stats.consecutiveErrors++;
           continue;
         }
+        const { addr, items } = settled.value;
+        if (items.length === 0) continue;
 
-        this.seenIds.add(trade.id);
-        this.stats.apiDetections++;
+        for (const item of items) {
+          const trade = this.parseActivity(item, addr);
+          if (!trade) continue;
 
-        // Update poll cursor
-        const tradeSec = Math.floor(trade.timestamp / 1000);
-        if (tradeSec > this.lastPollTimestamp) {
-          this.lastPollTimestamp = tradeSec;
-        }
+          // Skip historical trades from before bot started
+          if (trade.timestamp < this.startedAt - 5000) {
+            this.seenIds.add(trade.id);
+            continue;
+          }
 
-        this.logger.info("API: Target trade detected", {
-          side: trade.side,
-          outcome: trade.outcome,
-          price: `${trade.priceCents}¢`,
-          shares: trade.shares.toFixed(1),
-          usd: `$${trade.usdValue.toFixed(2)}`,
-          market: trade.title.slice(0, 60),
-        });
+          // Dedup — may have already been detected via chain WS
+          if (this.seenIds.has(trade.id)) continue;
 
-        // Auto-learn: watch this token on CLOB WS for future trades
-        if (trade.tokenId) {
-          this.watchTokenIds([trade.tokenId]);
-        }
+          // Also check if we have a pending chain event for this token (same leader)
+          let chainPendingKey: string | null = null;
+          for (const [k, p] of this.pendingChainEvents) {
+            if (p.leaderAddress === trade.leaderAddress &&
+              (p.tokenId === trade.tokenId
+                || (Math.abs(p.shares - trade.shares) < 0.1 && Date.now() - p.timestamp < 60000))) {
+              chainPendingKey = k;
+              break;
+            }
+          }
+          if (chainPendingKey) {
+            this.pendingChainEvents.delete(chainPendingKey);
+            this.seenIds.add(trade.id);
+            continue;
+          }
 
-        if (this.onTrade) {
-          this.onTrade(trade);
+          this.seenIds.add(trade.id);
+          this.stats.apiDetections++;
+
+          // Update per-address poll cursor
+          const tradeSec = Math.floor(trade.timestamp / 1000);
+          const prev = this.lastPollTimestamps.get(addr) ?? 0;
+          if (tradeSec > prev) this.lastPollTimestamps.set(addr, tradeSec);
+
+          this.logger.info("API: Target trade detected", {
+            leader: addr.slice(0, 8) + "...",
+            side: trade.side,
+            outcome: trade.outcome,
+            price: `${trade.priceCents}¢`,
+            shares: trade.shares.toFixed(1),
+            usd: `$${trade.usdValue.toFixed(2)}`,
+            market: trade.title.slice(0, 60),
+          });
+
+          // Auto-learn: watch this token on CLOB WS for future trades
+          if (trade.tokenId) {
+            this.watchTokenIds([trade.tokenId]);
+          }
+
+          if (this.onTrade) {
+            this.onTrade(trade);
+          }
         }
       }
 
@@ -769,9 +815,9 @@ export class TargetTracker {
     }
   }
 
-  private parseActivity(item: ActivityResponse): TargetTrade | null {
+  private parseActivity(item: ActivityResponse, leaderAddress: string): TargetTrade | null {
     try {
-      const id = item.id || `${item.conditionId || item.condition_id}-${item.timestamp}-${item.side}`;
+      const id = item.id || `${leaderAddress}-${item.conditionId || item.condition_id}-${item.timestamp}-${item.side}`;
       const side = (item.side || "").toUpperCase() as "BUY" | "SELL";
       if (side !== "BUY" && side !== "SELL") return null;
 
@@ -791,7 +837,7 @@ export class TargetTracker {
 
       if (!conditionId || !tokenId) return null;
 
-      return { id, side, type, conditionId, tokenId, outcome, priceCents, shares, usdValue, title, timestamp, source: "api" };
+      return { id, leaderAddress, side, type, conditionId, tokenId, outcome, priceCents, shares, usdValue, title, timestamp, source: "api" };
     } catch {
       return null;
     }

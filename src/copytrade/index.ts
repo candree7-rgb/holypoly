@@ -49,14 +49,17 @@ async function main() {
   const runtime = typeof (globalThis as Record<string, unknown>).Bun !== "undefined" ? "Bun" : "Node.js";
   logger.info(`Runtime: ${runtime} ${process.version}`);
 
+  const targetsSummary = config.targets.map((t) =>
+    `${t.address.slice(0, 8)}...${t.address.slice(-4)}×${t.multiplier}`,
+  ).join(", ");
   logger.info("Config loaded", {
-    target: config.targetAddress.slice(0, 8) + "..." + config.targetAddress.slice(-6),
+    targets: `${config.targets.length} leader(s): ${targetsSummary}`,
     detection: "CLOB WS (trigger) + API Poll (100ms) + Chain WS (backup)",
     pollInterval: `${config.pollIntervalMs}ms`,
     strategy: `GTC (500ms) → FAK +${config.maxSlippageCents}¢ → patient GTC`,
     sizing: config.sizingMode === "fixed" ? `$${config.fixedAmountUsd} fixed`
       : config.sizingMode === "shares" ? `${config.fixedShares} shares fixed`
-      : config.sizingMode === "portfolio" ? `portfolio-weighted x${config.copyMultiplier} (dynamic balance)`
+      : config.sizingMode === "portfolio" ? `portfolio-weighted (per-leader multiplier)`
       : `${config.copyAmountPct}% of target`,
     dryRun: config.dryRun,
   });
@@ -110,10 +113,10 @@ async function main() {
     }
   }
 
-  // Init tracker (WebSocket + API polling)
+  // Init tracker (WebSocket + API polling) — pass ALL target addresses
   const tracker = new TargetTracker(
     config.dataApiHost,
-    config.targetAddress,
+    config.targets.map((t) => t.address),
     config.rpcWsUrl,
     config.pollIntervalMs,
     logger,
@@ -196,7 +199,7 @@ async function main() {
   await telegram.send(
     [
       `*CopyTrader Started*`,
-      `Target: \`${config.targetAddress.slice(0, 8)}...${config.targetAddress.slice(-6)}\``,
+      `Targets (${config.targets.length}):\n${config.targets.map((t) => `  • \`${t.address.slice(0, 8)}...${t.address.slice(-4)}\` ×${t.multiplier}`).join("\n")}`,
       `Balance: $${balance.toFixed(2)}`,
       `Detection: CLOB WS + API Poll + Chain WS`,
       `Strategy: GTC → FAK +${config.maxSlippageCents}¢ → patient GTC`,

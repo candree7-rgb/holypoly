@@ -74,9 +74,9 @@ export class CopyExecutor {
   private totalSkipped = 0;
   private totalFailed = 0;
 
-  // Leader balance (fetched dynamically from on-chain)
-  private leaderBalance: number = 0;
-  private lastLeaderBalanceCheck: number = 0;
+  // Per-leader balance cache (keyed by lowercase address)
+  private leaderBalances: Map<string, number> = new Map();
+  private lastLeaderBalanceChecks: Map<string, number> = new Map();
 
   // Track pending GTC orders for fill tracking + bumps
   private pendingOrders: Map<string, {
@@ -178,7 +178,7 @@ export class CopyExecutor {
     const needsOrderbook = trade.source === "chain" || trade.priceCents === 0;
     const [, , obResult] = await Promise.all([
       this.refreshBalance(),
-      this.refreshLeaderBalance(),
+      this.refreshLeaderBalance(trade.leaderAddress),
       needsOrderbook
         ? this.clob.getOrderbook(trade.tokenId).catch((err: Error) => {
             this.logger.warn("Orderbook lookup failed, using 51¢ fallback", {
@@ -282,7 +282,7 @@ export class CopyExecutor {
       // Query both positions IN PARALLEL to minimize race window
       // (sequential queries add ~1-2s where leader can do more trades).
       const [leaderRes, ourRes] = await Promise.allSettled([
-        getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost),
+        getPositionForToken(trade.leaderAddress, trade.tokenId, this.config.dataApiHost),
         getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost),
       ]);
 
@@ -864,9 +864,15 @@ export class CopyExecutor {
    *   2.0 = double the % (2x risk)
    *   0.5 = half the % (conservative)
    */
+  private getMultiplierForLeader(leaderAddress: string): number {
+    const t = this.config.targets.find((t) => t.address === leaderAddress.toLowerCase());
+    return t ? t.multiplier : this.config.copyMultiplier;
+  }
+
   private calculateCopySize(trade: TargetTrade, priceCents: number): number {
     const targetUsd = trade.usdValue > 0 ? trade.usdValue : trade.shares * priceCents / 100;
     const price = priceCents / 100;
+    const multiplier = this.getMultiplierForLeader(trade.leaderAddress);
     let copyUsd: number;
 
     switch (this.config.sizingMode) {
@@ -883,20 +889,16 @@ export class CopyExecutor {
         break;
 
       case "portfolio": {
-        // Use leader's TOTAL equity (USDC + open positions), not just USDC.
-        // Leaders often have most capital in positions — using USDC alone
-        // makes leaderPct huge and our trades oversized.
-        const leaderEquity = this.leaderBalance > 0 ? this.leaderBalance : this.config.leaderPortfolioUsd;
+        // Use THIS leader's TOTAL equity (USDC + open positions), not just USDC.
+        const leaderCached = this.leaderBalances.get(trade.leaderAddress) ?? 0;
+        const leaderEquity = leaderCached > 0 ? leaderCached : this.config.leaderPortfolioUsd;
         // Use our equity for sizing math, but cap by free USDC for actual spending.
         const ourEquity = this.equity > 0 ? this.equity : this.balance;
         if (leaderEquity > 0 && targetUsd > 0) {
-          // What % of their total equity did the leader use?
           const leaderPct = targetUsd / leaderEquity;
-          // Apply same % to our total equity, times multiplier
-          copyUsd = ourEquity * leaderPct * this.config.copyMultiplier;
+          copyUsd = ourEquity * leaderPct * multiplier;
         } else {
-          // Fallback: just copy same USD * multiplier
-          copyUsd = targetUsd * this.config.copyMultiplier;
+          copyUsd = targetUsd * multiplier;
         }
         break;
       }
@@ -939,45 +941,56 @@ export class CopyExecutor {
    * Fetch leader's USDC balance on-chain from Polygon.
    * Called periodically (every 60s) to keep portfolio-weighted sizing accurate.
    */
-  private leaderBalancePromise: Promise<void> | null = null;
+  private leaderBalancePromises: Map<string, Promise<void>> = new Map();
 
-  async refreshLeaderBalance(): Promise<void> {
+  /**
+   * Refresh leader balance(s). If `address` is given, only that leader.
+   * Otherwise refresh all configured targets.
+   */
+  async refreshLeaderBalance(address?: string): Promise<void> {
     if (this.config.sizingMode !== "portfolio") return;
-    const now = Date.now();
-    if (now - this.lastLeaderBalanceCheck < 60_000 && this.leaderBalance > 0) return;
-
-    // Prevent concurrent fetches (avoid spam when many trades fire simultaneously)
-    if (this.leaderBalancePromise) return this.leaderBalancePromise;
-    this.leaderBalancePromise = this._fetchLeaderBalance();
-    try { await this.leaderBalancePromise; } finally { this.leaderBalancePromise = null; }
+    const addrs = address ? [address.toLowerCase()] : this.config.targets.map((t) => t.address);
+    await Promise.allSettled(addrs.map((a) => this.refreshOneLeader(a)));
   }
 
-  private async _fetchLeaderBalance(): Promise<void> {
+  private async refreshOneLeader(addr: string): Promise<void> {
+    const now = Date.now();
+    const last = this.lastLeaderBalanceChecks.get(addr) ?? 0;
+    const cached = this.leaderBalances.get(addr) ?? 0;
+    if (now - last < 60_000 && cached > 0) return;
+
+    // Prevent concurrent fetches per address
+    const existing = this.leaderBalancePromises.get(addr);
+    if (existing) return existing;
+    const p = this._fetchLeaderBalance(addr);
+    this.leaderBalancePromises.set(addr, p);
+    try { await p; } finally { this.leaderBalancePromises.delete(addr); }
+  }
+
+  private async _fetchLeaderBalance(addr: string): Promise<void> {
     const now = Date.now();
     try {
-      // Fetch TOTAL portfolio value: USDC + open positions
-      // (Leader often has most capital in positions, not free USDC)
       const portfolio = await getPortfolioValue(
-        this.config.targetAddress,
+        addr,
         this.config.rpcUrl,
         this.config.dataApiHost,
         this.logger,
       );
 
-      this.leaderBalance = portfolio.total;
-      this.lastLeaderBalanceCheck = now;
+      this.leaderBalances.set(addr, portfolio.total);
+      this.lastLeaderBalanceChecks.set(addr, now);
 
       this.logger.info("Leader portfolio updated", {
-        target: this.config.targetAddress.slice(0, 8) + "...",
+        target: addr.slice(0, 8) + "...",
         usdc: `$${portfolio.usdc.toFixed(2)}`,
         positions: `$${portfolio.positionValue.toFixed(2)}`,
         total: `$${portfolio.total.toFixed(2)}`,
       });
     } catch (err) {
-      this.logger.warn("Failed to fetch leader portfolio", { error: (err as Error).message });
+      this.logger.warn("Failed to fetch leader portfolio", { error: (err as Error).message, target: addr.slice(0, 8) + "..." });
       // Use fallback from config
-      if (this.leaderBalance === 0 && this.config.leaderPortfolioUsd > 0) {
-        this.leaderBalance = this.config.leaderPortfolioUsd;
+      if (!this.leaderBalances.get(addr) && this.config.leaderPortfolioUsd > 0) {
+        this.leaderBalances.set(addr, this.config.leaderPortfolioUsd);
       }
     }
   }
