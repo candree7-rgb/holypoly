@@ -265,30 +265,56 @@ export class CopyExecutor {
     if (trade.side === "SELL") {
       // PROPORTIONAL SELL: sell same % of our position as leader sold of theirs
       //
-      // Leader sold `trade.shares` shares. To know their pre-sell position size,
-      // query their current position (post-sell) and add `trade.shares`.
-      // sellPct = trade.shares / (leaderCurrentSize + trade.shares)
-      // ourSellShares = ourPositionSize * sellPct
-      const [leaderPos, ourPos] = await Promise.all([
-        getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost).catch(() => null),
-        getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost).catch(() => null),
-      ]);
+      // IMPORTANT: distinguish API failure from "position closed"
+      //   - HTTP error/timeout → skip the trade (safety: no 100% dumps on flaky API)
+      //   - HTTP 200 but no matching position → leader closed 100%
+      //
+      // Track which case we're in separately.
+      let leaderQueryOk = false;
+      let leaderSize = 0;
+      let ourQueryOk = false;
+      let ourSize = 0;
 
-      if (!ourPos || ourPos.size <= 0) {
+      try {
+        const pos = await getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost);
+        leaderQueryOk = true;
+        leaderSize = pos?.size || 0;
+      } catch (err) {
+        this.logger.warn("Leader position query failed — skipping SELL for safety", {
+          error: (err as Error).message,
+        });
+      }
+      try {
+        const pos = await getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost);
+        ourQueryOk = true;
+        ourSize = pos?.size || 0;
+      } catch (err) {
+        this.logger.warn("Own position query failed — skipping SELL for safety", {
+          error: (err as Error).message,
+        });
+      }
+
+      if (!leaderQueryOk || !ourQueryOk) {
+        this.totalSkipped++;
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "position_query_failed" };
+      }
+
+      if (ourSize <= 0) {
         this.totalSkipped++;
         return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_position_to_sell" };
       }
 
-      const leaderPreSellSize = (leaderPos?.size || 0) + trade.shares;
+      const leaderPreSellSize = leaderSize + trade.shares;
       const sellPct = leaderPreSellSize > 0 ? trade.shares / leaderPreSellSize : 1;
-      shares = ourPos.size * sellPct;
+      // Defense: never sell more than we own
+      shares = Math.min(ourSize * sellPct, ourSize);
       copyUsd = shares * price;
 
       this.logger.info("PROPORTIONAL SELL calculation", {
         leaderSold: trade.shares.toFixed(1),
-        leaderRemaining: (leaderPos?.size || 0).toFixed(1),
+        leaderRemaining: leaderSize.toFixed(1),
         sellPct: `${(sellPct * 100).toFixed(1)}%`,
-        ourPosition: ourPos.size.toFixed(1),
+        ourPosition: ourSize.toFixed(1),
         ourSellShares: shares.toFixed(1),
       });
 
@@ -351,7 +377,9 @@ export class CopyExecutor {
     // Step 3: If still unfilled → patient GTC at leader price
     //
     const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
-    const worstPrice = price + this.config.maxSlippageCents / 100;
+    // Slippage direction: BUY accepts HIGHER price, SELL accepts LOWER price
+    const slippage = this.config.maxSlippageCents / 100;
+    const worstPrice = trade.side === "BUY" ? price + slippage : Math.max(0.01, price - slippage);
 
     try {
       // ─── STEP 1: GTC at leader's exact price (500ms) ───
@@ -383,7 +411,7 @@ export class CopyExecutor {
         tracker.copies++;
         tracker.totalUsd += copyUsd;
         this.totalCopied++;
-        this.balance -= copyUsd;
+        if (trade.side === "BUY") this.balance -= copyUsd;
 
         this.logger.info("STEP 1: GTC filled (maker, 0% fee)", {
           side: trade.side,
@@ -423,10 +451,12 @@ export class CopyExecutor {
       // ─── STEP 2: FAK at leader price + slippage (partial fills OK) ───
       if (remaining > 0) {
         try {
+          // FAK amount: USD for BUY, shares for SELL (per Polymarket CLOB API)
+          const fakAmount = trade.side === "BUY" ? remaining * worstPrice : remaining;
           const fakResult = await this.clob.placeMarketOrderFAK({
             tokenId: trade.tokenId,
             side,
-            amount: remaining * worstPrice,
+            amount: fakAmount,
             worstPrice,
           });
 
@@ -436,7 +466,7 @@ export class CopyExecutor {
             tracker.copies++;
             tracker.totalUsd += copyUsd;
             this.totalCopied++;
-            this.balance -= copyUsd;
+            if (trade.side === "BUY") this.balance -= copyUsd;
 
             this.logger.info("STEP 2: FAK filled", {
               side: trade.side,
@@ -482,7 +512,7 @@ export class CopyExecutor {
       tracker.copies++;
       tracker.totalUsd += copyUsd;
       this.totalCopied++;
-      this.balance -= copyUsd;
+      if (trade.side === "BUY") this.balance -= copyUsd;
 
       const { orderId: patientId } = await this.clob.placeLimitOrder({
         tokenId: trade.tokenId,
@@ -584,14 +614,23 @@ export class CopyExecutor {
           order.bumpCount < this.config.maxBumps &&
           now - order.orderPlacedAt >= this.config.bumpAfterMs
         ) {
-          const bumpPrice = order.price + this.config.maxSlippageCents / 100;
+          // Bump direction: BUY bumps UP (pay more), SELL bumps DOWN (accept less)
+          const bumpSlip = this.config.maxSlippageCents / 100;
+          const bumpPrice = order.side === Side.BUY
+            ? order.price + bumpSlip
+            : Math.max(0.01, order.price - bumpSlip);
 
-          // Don't bump beyond maxPriceCents
-          if (Math.round(bumpPrice * 100) > this.config.maxPriceCents) {
-            this.logger.info("Bump would exceed max price, skipping to FOK/timeout", {
+          // Don't bump out of valid range (BUY: > max, SELL: < min)
+          const bumpCents = Math.round(bumpPrice * 100);
+          const outOfRange = order.side === Side.BUY
+            ? bumpCents > this.config.maxPriceCents
+            : bumpCents < this.config.minPriceCents;
+          if (outOfRange) {
+            this.logger.info("Bump would exceed price range, skipping to FOK/timeout", {
               orderId: order.orderId.slice(0, 12) + "...",
-              bumpPrice: `${Math.round(bumpPrice * 100)}¢`,
-              maxPrice: `${this.config.maxPriceCents}¢`,
+              side: order.side,
+              bumpPrice: `${bumpCents}¢`,
+              limit: order.side === Side.BUY ? `${this.config.maxPriceCents}¢` : `${this.config.minPriceCents}¢`,
             });
             // Force to timeout/FOK path by setting bumpCount to max
             order.bumpCount = this.config.maxBumps;
@@ -651,7 +690,11 @@ export class CopyExecutor {
 
           if (remaining > 0 && finalFilled < order.size * 0.95) {
             // Try FOK for the remaining unfilled shares
-            const worstPrice = order.price + this.config.maxSlippageCents / 100;
+            // Slippage direction depends on side (BUY = higher, SELL = lower)
+            const slip = this.config.maxSlippageCents / 100;
+            const worstPrice = order.side === Side.BUY
+              ? order.price + slip
+              : Math.max(0.01, order.price - slip);
             this.logger.info("FOK fallback for remaining shares", {
               remaining: remaining.toFixed(1),
               filled: finalFilled.toFixed(1),
@@ -660,10 +703,12 @@ export class CopyExecutor {
             });
 
             try {
+              // FOK amount: USD for BUY, shares for SELL
+              const fokAmount = order.side === Side.BUY ? remaining * worstPrice : remaining;
               const fokResult = await this.clob.placeMarketOrderFOK({
                 tokenId: order.tokenId,
                 side: order.side,
-                amount: remaining * order.price,
+                amount: fokAmount,
                 worstPrice,
               });
 

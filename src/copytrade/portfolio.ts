@@ -72,7 +72,8 @@ export async function getPositionForToken(
     headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
     signal: AbortSignal.timeout(3000),
   });
-  if (!resp.ok) return null;
+  // Throw on HTTP errors so caller can distinguish "no position" from "API failure"
+  if (!resp.ok) throw new Error(`Positions API returned ${resp.status}`);
 
   const data = await resp.json() as Array<{
     asset?: string;
@@ -85,9 +86,10 @@ export async function getPositionForToken(
     outcomeIndex?: number;
     title?: string;
   }>;
-  if (!Array.isArray(data)) return null;
+  if (!Array.isArray(data)) throw new Error("Positions API returned non-array response");
 
   const match = data.find((p) => p.asset === tokenId);
+  // Valid "no position" response — return null (distinguishable from thrown error)
   if (!match || !match.size || match.size <= 0) return null;
 
   return {
@@ -113,7 +115,9 @@ async function fetchPositionValue(proxyWallet: string, dataApiHost: string): Pro
 
   const data = await resp.json() as Array<{ value?: number }>;
   if (!Array.isArray(data) || data.length === 0) return 0;
-  return data[0].value || 0;
+  const first = data[0];
+  if (!first || typeof first !== "object") return 0;
+  return typeof first.value === "number" ? first.value : 0;
 }
 
 async function fetchUsdcBalance(proxyWallet: string, rpcUrl: string): Promise<number> {
