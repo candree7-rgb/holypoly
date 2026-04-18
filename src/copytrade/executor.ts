@@ -1,5 +1,6 @@
 import { Side } from "@polymarket/clob-client";
 import { ClobService } from "../data/clob.js";
+import { getPortfolioValue, getPositionForToken } from "./portfolio.js";
 
 /** USDC.e on Polygon (Polymarket uses this for balances) */
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -64,7 +65,8 @@ export class CopyExecutor {
   private clob: ClobService;
   private config: CopyTradeConfig;
   private logger: Logger;
-  private balance: number = 0;
+  private balance: number = 0; // Free USDC — what we can spend
+  private equity: number = 0; // Total portfolio (USDC + open positions) — for sizing math
   private lastBalanceCheck: number = 0;
   private windowTrackers: Map<string, WindowTracker> = new Map();
   private lastCopyTime: number = 0;
@@ -135,7 +137,9 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: "cooldown" };
     }
 
-    // Filter: only BUY if configured
+    // Filter: SELL handling
+    // If copyBuysOnly is true, skip sells entirely.
+    // Otherwise, we use PROPORTIONAL sell logic (see below) — can't just copy USD amount.
     if (this.config.copyBuysOnly && trade.side !== "BUY") {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: "sell_filtered" };
@@ -178,7 +182,8 @@ export class CopyExecutor {
       this.clob.getMarketMeta(trade.tokenId).catch(() => null),
     ]);
 
-    if (this.balance < this.config.minBalanceFloorUsd) {
+    // Balance floor — only for BUYs (SELLs don't spend USDC)
+    if (trade.side === "BUY" && this.balance < this.config.minBalanceFloorUsd) {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `balance_floor_${this.balance.toFixed(0)}` };
     }
@@ -252,26 +257,67 @@ export class CopyExecutor {
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: `price_too_low_${priceCents}c` };
     }
 
-    // Calculate copy size — clamp to minimum rather than skipping
+    // Calculate copy size
     const price = priceCents / 100;
-    let copyUsd = this.calculateCopySize(trade, priceCents);
-    if (copyUsd < this.config.minTradeUsd) {
-      // Use minimum trade size instead of skipping — we still want to follow the trade
-      copyUsd = this.config.minTradeUsd;
+    let copyUsd: number;
+    let shares: number;
+
+    if (trade.side === "SELL") {
+      // PROPORTIONAL SELL: sell same % of our position as leader sold of theirs
+      //
+      // Leader sold `trade.shares` shares. To know their pre-sell position size,
+      // query their current position (post-sell) and add `trade.shares`.
+      // sellPct = trade.shares / (leaderCurrentSize + trade.shares)
+      // ourSellShares = ourPositionSize * sellPct
+      const [leaderPos, ourPos] = await Promise.all([
+        getPositionForToken(this.config.targetAddress, trade.tokenId, this.config.dataApiHost).catch(() => null),
+        getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost).catch(() => null),
+      ]);
+
+      if (!ourPos || ourPos.size <= 0) {
+        this.totalSkipped++;
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_position_to_sell" };
+      }
+
+      const leaderPreSellSize = (leaderPos?.size || 0) + trade.shares;
+      const sellPct = leaderPreSellSize > 0 ? trade.shares / leaderPreSellSize : 1;
+      shares = ourPos.size * sellPct;
+      copyUsd = shares * price;
+
+      this.logger.info("PROPORTIONAL SELL calculation", {
+        leaderSold: trade.shares.toFixed(1),
+        leaderRemaining: (leaderPos?.size || 0).toFixed(1),
+        sellPct: `${(sellPct * 100).toFixed(1)}%`,
+        ourPosition: ourPos.size.toFixed(1),
+        ourSellShares: shares.toFixed(1),
+      });
+
+      // Don't dust-sell (<1 share)
+      if (shares < 1) {
+        this.totalSkipped++;
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "sell_size_dust" };
+      }
+    } else {
+      // BUY: standard portfolio/percentage/fixed sizing
+      copyUsd = this.calculateCopySize(trade, priceCents);
+      if (copyUsd < this.config.minTradeUsd) {
+        copyUsd = this.config.minTradeUsd;
+      }
+      shares = copyUsd / price;
     }
 
-    // Exposure check (only count trackers from last 5 minutes)
-    const expiryCutoff = Date.now() - 5 * 60_000;
-    const totalExposure = Array.from(this.windowTrackers.values())
-      .filter((w) => w.createdAt > expiryCutoff)
-      .reduce((s, w) => s + w.totalUsd, 0);
-    const maxExposure = this.balance * (this.config.maxExposurePct / 100);
-    if (totalExposure + copyUsd > maxExposure) {
-      this.totalSkipped++;
-      return { success: false, trade, latencyMs: Date.now() - startMs, reason: "exposure_limit" };
+    // Exposure check (only for BUYs — SELLs reduce exposure)
+    if (trade.side === "BUY") {
+      const expiryCutoff = Date.now() - 5 * 60_000;
+      const totalExposure = Array.from(this.windowTrackers.values())
+        .filter((w) => w.createdAt > expiryCutoff)
+        .reduce((s, w) => s + w.totalUsd, 0);
+      const maxExposure = this.balance * (this.config.maxExposurePct / 100);
+      if (totalExposure + copyUsd > maxExposure) {
+        this.totalSkipped++;
+        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "exposure_limit" };
+      }
     }
-
-    const shares = copyUsd / price;
 
     // DRY RUN
     if (this.config.dryRun) {
@@ -776,12 +822,17 @@ export class CopyExecutor {
         break;
 
       case "portfolio": {
-        const leaderBal = this.leaderBalance > 0 ? this.leaderBalance : this.config.leaderPortfolioUsd;
-        if (leaderBal > 0 && targetUsd > 0) {
-          // What % of their balance did the leader use?
-          const leaderPct = targetUsd / leaderBal;
-          // Apply same % to our balance, times multiplier
-          copyUsd = this.balance * leaderPct * this.config.copyMultiplier;
+        // Use leader's TOTAL equity (USDC + open positions), not just USDC.
+        // Leaders often have most capital in positions — using USDC alone
+        // makes leaderPct huge and our trades oversized.
+        const leaderEquity = this.leaderBalance > 0 ? this.leaderBalance : this.config.leaderPortfolioUsd;
+        // Use our equity for sizing math, but cap by free USDC for actual spending.
+        const ourEquity = this.equity > 0 ? this.equity : this.balance;
+        if (leaderEquity > 0 && targetUsd > 0) {
+          // What % of their total equity did the leader use?
+          const leaderPct = targetUsd / leaderEquity;
+          // Apply same % to our total equity, times multiplier
+          copyUsd = ourEquity * leaderPct * this.config.copyMultiplier;
         } else {
           // Fallback: just copy same USD * multiplier
           copyUsd = targetUsd * this.config.copyMultiplier;
@@ -794,6 +845,7 @@ export class CopyExecutor {
     }
 
     copyUsd = Math.min(copyUsd, this.config.maxTradeUsd);
+    // Cap by FREE USDC (actual spending capacity) — can't spend locked capital
     copyUsd = Math.min(copyUsd, this.balance * 0.9);
     return Math.max(copyUsd, 0);
   }
@@ -804,7 +856,18 @@ export class CopyExecutor {
     const now = Date.now();
     if (now - this.lastBalanceCheck < 10_000 && this.balance > 0) return;
     try {
-      this.balance = await this.clob.getBalance();
+      // Fetch both: free USDC (for spending) and total equity (for sizing math)
+      const [clobBalance, portfolio] = await Promise.all([
+        this.clob.getBalance(),
+        getPortfolioValue(
+          this.config.profileAddress,
+          this.config.rpcUrl,
+          this.config.dataApiHost,
+          this.logger,
+        ).catch(() => null),
+      ]);
+      this.balance = clobBalance; // free USDC = what we can spend
+      this.equity = portfolio ? portfolio.total : clobBalance; // total for sizing
       this.lastBalanceCheck = now;
     } catch (err) {
       this.logger.warn("Balance check failed", { error: (err as Error).message });
@@ -831,37 +894,26 @@ export class CopyExecutor {
   private async _fetchLeaderBalance(): Promise<void> {
     const now = Date.now();
     try {
-      // ERC-20 balanceOf(address) selector = 0x70a08231
-      const paddedAddr = this.config.targetAddress.replace("0x", "").toLowerCase().padStart(64, "0");
-      const callData = "0x70a08231" + paddedAddr;
+      // Fetch TOTAL portfolio value: USDC + open positions
+      // (Leader often has most capital in positions, not free USDC)
+      const portfolio = await getPortfolioValue(
+        this.config.targetAddress,
+        this.config.rpcUrl,
+        this.config.dataApiHost,
+        this.logger,
+      );
 
-      const resp = await fetch(this.config.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: 1,
-          method: "eth_call",
-          params: [
-            { to: USDC_ADDRESS, data: callData },
-            "latest",
-          ],
-        }),
+      this.leaderBalance = portfolio.total;
+      this.lastLeaderBalanceCheck = now;
+
+      this.logger.info("Leader portfolio updated", {
+        target: this.config.targetAddress.slice(0, 8) + "...",
+        usdc: `$${portfolio.usdc.toFixed(2)}`,
+        positions: `$${portfolio.positionValue.toFixed(2)}`,
+        total: `$${portfolio.total.toFixed(2)}`,
       });
-
-      const data = (await resp.json()) as { result?: string };
-      if (data.result) {
-        const raw = BigInt(data.result);
-        this.leaderBalance = Number(raw) / 1e6; // USDC has 6 decimals
-        this.lastLeaderBalanceCheck = now;
-
-        this.logger.info("Leader USDC balance updated", {
-          target: this.config.targetAddress.slice(0, 8) + "...",
-          balance: `$${this.leaderBalance.toFixed(2)}`,
-        });
-      }
     } catch (err) {
-      this.logger.warn("Failed to fetch leader balance", { error: (err as Error).message });
+      this.logger.warn("Failed to fetch leader portfolio", { error: (err as Error).message });
       // Use fallback from config
       if (this.leaderBalance === 0 && this.config.leaderPortfolioUsd > 0) {
         this.leaderBalance = this.config.leaderPortfolioUsd;

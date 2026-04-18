@@ -200,7 +200,7 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   // Filters
   const marketFilterRaw = getEnv("COPY_MARKET_FILTER") ?? "";
   const marketFilter = marketFilterRaw ? marketFilterRaw.split(",").map((s) => s.trim().toLowerCase()) : [];
-  const copyBuysOnly = parseBoolean("COPY_BUYS_ONLY", true);
+  const copyBuysOnly = parseBoolean("COPY_BUYS_ONLY", false);
   const copyRedemptions = parseBoolean("COPY_REDEMPTIONS", false);
 
   // Risk
