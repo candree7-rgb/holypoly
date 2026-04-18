@@ -131,8 +131,8 @@ export class CopyExecutor {
   async executeCopy(trade: TargetTrade): Promise<CopyResult> {
     const startMs = Date.now();
 
-    // Cooldown check
-    if (startMs - this.lastCopyTime < this.config.cooldownMs) {
+    // Cooldown check — BUYs only (SELLs are risk-reducing, always execute)
+    if (trade.side === "BUY" && startMs - this.lastCopyTime < this.config.cooldownMs) {
       this.totalSkipped++;
       return { success: false, trade, latencyMs: Date.now() - startMs, reason: "cooldown" };
     }
