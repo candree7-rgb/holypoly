@@ -87,6 +87,7 @@ export interface Config {
 
   // Redeem-only mode (disables all trading, WebSockets, Telegram)
   redeemOnly: boolean;
+  redeemIntervalMinutes: number;
 
   // Auto-redeem
   autoRedeem: boolean;
@@ -334,6 +335,7 @@ export const loadConfig = (): Config => {
 
   // Redeem-only mode
   const redeemOnly = parseBoolean("REDEEM_ONLY", false);
+  const redeemIntervalMinutes = parseNumber("REDEEM_INTERVAL_MINUTES", 29);
 
   // Database (optional in redeem-only mode)
   const databaseUrl = redeemOnly ? (getEnv("DATABASE_URL") ?? "") : requireEnv("DATABASE_URL");
@@ -487,6 +489,7 @@ export const loadConfig = (): Config => {
     minBalanceFloorUsd,
     databaseUrl,
     redeemOnly,
+    redeemIntervalMinutes,
     autoRedeem,
     relayerUrl,
     relayerTxType,

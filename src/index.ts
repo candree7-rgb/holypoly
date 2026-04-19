@@ -56,7 +56,8 @@ const main = async () => {
     logger.info("=== HolyPoly REDEEM-ONLY Mode ===");
     logger.info("Trading, WebSockets, and Telegram are disabled. Only auto-redeem is active.");
 
-    const REDEEM_ONLY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    const intervalMs = config.redeemIntervalMinutes * 60 * 1000;
+    logger.info(`Redeem interval: ${config.redeemIntervalMinutes} minutes`);
 
     const dataApi = new DataApiClient(config.dataApiHost, logger);
     const redeemService = RedeemService.init(
@@ -80,30 +81,17 @@ const main = async () => {
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
 
-    // Run redeem at xx:04, xx:09, xx:14, xx:19, ... (1 min before each 5-min mark)
-    // Track redeemed conditions in-memory to avoid re-submitting
     const redeemedConditions = new Set<string>();
     let rateLimitedUntil = 0;
 
-    const msUntilNextRun = () => {
-      const now = Date.now();
-      if (rateLimitedUntil > now) return rateLimitedUntil - now;
-      // Schedule at xx:04, xx:09, xx:14, xx:19, ... (1 min before each 5-min mark)
-      const d = new Date(now);
-      const min = d.getMinutes();
-      const mod = min % 5;
-      const offset = mod <= 4 ? (4 - mod) : (4 - mod + 5); // minutes until next min%5===4
-      const target = new Date(d);
-      target.setMinutes(min + (offset === 0 ? 5 : offset), 0, 0); // if exactly on xx:04, go to next
-      const ms = target.getTime() - now;
-      logger.info(`Next redeem at ${target.toISOString()} (in ${Math.round(ms / 1000)}s)`);
-      return ms;
-    };
-
     while (true) {
-      await sleep(msUntilNextRun());
-
-      if (Date.now() < rateLimitedUntil) continue;
+      const waitMs = rateLimitedUntil > Date.now()
+        ? rateLimitedUntil - Date.now()
+        : intervalMs;
+      const nextRun = new Date(Date.now() + waitMs);
+      logger.info(`Next redeem at ${nextRun.toISOString()} (in ${Math.round(waitMs / 1000)}s)`);
+      await sleep(waitMs);
+      rateLimitedUntil = 0;
 
       try {
         const positions = await dataApi.getPositions(config.profileAddress, true);
