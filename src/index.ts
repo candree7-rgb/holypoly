@@ -83,11 +83,25 @@ const main = async () => {
 
     const redeemedConditions = new Set<string>();
     let rateLimitedUntil = 0;
+    const interval = config.redeemIntervalMinutes;
+
+    // Schedule at xx:29, xx:59 (for 30min) or xx:04, xx:09 (for 5min) etc.
+    // Always 1 minute before each interval boundary
+    const msUntilNextSlot = () => {
+      if (rateLimitedUntil > Date.now()) return rateLimitedUntil - Date.now();
+      const now = new Date();
+      const min = now.getMinutes();
+      // Target minute: (interval - 1) past each interval boundary
+      // e.g. interval=30 → targets 29, 59 | interval=5 → targets 4, 9, 14, 19...
+      const targetMin = min + ((interval - 1 - (min % interval)) + interval) % interval;
+      const target = new Date(now);
+      target.setMinutes(targetMin, 0, 0);
+      if (target.getTime() <= now.getTime()) target.setMinutes(target.getMinutes() + interval);
+      return target.getTime() - now.getTime();
+    };
 
     while (true) {
-      const waitMs = rateLimitedUntil > Date.now()
-        ? rateLimitedUntil - Date.now()
-        : intervalMs;
+      const waitMs = msUntilNextSlot();
       const nextRun = new Date(Date.now() + waitMs);
       logger.info(`Next redeem at ${nextRun.toISOString()} (in ${Math.round(waitMs / 1000)}s)`);
       await sleep(waitMs);
