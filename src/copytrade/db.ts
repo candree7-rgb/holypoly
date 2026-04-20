@@ -171,12 +171,13 @@ export class CopyTradeDB {
     conditionId: string;
     tokenId: string;
     outcome: string;
+    marketTitle: string;
     filledShares: number;
     filledUsd: number;
     side: string;
   }>> {
     const result = await this.pool.query(
-      `SELECT id, leader_address, condition_id, token_id, outcome, filled_shares, filled_usd, side
+      `SELECT id, leader_address, condition_id, token_id, outcome, market_title, filled_shares, filled_usd, side
        FROM copy_trades
        WHERE status = 'filled'
          AND resolved_at IS NULL
@@ -193,6 +194,7 @@ export class CopyTradeDB {
       conditionId: r.condition_id,
       tokenId: r.token_id,
       outcome: r.outcome,
+      marketTitle: r.market_title || "",
       filledShares: parseFloat(r.filled_shares) || 0,
       filledUsd: parseFloat(r.filled_usd) || 0,
       side: r.side,

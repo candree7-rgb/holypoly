@@ -21,7 +21,7 @@ import { loadCopyTradeConfig } from "./config.js";
 import { TargetTracker } from "./tracker.js";
 import { CopyExecutor, type CopyResult, type FillEvent, type UnfilledEvent } from "./executor.js";
 import { CopyTradeDB } from "./db.js";
-import { ResolutionTracker } from "./resolution.js";
+import { ResolutionTracker, type ResolutionEvent } from "./resolution.js";
 import { sleep } from "../utils.js";
 import type { Logger } from "../logger.js";
 
@@ -233,6 +233,28 @@ async function main() {
   let resolution: ResolutionTracker | null = null;
   if (db) {
     resolution = new ResolutionTracker(db, config.gammaHost, logger);
+
+    // Win/Loss Telegram notification per resolved trade
+    resolution.onTradeResolved((event: ResolutionEvent) => {
+      const emoji = event.won ? "✅" : "❌";
+      const result = event.won ? "WON" : "LOST";
+      const pnlStr = event.pnl >= 0 ? `+$${event.pnl.toFixed(2)}` : `-$${Math.abs(event.pnl).toFixed(2)}`;
+      const leader = `\`${event.leaderAddress.slice(0, 8)}...${event.leaderAddress.slice(-4)}\``;
+
+      telegram.send(
+        [
+          `${emoji} *${result}* — ${event.market.slice(0, 50)}`,
+          `Leader: ${leader}`,
+          `Outcome: ${event.outcome}`,
+          `Shares: ${event.filledShares.toFixed(1)} · Cost: $${event.costUsd.toFixed(2)} · Payout: $${event.payoutUsd.toFixed(2)}`,
+          `*PNL: ${pnlStr}*`,
+        ].join("\n"),
+        "resolution",
+      ).catch((err) => {
+        logger.warn("TG resolution notify failed", { error: (err as Error).message });
+      });
+    });
+
     resolution.start(60_000); // check every 60s
   }
 
@@ -260,25 +282,35 @@ async function main() {
         })),
       });
 
-      // Telegram summary every 6h
-      if (Date.now() - lastTelegramSummary >= 6 * 60 * 60_000) {
+      // Telegram daily summary (every 24h)
+      if (Date.now() - lastTelegramSummary >= 24 * 60 * 60_000) {
+        const todayStats = await db.getLeaderStats(24);
+        const todayPnl = todayStats.reduce((s, x) => s + x.realizedPnl, 0);
+        const todayFilled = todayStats.reduce((s, x) => s + x.filled, 0);
+        const todayCopies = todayStats.reduce((s, x) => s + x.copies, 0);
+        const todayWinRate = todayStats.length > 0
+          ? todayStats.reduce((s, x) => s + x.winRate, 0) / todayStats.length : 0;
+
         const lines = [
-          `*📊 PNL Report (per Leader)*`,
+          `*📊 Daily PNL Report*`,
           ``,
-          `Total Realized: ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`,
-          `Open Positions: $${totalOpen.toFixed(2)}`,
+          `Balance: $${(await executor.getStats().balance).toFixed(2)}`,
+          `Today: ${todayFilled}/${todayCopies} trades filled`,
+          `Total PNL: ${todayPnl >= 0 ? "+" : ""}$${todayPnl.toFixed(2)}`,
+          `Win Rate: ${(todayWinRate * 100).toFixed(0)}%`,
+          `Open: $${totalOpen.toFixed(2)}`,
           ``,
+          `*Per Leader (24h):*`,
         ];
-        for (const s of stats) {
+        for (const s of todayStats) {
           const pnlStr = s.realizedPnl >= 0 ? `+$${s.realizedPnl.toFixed(2)}` : `-$${Math.abs(s.realizedPnl).toFixed(2)}`;
+          const emoji = s.realizedPnl >= 0 ? "🟢" : "🔴";
           lines.push(
-            `\`${s.leaderAddress.slice(0, 8)}...${s.leaderAddress.slice(-4)}\``,
-            `  ${s.filled}/${s.copies} filled · spent $${s.totalSpentUsd.toFixed(0)}`,
-            `  PNL: ${pnlStr} · ${(s.winRate * 100).toFixed(0)}% wins · open $${s.openPositionsUsd.toFixed(0)}`,
-            ``,
+            `${emoji} \`${s.leaderAddress.slice(0, 8)}...${s.leaderAddress.slice(-4)}\``,
+            `   ${s.filled} trades · ${pnlStr} · ${(s.winRate * 100).toFixed(0)}% wins`,
           );
         }
-        await telegram.send(lines.join("\n"), "pnl_summary");
+        await telegram.send(lines.join("\n"), "daily_summary");
         lastTelegramSummary = Date.now();
       }
     } catch (err) {

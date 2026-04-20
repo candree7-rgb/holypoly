@@ -1,17 +1,22 @@
 import type { Logger } from "../logger.js";
 import type { CopyTradeDB } from "./db.js";
 
+export interface ResolutionEvent {
+  leaderAddress: string;
+  market: string;
+  outcome: string;
+  side: string;
+  won: boolean;
+  filledShares: number;
+  costUsd: number;
+  payoutUsd: number;
+  pnl: number;
+}
+
 /**
  * Polls Polymarket Gamma API to detect resolved markets, then updates
- * DB rows with payout + realized PNL. Runs on an interval.
- *
- * Resolution logic:
- *   - For each filled BUY trade with unresolved condition_id:
- *     - Query Gamma /markets/{conditionId}
- *     - If resolved: payout = shares × 1.00 if our outcome won, else 0
- *     - realized_pnl = payout - filled_usd (cost basis)
- *   - SELL trades are treated as already-realized (realized_pnl = filled_usd - 0 from prior buy)
- *     Actually simpler: we just store the SELL side as proceeds and match in aggregation.
+ * DB rows with payout + realized PNL. Emits resolution events for
+ * Telegram notifications.
  */
 export class ResolutionTracker {
   private db: CopyTradeDB;
@@ -20,11 +25,16 @@ export class ResolutionTracker {
   private timer: ReturnType<typeof setInterval> | null = null;
   private marketCache: Map<string, ResolvedMarket | null> = new Map();
   private isChecking = false;
+  private onResolved: ((event: ResolutionEvent) => void) | null = null;
 
   constructor(db: CopyTradeDB, gammaHost: string, logger: Logger) {
     this.db = db;
     this.gammaHost = gammaHost.replace(/\/$/, "");
     this.logger = logger;
+  }
+
+  onTradeResolved(cb: (event: ResolutionEvent) => void): void {
+    this.onResolved = cb;
   }
 
   start(intervalMs = 60_000): void {
@@ -78,6 +88,20 @@ export class ResolutionTracker {
 
           await this.db.recordResolution(trade.id, market.winningOutcome, payout, pnl);
           resolvedCount++;
+
+          if (this.onResolved) {
+            this.onResolved({
+              leaderAddress: trade.leaderAddress,
+              market: trade.marketTitle,
+              outcome: trade.outcome,
+              side: trade.side,
+              won,
+              filledShares: trade.filledShares,
+              costUsd: trade.filledUsd,
+              payoutUsd: payout,
+              pnl,
+            });
+          }
         }
       }
 
