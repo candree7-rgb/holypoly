@@ -17,11 +17,15 @@ export class TelegramNotifier {
   private alertWindowStart = Date.now();
   private maxAlertsPerWindow = 15;
 
+  private prefix: string;
+
   constructor(
     private token: string | undefined,
     private chatId: string | undefined,
     private logger: Logger,
+    prefix = "🤖",
   ) {
+    this.prefix = prefix;
     this.enabled = Boolean(token && chatId);
     this.apiUrl = token
       ? `https://api.telegram.org/bot${token}/sendMessage`
@@ -70,13 +74,15 @@ export class TelegramNotifier {
     if (!this.enabled) return false;
     if (alertType && !this.shouldSend(alertType)) return false;
 
+    const prefixed = `${this.prefix} ${message}`;
+
     try {
       let resp = await fetch(this.apiUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: this.chatId,
-          text: message,
+          text: prefixed,
           parse_mode: "Markdown",
         }),
       });
@@ -91,7 +97,7 @@ export class TelegramNotifier {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             chat_id: this.chatId,
-            text: message,
+            text: prefixed,
           }),
         });
         if (!resp.ok) {

@@ -75,14 +75,15 @@ export class RiskManager {
 
   /**
    * Get effective buy percentage, scaled by balance tier.
-   * Prevents oversized orders that exceed orderbook depth.
+   * Convergence arb: 5% default, scales down at higher balances
+   * to prevent orderbook depth issues.
    */
   getEffectiveBuyPct(balance: number): number {
     const base = this.config.buyAmountPct;
-    if (balance <= 1000) return base;
-    if (balance <= 5000) return base * 0.5;
-    if (balance <= 20000) return base * 0.25;
-    return base * 0.1; // $20k+: 0.4% = $80 max per order at $20k
+    if (balance <= 2000) return base;           // ≤$2k: full 5% = $100 max
+    if (balance <= 10000) return base * 0.6;    // $2-10k: 3% = $300 max
+    if (balance <= 50000) return base * 0.3;    // $10-50k: 1.5% = $750 max
+    return base * 0.15;                          // $50k+: 0.75% = $375 max per order
   }
 
   /**

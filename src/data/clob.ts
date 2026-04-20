@@ -167,9 +167,11 @@ export class ClobService {
   private roundToTick(price: number, tickSize: TickSize, side: Side): number {
     const tick = Number(tickSize);
     if (!Number.isFinite(tick) || tick <= 0) return price;
-    const factor = 1 / tick;
-    const raw = price * factor;
-    const rounded = side === Side.BUY ? Math.floor(raw) : Math.ceil(raw);
+    // Use integer math to avoid floating-point precision issues
+    const factor = Math.round(1 / tick);
+    const raw = Math.round(price * factor * 1e8) / 1e8; // avoid fp drift
+    // Round toward fill: BUY rounds UP (willing to pay more), SELL rounds DOWN (willing to accept less)
+    const rounded = side === Side.BUY ? Math.ceil(raw) : Math.floor(raw);
     const result = rounded / factor;
     const decimals = tickSize.includes("0.0001")
       ? 4
@@ -189,7 +191,7 @@ export class ClobService {
     side: Side;
     price: number;
     size: number;
-  }): Promise<void> {
+  }): Promise<{ orderId: string }> {
     const { tokenId, side } = params;
     const meta = await this.getMarketMeta(tokenId);
 
@@ -197,12 +199,7 @@ export class ClobService {
     const size = params.size;
 
     if (size < meta.minOrderSize) {
-      this.logger.warn("Order size below minimum", {
-        tokenId,
-        size,
-        min: meta.minOrderSize,
-      });
-      return;
+      throw new Error(`Order size ${size} below minimum ${meta.minOrderSize}`);
     }
 
     const resp = await this.client.createAndPostOrder(
@@ -221,11 +218,127 @@ export class ClobService {
     if (resp?.status && resp.status >= 400) {
       throw new Error(`Order failed (status ${resp.status})`);
     }
+    return { orderId: (resp as Record<string, unknown>)?.orderID as string ?? "" };
+  }
+
+  /**
+   * Place a limit order (GTC, maker = 0% fee) and wait for fill.
+   * If not filled within timeoutMs, cancel and fallback to FOK (taker).
+   * Returns whether the fill was maker (0% fee) or taker.
+   */
+  async placeLimitThenFOK(params: {
+    tokenId: string;
+    side: Side;
+    price: number;
+    size: number;
+    timeoutMs?: number;
+  }): Promise<{ filled: boolean; orderIds: string[]; maker: boolean }> {
+    const timeoutMs = params.timeoutMs ?? 1500;
+    const meta = await this.getMarketMeta(params.tokenId);
+    const price = this.roundToTick(params.price, meta.tickSize, params.side);
+
+    if (params.size < meta.minOrderSize) {
+      this.logger.warn("Order size below minimum", {
+        tokenId: params.tokenId,
+        size: params.size,
+        min: meta.minOrderSize,
+      });
+      return { filled: false, orderIds: [], maker: false };
+    }
+
+    // Step 1: Place limit order (maker = 0% fee on Polymarket crypto markets)
+    let orderId: string | null = null;
+    try {
+      const resp = await this.client.createAndPostOrder(
+        {
+          tokenID: params.tokenId,
+          price,
+          side: params.side,
+          size: params.size,
+        },
+        { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        OrderType.GTC,
+      );
+      if (resp?.error) throw new Error(resp.error);
+      orderId = resp?.orderID ?? null;
+    } catch (err) {
+      this.logger.warn("Limit order placement failed, trying FOK", {
+        error: (err as Error).message,
+      });
+    }
+
+    if (!orderId) {
+      // Limit order failed — fallback to FOK immediately
+      const fokResult = await this.placeMarketOrderFOK({
+        tokenId: params.tokenId,
+        side: params.side,
+        amount: params.size * price,
+        worstPrice: price + 0.01,
+      });
+      return { ...fokResult, maker: false };
+    }
+
+    // Step 2: Poll for fill within timeout
+    const pollInterval = 300;
+    const maxPolls = Math.ceil(timeoutMs / pollInterval);
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise((r) => setTimeout(r, pollInterval));
+      try {
+        const filled = await this.getFilledShares(orderId);
+        if (filled >= params.size * 0.95) {
+          this.logger.info("Limit order filled (maker, 0% fee)", {
+            tokenId: params.tokenId.slice(0, 12) + "...",
+            price,
+            size: params.size,
+            filled,
+          });
+          return { filled: true, orderIds: [orderId], maker: true };
+        }
+      } catch {
+        // poll error, continue
+      }
+    }
+
+    // Step 3: Not filled — cancel limit order and fallback to FOK
+    this.logger.info("Limit order not filled, cancelling → FOK fallback", {
+      tokenId: params.tokenId.slice(0, 12) + "...",
+      timeoutMs,
+    });
+    await this.cancelOrder(orderId);
+
+    // Check if partially filled before FOK
+    let partialShares = 0;
+    try {
+      partialShares = await this.getFilledShares(orderId);
+    } catch {
+      // ignore
+    }
+
+    const remainingSize = params.size - partialShares;
+    if (remainingSize < meta.minOrderSize) {
+      // Mostly filled as maker — good enough
+      return { filled: partialShares > 0, orderIds: [orderId], maker: true };
+    }
+
+    // FOK for remaining unfilled portion
+    const fokResult = await this.placeMarketOrderFOK({
+      tokenId: params.tokenId,
+      side: params.side,
+      amount: remainingSize * price,
+      worstPrice: price + 0.01,
+    });
+
+    const allOrderIds = [orderId, ...fokResult.orderIds];
+    return {
+      filled: fokResult.filled || partialShares > 0,
+      orderIds: allOrderIds,
+      maker: false, // mixed or taker
+    };
   }
 
   /**
    * Place a FOK (Fill or Kill) market order — fills immediately or not at all.
-   * Use for winner entry to prevent stale fills after edge evaporates.
+   * Use as fallback when limit order doesn't fill, or for emergency exits.
    */
   async placeMarketOrderFOK(params: {
     tokenId: string;
@@ -261,6 +374,50 @@ export class ClobService {
       return { filled, orderIds };
     } catch (err) {
       this.logger.warn("FOK order failed", { error: (err as Error).message });
+      return { filled: false, orderIds: [] };
+    }
+  }
+
+  /**
+   * Place a FAK (Fill-And-Kill) market order — fills whatever is available, cancels rest.
+   * Unlike FOK (all-or-nothing), FAK allows partial fills.
+   * Per docs.polymarket.com: "Fills as many shares as available immediately,
+   * then cancels any unfilled remainder."
+   */
+  async placeMarketOrderFAK(params: {
+    tokenId: string;
+    side: Side;
+    amount: number; // USD amount for BUY, shares for SELL
+    worstPrice?: number; // slippage protection, not target price
+  }): Promise<{ filled: boolean; orderIds: string[] }> {
+    const meta = await this.getMarketMeta(params.tokenId);
+
+    try {
+      const resp = await this.client.createAndPostMarketOrder(
+        {
+          tokenID: params.tokenId,
+          side: params.side,
+          amount: params.amount,
+          ...(params.worstPrice ? { price: this.roundToTick(params.worstPrice, meta.tickSize, params.side) } : {}),
+        },
+        { tickSize: meta.tickSize, negRisk: meta.negRisk },
+        OrderType.FAK,
+      );
+
+      const orderIds: string[] = [];
+      if (resp?.orderID) orderIds.push(resp.orderID);
+      const filled = !resp?.error && orderIds.length > 0;
+
+      this.logger.info("FAK order result", {
+        tokenId: params.tokenId.slice(0, 12) + "...",
+        side: params.side,
+        amount: params.amount,
+        filled,
+      });
+
+      return { filled, orderIds };
+    } catch (err) {
+      this.logger.warn("FAK order failed", { error: (err as Error).message });
       return { filled: false, orderIds: [] };
     }
   }

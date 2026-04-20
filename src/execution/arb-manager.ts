@@ -1,5 +1,6 @@
 import type { Logger } from "../logger.js";
 import type { TradeSide } from "../types.js";
+import { polymarketFee } from "../utils.js";
 
 /**
  * ArbManager: Tracks per-window position state for the hybrid strategy.
@@ -61,6 +62,24 @@ export class ArbManager {
     this.roundTrips = 0;
     this.windowConditionId = conditionId;
     this.lastEntryTime = 0;
+  }
+
+  /** Record a sell-back: we sold our winner position, remove it from state */
+  recordSellBack(side: TradeSide, shares: number): void {
+    if (side === "Up") {
+      const pricePer = this.upShares > 0 ? this.upCostUsd / this.upShares : 0;
+      this.upShares = Math.max(0, this.upShares - shares);
+      this.upCostUsd = this.upShares * pricePer;
+    } else {
+      const pricePer = this.downShares > 0 ? this.downCostUsd / this.downShares : 0;
+      this.downShares = Math.max(0, this.downShares - shares);
+      this.downCostUsd = this.downShares * pricePer;
+    }
+    this.logger.info("Sell-back recorded", {
+      side,
+      shares: shares.toFixed(2),
+      remaining: `Up=${this.upShares.toFixed(1)} Down=${this.downShares.toFixed(1)}`,
+    });
   }
 
   /** Record a fill on one side */
@@ -187,8 +206,10 @@ export class ArbManager {
     const downProportion = this.downShares > 0 ? balanced / this.downShares : 0;
     const balancedCost = this.upCostUsd * upProportion + this.downCostUsd * downProportion;
 
-    // Deduct 2% taker fee on both sides
-    const fees = balancedCost * 0.02;
+    // Use actual Polymarket fee formula instead of hardcoded 2%
+    const avgUpPrice = this.upShares > 0 ? this.upCostUsd / this.upShares : 0;
+    const avgDownPrice = this.downShares > 0 ? this.downCostUsd / this.downShares : 0;
+    const fees = polymarketFee(balanced, avgUpPrice) + polymarketFee(balanced, avgDownPrice);
 
     // Balanced pairs pay $1.00 per share at settlement
     return balanced - balancedCost - fees;

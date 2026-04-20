@@ -20,67 +20,78 @@ export interface Config {
   profileAddress: string;
   apiCreds?: ApiCreds;
 
-  // Webhook (kept for optional hybrid mode)
+  // Webhook (kept for optional use)
   webhookPort: number;
   webhookSecret?: string;
 
-  // Trading parameters (percentage-based for compounding)
-  /** % of wallet balance per individual order (e.g. 4 = 4%) */
-  buyAmountPct: number;
-  maxBuysPerWindow: number;
-  maxBuysPerSide: number;
-  maxEntryPriceCents: number;
-  minEntryPriceCents: number;
-  /** Max ask sum (Up ask + Down ask) to enter — must be below this for hedge to be profitable */
-  maxEntryAskSumCents: number;
-  redeemDelaySeconds: number;
+  // === CONVERGENCE ARB PARAMETERS ===
 
-  // Edge detection parameters
-  /** Minimum edge (cents) to enter a trade */
+  // Position sizing
+  /** % of wallet balance per entry (e.g. 5 = 5%) */
+  buyAmountPct: number;
+  /** Max buys per window */
+  maxBuysPerWindow: number;
+
+  // Entry timing — time-remaining based
+  /** Only enter when window has <= this many seconds remaining */
+  maxEntryTimeRemaining: number;
+  /** Don't enter with < this many seconds remaining */
+  minEntryTimeRemaining: number;
+
+  // Entry filters
+  /** Minimum edge (cents) to enter: fairValue - marketAsk */
   edgeThresholdCents: number;
-  /** Edge tier thresholds for position scaling */
-  edgeTier2Cents: number;
-  edgeTier3Cents: number;
-  edgeTier4Cents: number;
-  /** Minimum BTC delta (USD) to consider trading */
+  /** Minimum normalized delta (sigma) to enter */
+  minNormalizedDelta: number;
+  /** Minimum absolute BTC delta (USD) to consider trading */
   minDeltaThresholdUsd: number;
-  /** Max adverse momentum (USD) before skipping trade */
+  /** Max adverse momentum (USD) before skipping */
   maxAdverseMomentumUsd: number;
+  /** Spike ratio threshold: |momentum10s|/|momentum30s| > this = spike, skip */
+  spikeRatioThreshold: number;
   /** Seconds to look back for momentum check */
   momentumLookbackSeconds: number;
   /** Seconds to look back for volatility calculation */
   volatilityLookbackSeconds: number;
-  /** Seconds to wait after window start before scanning */
-  entryDelaySeconds: number;
   /** How often (ms) to scan for edge opportunities */
   scanIntervalMs: number;
 
-  // Hedge parameters
-  hedgeMonitorEnabled: boolean;
-  hedgeTriggerCents: number;
-  hedgeEdgeThresholdCents: number;
-  hedgeMaxPriceCents: number;
+  // Entry quality
+  /** Minimum fair value (cents) for winner side to enter — rejects low-confidence entries */
+  minFairValueCents: number;
 
-  // Arb completion parameters
-  /** Minimum profit (cents) per share pair to complete arb */
-  minProfitCents: number;
-  /** Max round-trips (buy winner + buy loser) per window */
-  maxRoundTripsPerWindow: number;
+  // Naked position safety
+  /** Fair value threshold: if winner fairValue >= this, naked hold is safe */
+  nakedSafetyThreshold: number;
+  /** If delta drops by this % from entry, trigger emergency sell */
+  reversalDeltaDropPct: number;
+  /** Max spread (cents) for emergency sell-back: sell at bestBid */
+  emergencySellMaxSpreadCents: number;
+
+  /** Max acceptable loss per share (cents) when hedging defensively.
+   *  maxLoserPrice = (100 - entryPrice) + maxAcceptableLossCents
+   *  E.g. entry 85¢, maxLoss 25¢ → buy loser up to 40¢ → loss capped at 25¢/sh */
+  maxAcceptableLossCents: number;
+
+  // Opportunistic loser fill
+  /** Buy loser if it drops to <= this price (cents). Ultra-cheap = free hedge */
+  opportunisticLoserMaxCents: number;
+
+  // Risk management
   /** Max unhedged exposure as % of balance */
   maxUnhedgedPct: number;
   /** Max total cost per window as % of balance */
   maxWindowExposurePct: number;
-  /** Timeout (ms) to complete arb before emergency balance */
-  arbCompletionTimeoutMs: number;
-
-  // Risk management (percentage-based)
-  /** Max daily loss as % of starting daily balance (e.g. 10 = 10%) */
+  /** Max daily loss as % of starting daily balance */
   dailyLossLimitPct: number;
   /** Max weekly loss as % of starting weekly balance */
   weeklyLossLimitPct: number;
   losingStreakPause: number;
   /** Absolute minimum USDC balance — stop trading below this */
   minBalanceFloorUsd: number;
+
+  // Redeem
+  redeemDelaySeconds: number;
 
   // Database
   databaseUrl: string;
@@ -131,7 +142,6 @@ const parseNumber = (name: string, fallback?: number): number => {
   const trimmed = raw.trim();
   const num = Number(trimmed);
   if (!Number.isFinite(num)) {
-    // Try parsing just the leading numeric portion (handles values like "52 (default 52)")
     const match = trimmed.match(/^-?\d+(\.\d+)?/);
     if (!match) throw new ConfigError(`Invalid number for ${name}: ${raw}`);
     const parsed = Number(match[0]);
@@ -181,49 +191,49 @@ export const loadConfig = (): Config => {
     ? { key: apiKey, secret: apiSecret, passphrase: apiPassphrase }
     : undefined;
 
-  // Webhook
-  const webhookPort = parseNumber("PORT", 3000); // Railway sets PORT automatically
+  const webhookPort = parseNumber("PORT", 3000);
   const webhookSecret = getEnv("WEBHOOK_SECRET");
 
-  // Trading parameters
-  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 4);
-  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 5);
-  const maxBuysPerSide = parseNumber("MAX_BUYS_PER_SIDE", 3);
-  const maxEntryPriceCents = parseNumber("MAX_ENTRY_PRICE_CENTS", 92);
-  const minEntryPriceCents = parseNumber("MIN_ENTRY_PRICE_CENTS", 40);
-  const maxEntryAskSumCents = parseNumber("MAX_ENTRY_ASK_SUM_CENTS", 100);
-  const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
+  // === CONVERGENCE ARB PARAMETERS ===
+  const buyAmountPct = parseNumber("BUY_AMOUNT_PCT", 5);
+  const maxBuysPerWindow = parseNumber("MAX_BUYS_PER_WINDOW", 2);
 
-  // Edge detection parameters
-  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 5);
-  const edgeTier2Cents = parseNumber("EDGE_TIER2_CENTS", 8);
-  const edgeTier3Cents = parseNumber("EDGE_TIER3_CENTS", 12);
-  const edgeTier4Cents = parseNumber("EDGE_TIER4_CENTS", 15);
+  // Entry timing
+  const maxEntryTimeRemaining = parseNumber("MAX_ENTRY_TIME_REMAINING", 100);
+  const minEntryTimeRemaining = parseNumber("MIN_ENTRY_TIME_REMAINING", 30);
+
+  // Entry filters
+  const edgeThresholdCents = parseNumber("EDGE_THRESHOLD_CENTS", 2);
+  const minNormalizedDelta = parseNumber("MIN_NORMALIZED_DELTA", 0.7);
   const minDeltaThresholdUsd = parseNumber("MIN_DELTA_THRESHOLD_USD", 10);
   const maxAdverseMomentumUsd = parseNumber("MAX_ADVERSE_MOMENTUM_USD", 50);
+  const spikeRatioThreshold = parseNumber("SPIKE_RATIO_THRESHOLD", 3.0);
   const momentumLookbackSeconds = parseNumber("MOMENTUM_LOOKBACK_SECONDS", 30);
   const volatilityLookbackSeconds = parseNumber("VOLATILITY_LOOKBACK_SECONDS", 120);
-  const entryDelaySeconds = parseNumber("ENTRY_DELAY_SECONDS", 30);
-  const scanIntervalMs = parseNumber("SCAN_INTERVAL_MS", 2000);
+  const scanIntervalMs = parseNumber("SCAN_INTERVAL_MS", 500);
 
-  // Hedge parameters
-  const hedgeMonitorEnabled = parseBoolean("HEDGE_MONITOR_ENABLED", true);
-  const hedgeTriggerCents = parseNumber("HEDGE_TRIGGER_CENTS", 5);
-  const hedgeEdgeThresholdCents = parseNumber("HEDGE_EDGE_THRESHOLD_CENTS", 12);
-  const hedgeMaxPriceCents = parseNumber("HEDGE_MAX_PRICE_CENTS", 45);
+  // Entry quality
+  const minFairValueCents = parseNumber("MIN_FAIR_VALUE_CENTS", 80);
 
-  // Arb completion parameters
-  const minProfitCents = parseNumber("MIN_PROFIT_CENTS", 4);
-  const maxRoundTripsPerWindow = parseNumber("MAX_ROUND_TRIPS_PER_WINDOW", 3);
-  const maxUnhedgedPct = parseNumber("MAX_UNHEDGED_PCT", 11);
+  // Naked position safety
+  const nakedSafetyThreshold = parseNumber("NAKED_SAFETY_THRESHOLD", 95);
+  const reversalDeltaDropPct = parseNumber("REVERSAL_DELTA_DROP_PCT", 30);
+  const emergencySellMaxSpreadCents = parseNumber("EMERGENCY_SELL_MAX_SPREAD_CENTS", 3);
+  const maxAcceptableLossCents = parseNumber("MAX_ACCEPTABLE_LOSS_CENTS", 25);
+
+  // Opportunistic loser fill
+  const opportunisticLoserMaxCents = parseNumber("OPPORTUNISTIC_LOSER_MAX_CENTS", 3);
+
+  // Risk management
+  const maxUnhedgedPct = parseNumber("MAX_UNHEDGED_PCT", 8);
   const maxWindowExposurePct = parseNumber("MAX_WINDOW_EXPOSURE_PCT", 15);
-  const arbCompletionTimeoutMs = parseNumber("ARB_COMPLETION_TIMEOUT_MS", 60000);
-
-  // Risk management (percentage-based)
   const dailyLossLimitPct = parseNumber("DAILY_LOSS_LIMIT_PCT", 10);
   const weeklyLossLimitPct = parseNumber("WEEKLY_LOSS_LIMIT_PCT", 20);
   const losingStreakPause = parseNumber("LOSING_STREAK_PAUSE", 5);
   const minBalanceFloorUsd = parseNumber("MIN_BALANCE_FLOOR_USD", 50);
+
+  // Redeem
+  const redeemDelaySeconds = parseNumber("REDEEM_DELAY_SECONDS", 200);
 
   // Database
   const databaseUrl = requireEnv("DATABASE_URL");
@@ -255,7 +265,6 @@ export const loadConfig = (): Config => {
     }
   }
 
-  // Telegram (optional)
   const telegramBotToken = getEnv("TELEGRAM_BOT_TOKEN");
   const telegramChatId = getEnv("TELEGRAM_CHAT_ID");
 
@@ -277,34 +286,29 @@ export const loadConfig = (): Config => {
     webhookSecret,
     buyAmountPct,
     maxBuysPerWindow,
-    maxBuysPerSide,
-    maxEntryPriceCents,
-    minEntryPriceCents,
-    maxEntryAskSumCents,
-    redeemDelaySeconds,
+    maxEntryTimeRemaining,
+    minEntryTimeRemaining,
     edgeThresholdCents,
-    edgeTier2Cents,
-    edgeTier3Cents,
-    edgeTier4Cents,
+    minNormalizedDelta,
     minDeltaThresholdUsd,
     maxAdverseMomentumUsd,
+    spikeRatioThreshold,
     momentumLookbackSeconds,
     volatilityLookbackSeconds,
-    entryDelaySeconds,
     scanIntervalMs,
-    hedgeMonitorEnabled,
-    hedgeTriggerCents,
-    hedgeEdgeThresholdCents,
-    hedgeMaxPriceCents,
-    minProfitCents,
-    maxRoundTripsPerWindow,
+    minFairValueCents,
+    nakedSafetyThreshold,
+    reversalDeltaDropPct,
+    emergencySellMaxSpreadCents,
+    maxAcceptableLossCents,
+    opportunisticLoserMaxCents,
     maxUnhedgedPct,
     maxWindowExposurePct,
-    arbCompletionTimeoutMs,
     dailyLossLimitPct,
     weeklyLossLimitPct,
     losingStreakPause,
     minBalanceFloorUsd,
+    redeemDelaySeconds,
     databaseUrl,
     autoRedeem,
     relayerUrl,

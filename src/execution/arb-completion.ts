@@ -8,43 +8,31 @@ import type { TradeSide, WindowInfo } from "../types.js";
 import type { ArbManager } from "./arb-manager.js";
 import type { VolatilityCalculator } from "../signal/volatility.js";
 import type { FairValueEngine } from "../signal/fair-value.js";
+import type { BinanceWsClient } from "../data/binance-ws.js";
+import type { RtdsWsClient } from "../data/rtds-ws.js";
+import { lookupFairUp } from "../signal/lookup-table.js";
 
 /**
- * ArbCompletionMonitor v5: SIMPLE & FAST
+ * Convergence Arb Completion Monitor — NAKED-FIRST strategy.
  *
- * Strategy:
- * 1. Winner bought → IMMEDIATELY try to fill loser at ANY profitable price
- * 2. React to WS orderbook updates (event-driven, no polling)
- * 3. Safety timer every 2s as fallback (in case WS update missed)
- * 4. After 5s → bail out (sell winner back)
+ * After buying the winner via FOK, this monitor:
  *
- * NO tranches. NO trailing. NO DCA. Just fill or bail.
+ * 1. MONITORS Binance for reversal (2-5s edge over Polymarket)
+ * 2. CHECKS lookup table for naked safety (delta+time → P(win))
+ * 3. BUYS loser ONLY if ultra-cheap (≤3¢) — opportunistic, not forced
+ * 4. SELLS winner back if delta collapses (emergency exit)
+ * 5. HOLDS naked if safe (≥95% probability from lookup table)
+ *
+ * Key insight: at 96%+ win rate, naked hold has HIGHER EV than forced hedge.
+ * EV(naked @ 96%) = +6.0¢/share vs EV(hedge @ 5¢) = +5.0¢/share
  */
 
-export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[]) => void;
+export type ArbCompletionCallback = (side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack?: boolean, maker?: boolean) => void;
 
-/** Safety fallback interval — WS is primary, this is just a backup (ms) */
-const SAFETY_CHECK_INTERVAL_MS = 2000;
+/** How often to run safety checks (ms). Binance ticks are event-driven — this is the fallback. */
+const SAFETY_CHECK_INTERVAL_MS = 500;
 
-/** Polymarket taker fee: 2% on each side. Both winner and loser orders pay this. */
-const TAKER_FEE_PCT = 0.02;
-
-/** Phase 1: Fill if pair cost < 92¢ (guaranteed ~4¢ profit after ~4¢ fees on both sides)
- * Math: payout $1.00 - pair cost $0.92 = $0.08 gross - ~$0.04 fees = ~$0.04 net profit */
-const PHASE1_MAX_PAIR_CENTS = 92;
-
-/** Phase 2: Accept pair ≤ 96¢ (still profitable after fees)
- * Math: payout $1.00 - pair cost $0.96 = $0.04 gross - ~$0.04 fees ≈ break-even
- * This is the absolute floor — below this we lose money on every hedge. */
-const PHASE2_AFTER_MS = 5000;
-const PHASE2_MAX_PAIR_CENTS = 96;
-
-/** Phase 3: After 20s, bail out and hold naked.
- * Naked directional with a real edge is BETTER than hedging at >96¢ pair cost.
- * Don't wait 90s hoping for a miracle — if loser hasn't dropped by 20s, it won't. */
-const BAILOUT_AFTER_MS = 20000;
-
-interface HedgeState {
+interface MonitorState {
   active: boolean;
   winnerSide: TradeSide;
   winnerAvgPriceCents: number;
@@ -57,20 +45,42 @@ interface HedgeState {
   totalSharesFilled: number;
   totalCostUsd: number;
   allOrderIds: string[];
-  /** Best (lowest) loser ask seen during monitoring */
-  bestLoserAskSeen: number;
-  /** Initial loser ask when monitoring started */
-  initialLoserAsk: number | null;
-  /** BTC price for edge monitoring */
+  /** BTC price at time of entry */
+  entryBtcPrice: number;
+  /** BTC delta at time of entry (entryBtcPrice - openingPrice) */
+  entryDelta: number;
+  /** Current BTC price (updated from Binance) */
   currentBtcPrice: number;
+  /** Window opening price */
   openingPrice: number;
+  /** Seconds remaining when we entered */
+  entryTimeRemaining: number;
+  /** Current time remaining */
   timeRemainingSeconds: number;
+  /** Whether we already sold the winner back */
+  soldBack: boolean;
+  /** Loser limit order ID (opportunistic) if placed */
+  loserLimitOrderId: string | null;
 }
 
 export class ArbCompletionMonitor {
-  private state: HedgeState | null = null;
+  private state: MonitorState | null = null;
   private onCompleteCallback: ArbCompletionCallback | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private binanceUnsubscribe: (() => void) | null = null;
+  /** Generation counter — prevents stale async operations from modifying state after reset */
+  private generation = 0;
+  /** Debounce timestamps for noisy log messages (prevents log spam from high-frequency ticks) */
+  private lastReversalLogAt = 0;
+  private lastFlippedLogAt = 0;
+  /** Track hedge retry attempts to prevent infinite loops */
+  private hedgeRetryCount = 0;
+  /** Set to true after all exit attempts exhausted — prevents re-triggering the same exit cycle */
+  private exitExhausted = false;
+  private static readonly MAX_HEDGE_RETRIES = 3;
+  private static readonly MAX_SELLBACK_RETRIES = 5;
+  private static readonly HEDGE_RETRY_STEP_CENTS = 2; // widen by 2¢ each retry
+  private static readonly SELLBACK_RETRY_STEP_CENTS = 5; // widen by 5¢ each retry (more aggressive)
 
   constructor(
     private clobWs: ClobWsClient,
@@ -79,19 +89,15 @@ export class ArbCompletionMonitor {
     private arbManager: ArbManager,
     private logger: Logger,
     private telegram: TelegramNotifier,
-    private volatilityCalc?: VolatilityCalculator,
-    private fairValueEngine?: FairValueEngine,
+    private volatilityCalc: VolatilityCalculator,
+    private fairValueEngine: FairValueEngine,
+    private binance: BinanceWsClient,
+    private rtds: RtdsWsClient,
   ) {
-    // Also react to WS price updates for faster detection
-    this.clobWs.onUpdate(this.onPriceUpdate.bind(this));
+    // React to CLOB WS updates for opportunistic loser fills
+    this.clobWs.onUpdate(this.onClobUpdate.bind(this));
   }
 
-  /**
-   * Start seeking loser side. Simple 3-phase approach:
-   * Phase 1 (0-5s): Fill if pair cost < 92¢ (profitable after 2% fees on both sides)
-   * Phase 2 (5-20s): Fill if pair cost ≤ 96¢ (break-even after fees)
-   * Phase 3 (20s+):  Bail out — hold naked (positive EV from edge)
-   */
   startSeeking(params: {
     winnerSide: TradeSide;
     winnerAvgPriceCents: number;
@@ -104,11 +110,10 @@ export class ArbCompletionMonitor {
     onComplete: ArbCompletionCallback;
   }): void {
     const loserSide: TradeSide = params.winnerSide === "Up" ? "Down" : "Up";
+    const entryDelta = params.currentBtcPrice - params.window.openingPrice;
 
-    // Get current loser ask for initial log
-    const book = this.clobWs.getBook(params.loserTokenId);
-    const currentLoserAsk = book?.bestAsk ? book.bestAsk * 100 : null;
-    const pairCost = currentLoserAsk ? params.winnerAvgPriceCents + currentLoserAsk : null;
+    this.generation++;
+    this.exitExhausted = false;
 
     this.state = {
       active: true,
@@ -123,34 +128,46 @@ export class ArbCompletionMonitor {
       totalSharesFilled: 0,
       totalCostUsd: 0,
       allOrderIds: [],
-      bestLoserAskSeen: currentLoserAsk ?? 999,
-      initialLoserAsk: currentLoserAsk,
+      entryBtcPrice: params.currentBtcPrice,
+      entryDelta,
       currentBtcPrice: params.currentBtcPrice,
       openingPrice: params.window.openingPrice,
+      entryTimeRemaining: params.timeRemainingSeconds,
       timeRemainingSeconds: params.timeRemainingSeconds,
+      soldBack: false,
+      loserLimitOrderId: null,
     };
 
     this.onCompleteCallback = params.onComplete;
 
-    this.logger.info("Arb completion v5 — seeking loser (SIMPLE MODE)", {
-      seeking: loserSide,
+    // Check current loser ask for logging
+    const book = this.clobWs.getBook(params.loserTokenId);
+    const currentLoserAsk = book?.bestAsk ? book.bestAsk * 100 : null;
+
+    this.logger.info("CONVERGENCE ARB — monitoring naked position", {
+      winner: params.winnerSide,
       winnerPrice: `${params.winnerAvgPriceCents.toFixed(1)}¢`,
-      currentLoserAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
-      pairCost: pairCost ? `${pairCost.toFixed(1)}¢` : "N/A",
-      profitableAt: `≤${(PHASE1_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
-      breakEvenAt: `≤${(PHASE2_MAX_PAIR_CENTS - params.winnerAvgPriceCents).toFixed(1)}¢`,
-      phases: `0-5s: fill<92¢ | 5-20s: fill≤96¢ | 20s+: bail (naked)`,
+      entryDelta: `$${entryDelta.toFixed(2)}`,
+      normalizedDelta: `${(Math.abs(entryDelta) / this.volatilityCalc.getVolatility()).toFixed(2)}σ`,
+      loserAsk: currentLoserAsk ? `${currentLoserAsk.toFixed(1)}¢` : "N/A",
+      timeLeft: `${params.timeRemainingSeconds.toFixed(0)}s`,
+      strategy: "naked-first + Binance reversal detection",
     });
 
-    // WS-driven: onPriceUpdate fires on every orderbook change (primary path)
-    // Safety fallback timer in case WS misses an update
-    this.pollTimer = setInterval(() => this.checkAndFill(), SAFETY_CHECK_INTERVAL_MS);
+    // Subscribe to Binance ticks for real-time reversal detection
+    const onBinanceTick = () => this.onBinanceTick();
+    this.binance.onTick(onBinanceTick);
+    this.binanceUnsubscribe = () => {
+      this.binance.offTick(onBinanceTick);
+    };
 
-    // Try immediately with current book data
-    this.checkAndFill();
+    // Safety fallback timer
+    this.pollTimer = setInterval(() => this.safetyCheck(), SAFETY_CHECK_INTERVAL_MS);
+
+    // Try opportunistic loser fill immediately
+    this.tryOpportunisticLoserFill();
   }
 
-  /** Update BTC price for monitoring */
   updateBtcPrice(price: number, timeRemaining: number): void {
     if (this.state) {
       this.state.currentBtcPrice = price;
@@ -158,7 +175,31 @@ export class ArbCompletionMonitor {
     }
   }
 
+  /** Max loser price for profitable pair (breakeven) */
+  private getBreakevenLoserPrice(): number {
+    return this.state ? 100 - this.state.winnerAvgPriceCents - 1 : 0;
+  }
+
+  /** Max loser price for defensive hedge (accepts capped loss based on entry price) */
+  private getDefensiveLoserPrice(): number {
+    if (!this.state) return 0;
+    // entry 85¢ → breakeven loser = 15¢, defensive = 15 + 25 = 40¢ (loss capped at 25¢/sh)
+    return (100 - this.state.winnerAvgPriceCents) + this.config.maxAcceptableLossCents;
+  }
+
   reset(): void {
+    this.generation++; // Invalidate any in-flight async operations
+    this.lastReversalLogAt = 0;
+    this.lastFlippedLogAt = 0;
+    this.hedgeRetryCount = 0;
+    if (this.binanceUnsubscribe) {
+      this.binanceUnsubscribe();
+      this.binanceUnsubscribe = null;
+    }
+    // Cancel any outstanding loser limit order
+    if (this.state?.loserLimitOrderId && !this.config.dryRun) {
+      this.clob.cancelOrder(this.state.loserLimitOrderId).catch(() => {});
+    }
     this.state = null;
     this.onCompleteCallback = null;
     if (this.pollTimer) {
@@ -173,162 +214,378 @@ export class ArbCompletionMonitor {
 
   get phase(): string {
     if (!this.state) return "idle";
-    if (this.state.filled) return "done";
-    const elapsed = Date.now() - this.state.startedAt;
-    if (elapsed < PHASE2_AFTER_MS) return "profitable";
-    if (elapsed < BAILOUT_AFTER_MS) return "breakeven";
-    return "bailout";
+    if (this.state.filled) return "hedged";
+    if (this.state.soldBack) return "exited";
+    return "naked-monitoring";
   }
 
-  get tranchesStatus(): string {
-    if (!this.state) return "idle";
-    return this.state.filled ? "1/1" : "0/1";
+  // ===== EVENT-DRIVEN HANDLERS =====
+
+  /**
+   * Binance tick handler — fires on every trade (~100ms).
+   * This is our FASTEST reversal detection path.
+   */
+  private onBinanceTick(): void {
+    if (!this.state || !this.state.active || this.state.filled || this.state.soldBack) return;
+
+    const btcPrice = this.binance.price;
+    if (!btcPrice) return;
+
+    this.state.currentBtcPrice = btcPrice;
+    const currentDelta = btcPrice - this.state.openingPrice;
+
+    // Check reversal: has delta collapsed?
+    this.checkReversal(currentDelta);
   }
 
   /**
-   * React to WS orderbook updates — try to fill on every update.
+   * CLOB WS update — check for ultra-cheap loser fills.
    */
-  private onPriceUpdate(assetId: string, _book: BookSnapshot): void {
-    if (!this.state || !this.state.active) return;
+  private onClobUpdate(assetId: string, _book: BookSnapshot): void {
+    if (!this.state || !this.state.active || this.state.filled || this.state.soldBack) return;
     if (assetId !== this.state.loserTokenId) return;
-    this.checkAndFill();
+
+    this.tryOpportunisticLoserFill();
   }
 
-  /**
-   * Core logic: check if we can fill the loser side now.
-   * Called on every WS update + safety timer every 2s.
-   * WS path is sync (fast), timer path uses async REST fallback.
-   */
-  private checkAndFill(): void {
-    if (!this.state || !this.state.active || this.state.filled || this.state.fillInFlight) return;
-
-    const elapsed = Date.now() - this.state.startedAt;
-
-    // Phase 3: bail out
-    if (elapsed >= BAILOUT_AFTER_MS) {
-      this.state.fillInFlight = true;
-      this.doBailOut().catch((err) => {
-        this.logger.error("Bail-out failed", { error: (err as Error).message });
-      });
-      return;
-    }
-
-    // Get current loser ask from WS
-    const book = this.clobWs.getBook(this.state.loserTokenId);
-    const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
-
-    if (!askCents) {
-      // WS has no data — fetch from REST API as fallback
-      this.state.fillInFlight = true; // prevent re-entry during async
-      this.fetchAndCheck(elapsed).catch((err) => {
-        this.logger.error("REST fallback check failed", { error: (err as Error).message });
-        if (this.state && !this.state.filled) this.state.fillInFlight = false;
-      });
-      return;
-    }
-
-    this.evaluateAndFill(askCents, elapsed);
-  }
+  // ===== CORE LOGIC =====
 
   /**
-   * Async REST fallback when WS has no book data for the loser.
+   * Check for BTC reversal using Binance data.
+   * Triggers emergency sell-back if delta collapses.
    */
-  private async fetchAndCheck(elapsed: number): Promise<void> {
-    if (!this.state || this.state.filled) return;
+  private checkReversal(currentDelta: number): void {
+    if (!this.state || this.state.fillInFlight || this.exitExhausted) return;
 
-    const ob = await this.clob.getOrderbook(this.state.loserTokenId);
-    const askCents = ob.bestAsk ? ob.bestAsk * 100 : null;
+    const entryDelta = this.state.entryDelta;
+    const absDeltaNow = Math.abs(currentDelta);
+    const absDeltaEntry = Math.abs(entryDelta);
 
-    if (!askCents) {
-      this.logger.warn("No loser price from WS or REST", {
-        elapsed: `${(elapsed / 1000).toFixed(1)}s`,
-        loserTokenId: this.state.loserTokenId.slice(0, 12) + "...",
-      });
-      this.state.fillInFlight = false;
-      return;
-    }
+    // Direction check: did delta flip sign? (worst case — try hedge first)
+    const flipped = (entryDelta > 0 && currentDelta <= 0) || (entryDelta < 0 && currentDelta >= 0);
+    if (flipped) {
+      // When delta flips, the LOSER becomes cheap — perfect time for defensive hedge!
+      const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+      const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+      const maxLoserPrice = this.getDefensiveLoserPrice(); // Accept capped loss
 
-    this.logger.debug("Using REST price (WS has no data)", {
-      loserAsk: `${askCents.toFixed(1)}¢`,
-    });
-
-    this.evaluateAndFill(askCents, elapsed);
-  }
-
-  /**
-   * Evaluate loser ask price and fill if within threshold.
-   */
-  private evaluateAndFill(askCents: number, elapsed: number): void {
-    if (!this.state || this.state.filled || (this.state.fillInFlight && elapsed < BAILOUT_AFTER_MS)) {
-      // fillInFlight is set by fetchAndCheck — allow it through
-    }
-
-    // Track best (lowest) loser price seen
-    if (askCents < this.state!.bestLoserAskSeen) {
-      this.state!.bestLoserAskSeen = askCents;
-    }
-
-    const pairCost = this.state!.winnerAvgPriceCents + askCents;
-
-    // Phase 1: profitable fill (pair < 98¢)
-    if (elapsed < PHASE2_AFTER_MS) {
-      if (pairCost <= PHASE1_MAX_PAIR_CENTS) {
-        this.state!.fillInFlight = true;
-        this.fillLoser(askCents, "profitable").catch((err) => {
-          this.logger.error("Profitable fill failed — will retry on next update", {
-            error: (err as Error).message,
-          });
+      if (loserAskCents && loserAskCents <= maxLoserPrice) {
+        const pairCost = this.state.winnerAvgPriceCents + loserAskCents;
+        const lossCents = pairCost > 100 ? pairCost - 100 : 0;
+        this.logger.info("DELTA FLIPPED — defensive hedge (capped loss)", {
+          entryDelta: `$${entryDelta.toFixed(2)}`,
+          currentDelta: `$${currentDelta.toFixed(2)}`,
+          loserAsk: `${loserAskCents.toFixed(1)}¢`,
+          pairCost: `${pairCost.toFixed(1)}¢`,
+          cappedLoss: lossCents > 0 ? `-${lossCents.toFixed(1)}¢/sh` : `+${(100 - pairCost).toFixed(1)}¢/sh`,
+        });
+        this.state.fillInFlight = true;
+        this.fillLoserWithRetry(loserAskCents, "delta-flip").catch((err) => {
+          this.logger.error("Delta-flipped hedge failed", { error: (err as Error).message });
           if (this.state && !this.state.filled) this.state.fillInFlight = false;
         });
       } else {
-        // Release lock if set by fetchAndCheck
-        if (this.state) this.state.fillInFlight = false;
+        // Loser too expensive even for defensive hedge — try sell-back
+        const now = Date.now();
+        if (now - this.lastFlippedLogAt >= 5000) {
+          this.lastFlippedLogAt = now;
+          this.logger.warn("DELTA FLIPPED — loser too expensive, attempting sell-back", {
+            entryDelta: `$${entryDelta.toFixed(2)}`,
+            currentDelta: `$${currentDelta.toFixed(2)}`,
+            loserAsk: loserAskCents ? `${loserAskCents.toFixed(1)}¢` : "N/A",
+            maxDefensive: `${maxLoserPrice.toFixed(1)}¢`,
+          });
+        }
+        this.state.fillInFlight = true;
+        this.emergencySellBackWithRetry("delta-flip").catch((err) => {
+          this.logger.error("Delta-flip sell-back failed", { error: (err as Error).message });
+          if (this.state) this.state.fillInFlight = false;
+        });
       }
       return;
     }
 
-    // Phase 2: break-even fill (pair ≤ 100¢ — settlement pays 100¢)
-    if (pairCost <= PHASE2_MAX_PAIR_CENTS) {
-      this.state!.fillInFlight = true;
-      this.fillLoser(askCents, "breakeven").catch((err) => {
-        this.logger.error("Break-even fill failed — will retry on next update", {
-          error: (err as Error).message,
-        });
-        if (this.state && !this.state.filled) this.state.fillInFlight = false;
-      });
-    } else {
-      // Release lock if set by fetchAndCheck
-      if (this.state) this.state.fillInFlight = false;
+    // Delta drop check: has delta dropped by more than reversalDeltaDropPct?
+    if (absDeltaEntry > 0) {
+      const dropPct = ((absDeltaEntry - absDeltaNow) / absDeltaEntry) * 100;
+      if (dropPct >= this.config.reversalDeltaDropPct) {
+        // Double-check: is the position still safe according to lookup table?
+        const vol = this.volatilityCalc.getVolatility();
+        const normalizedDelta = vol > 0.01 ? absDeltaNow / vol : 0;
+        const lookup = lookupFairUp(
+          currentDelta > 0 ? normalizedDelta : -normalizedDelta,
+          this.state.timeRemainingSeconds,
+        );
+        const winnerFairValue = this.state.winnerSide === "Up" ? lookup.fairUp : 100 - lookup.fairUp;
+
+        if (winnerFairValue < this.config.nakedSafetyThreshold) {
+          // Try defensive hedge first (buy loser — accept capped loss)
+          const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+          const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+          const maxLoserPrice = this.getDefensiveLoserPrice();
+
+          if (loserAskCents && loserAskCents <= maxLoserPrice) {
+            const pairCost = this.state.winnerAvgPriceCents + loserAskCents;
+            this.logger.info("REVERSAL — defensive hedge (capped loss)", {
+              dropPct: `${dropPct.toFixed(0)}%`,
+              loserAsk: `${loserAskCents.toFixed(1)}¢`,
+              pairCost: `${pairCost.toFixed(1)}¢`,
+              cappedLoss: pairCost > 100 ? `-${(pairCost - 100).toFixed(1)}¢/sh` : `+${(100 - pairCost).toFixed(1)}¢/sh`,
+            });
+            this.state.fillInFlight = true;
+            this.fillLoserWithRetry(loserAskCents, "reversal").catch((err) => {
+              this.logger.error("Reversal hedge failed", { error: (err as Error).message });
+              if (this.state && !this.state.filled) this.state.fillInFlight = false;
+            });
+          } else if (winnerFairValue < this.state.winnerAvgPriceCents) {
+            // Loser too expensive AND EV is negative — sell back with retries
+            this.logger.warn("REVERSAL — EV negative, selling back with retries", {
+              entryDelta: `$${entryDelta.toFixed(2)}`,
+              currentDelta: `$${currentDelta.toFixed(2)}`,
+              dropPct: `${dropPct.toFixed(0)}%`,
+              winnerFairValue: `${winnerFairValue}¢`,
+              entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+            });
+            this.state.fillInFlight = true;
+            this.emergencySellBackWithRetry("delta-drop").catch((err) => {
+              this.logger.error("Emergency sell-back failed", { error: (err as Error).message });
+              if (this.state) this.state.fillInFlight = false;
+            });
+          } else {
+            // Debounce: only log once every 5 seconds (prevents spam from Binance tick handler)
+            const now = Date.now();
+            if (now - this.lastReversalLogAt >= 5000) {
+              this.lastReversalLogAt = now;
+              this.logger.info("REVERSAL — delta dropped but still +EV, holding naked", {
+                dropPct: `${dropPct.toFixed(0)}%`,
+                winnerFairValue: `${winnerFairValue}¢`,
+                entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+              });
+            }
+          }
+        }
+      }
     }
   }
 
   /**
-   * Fill 100% of loser shares at the given price.
+   * Safety check — runs every 500ms as fallback.
+   * Checks lookup table safety, velocity, flash crash, data staleness.
    */
-  private async fillLoser(askCents: number, reason: string): Promise<void> {
-    if (!this.state) return;
+  private safetyCheck(): void {
+    if (!this.state || !this.state.active || this.state.filled || this.state.soldBack || this.state.fillInFlight || this.exitExhausted) return;
+
+    // Check Binance data staleness — if we haven't received a tick in 5s, we're flying blind
+    const binanceTimestamp = this.binance.timestamp;
+    if (binanceTimestamp !== null && Date.now() - binanceTimestamp > 5000) {
+      this.logger.warn("Binance data stale (>5s) — cannot monitor reversal safely");
+      // If position is not super-safe, sell back proactively
+      const vol = this.volatilityCalc.getVolatility();
+      const currentDelta = this.state.currentBtcPrice - this.state.openingPrice;
+      const nDelta = vol > 0.01 ? currentDelta / vol : 0;
+      const lookup = lookupFairUp(nDelta, this.state.timeRemainingSeconds);
+      const fv = this.state.winnerSide === "Up" ? lookup.fairUp : 100 - lookup.fairUp;
+      if (fv < 98) {
+        // Not an overwhelmingly safe position — try defensive hedge first, then sell-back
+        const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+        const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+        const maxLoserPrice = this.getDefensiveLoserPrice();
+
+        if (loserAskCents && loserAskCents <= maxLoserPrice) {
+          this.logger.info("BINANCE STALE — defensive hedge (preferred over sell-back)", {
+            loserAsk: `${loserAskCents.toFixed(1)}¢`,
+            maxDefensive: `${maxLoserPrice.toFixed(1)}¢`,
+          });
+          this.state.fillInFlight = true;
+          this.fillLoserWithRetry(loserAskCents, "binance-stale").catch((err) => {
+            this.logger.error("Binance-stale hedge failed", { error: (err as Error).message });
+            if (this.state && !this.state.filled) this.state.fillInFlight = false;
+          });
+        } else {
+          this.state.fillInFlight = true;
+          this.emergencySellBackWithRetry("binance-stale").catch((err) => {
+            this.logger.error("Binance-stale sell-back failed", { error: (err as Error).message });
+            if (this.state) this.state.fillInFlight = false;
+          });
+        }
+        return;
+      }
+    }
+
+    const btcPrice = this.state.currentBtcPrice;
+    const currentDelta = btcPrice - this.state.openingPrice;
+    const vol = this.volatilityCalc.getVolatility();
+    const normalizedDelta = vol > 0.01 ? currentDelta / vol : 0;
+
+    // Lookup table safety check
+    const lookup = lookupFairUp(normalizedDelta, this.state.timeRemainingSeconds);
+    const winnerFairValue = this.state.winnerSide === "Up" ? lookup.fairUp : 100 - lookup.fairUp;
+
+    // Flash crash: check volatility spike against our position
+    const velocity = this.volatilityCalc.getPriceVelocity(5);
+    if (velocity !== null) {
+      const isAgainst = (this.state.winnerSide === "Up" && velocity < -20) ||
+                        (this.state.winnerSide === "Down" && velocity > 20);
+      if (isAgainst && winnerFairValue < 80) {
+        // Flash crash = loser is now cheap — perfect defensive hedge opportunity!
+        const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+        const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+        const maxLoserPrice = this.getDefensiveLoserPrice();
+
+        if (loserAskCents && loserAskCents <= maxLoserPrice) {
+          const pairCost = this.state.winnerAvgPriceCents + loserAskCents;
+          this.logger.info("FLASH CRASH — defensive hedge (capped loss)", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            loserAsk: `${loserAskCents.toFixed(1)}¢`,
+            pairCost: `${pairCost.toFixed(1)}¢`,
+            cappedLoss: pairCost > 100 ? `-${(pairCost - 100).toFixed(1)}¢/sh` : `+${(100 - pairCost).toFixed(1)}¢/sh`,
+          });
+          this.state.fillInFlight = true;
+          this.fillLoserWithRetry(loserAskCents, "flash-crash").catch((err) => {
+            this.logger.error("Flash crash hedge failed", { error: (err as Error).message });
+            if (this.state && !this.state.filled) this.state.fillInFlight = false;
+          });
+        } else if (winnerFairValue < this.state.winnerAvgPriceCents) {
+          this.logger.warn("FLASH CRASH — EV negative, selling back with retries", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            winnerFairValue: `${winnerFairValue}¢`,
+            entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+          });
+          this.state.fillInFlight = true;
+          this.emergencySellBackWithRetry("flash-crash").catch((err) => {
+            this.logger.error("Flash crash sell-back failed", { error: (err as Error).message });
+            if (this.state) this.state.fillInFlight = false;
+          });
+        } else {
+          this.logger.info("FLASH CRASH — still +EV, holding naked", {
+            velocity: `$${velocity.toFixed(1)}/s`,
+            winnerFairValue: `${winnerFairValue}¢`,
+            entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+          });
+        }
+        return;
+      }
+    }
+
+    // If close to settlement and position looks risky, try to HEDGE first (buy loser).
+    // Only sell-back if EV is actually negative (fairValue < entryPrice) — at 2¢ entry, holding is almost always +EV.
+    if (this.state.timeRemainingSeconds < 15 && winnerFairValue < this.config.nakedSafetyThreshold) {
+      // LATE WINDOW: defensive hedge with entry-based loss cap
+      const loserBook = this.clobWs.getBook(this.state.loserTokenId);
+      const loserAskCents = loserBook?.bestAsk ? loserBook.bestAsk * 100 : null;
+      const maxLoserPrice = this.getDefensiveLoserPrice();
+
+      if (loserAskCents && loserAskCents <= maxLoserPrice) {
+        const pairCost = this.state.winnerAvgPriceCents + loserAskCents;
+        this.logger.info("LATE WINDOW — defensive hedge (capped loss)", {
+          timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+          loserAsk: `${loserAskCents.toFixed(1)}¢`,
+          pairCost: `${pairCost.toFixed(1)}¢`,
+          cappedLoss: pairCost > 100 ? `-${(pairCost - 100).toFixed(1)}¢/sh` : `+${(100 - pairCost).toFixed(1)}¢/sh`,
+        });
+        this.state.fillInFlight = true;
+        this.fillLoserWithRetry(loserAskCents, "late-window").catch((err) => {
+          this.logger.error("Late hedge failed", { error: (err as Error).message });
+          if (this.state && !this.state.filled) this.state.fillInFlight = false;
+        });
+        return;
+      }
+
+      // No hedge available — only sell-back if EV is negative (fairValue < entryPrice)
+      if (winnerFairValue < this.state.winnerAvgPriceCents) {
+        this.logger.warn("LATE WINDOW — EV negative, selling back with retries", {
+          timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+          winnerFairValue: `${winnerFairValue}¢`,
+          entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+        });
+        this.state.fillInFlight = true;
+        this.emergencySellBackWithRetry("late-unsafe").catch((err) => {
+          this.logger.error("Late sell-back failed", { error: (err as Error).message });
+          if (this.state) this.state.fillInFlight = false;
+        });
+        return;
+      }
+
+      // FairValue > entryPrice → still +EV, HOLD naked (don't sell back!)
+      this.logger.info("LATE WINDOW — holding naked (+EV)", {
+        timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+        winnerFairValue: `${winnerFairValue}¢`,
+        entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+        ev: `+${(winnerFairValue - this.state.winnerAvgPriceCents).toFixed(1)}¢/share`,
+      });
+      return;
+    }
+
+    // Log status periodically (every 5s)
+    const elapsed = Date.now() - this.state.startedAt;
+    if (elapsed % 5000 < SAFETY_CHECK_INTERVAL_MS) {
+      this.logger.debug("Naked position status", {
+        winnerFairValue: `${winnerFairValue}¢`,
+        delta: `${normalizedDelta.toFixed(2)}σ ($${currentDelta.toFixed(2)})`,
+        timeLeft: `${this.state.timeRemainingSeconds.toFixed(0)}s`,
+        safe: winnerFairValue >= this.config.nakedSafetyThreshold ? "YES" : "NO",
+        elapsed: `${(elapsed / 1000).toFixed(0)}s`,
+      });
+    }
+  }
+
+  /**
+   * Try to buy loser at ultra-cheap price (≤3¢) or at any profitable price if urgent.
+   * This is the PRIMARY exit strategy — hedge beats sell-back at any entry price.
+   */
+  private tryOpportunisticLoserFill(urgent = false): void {
+    if (!this.state || this.state.filled || this.state.soldBack || this.state.fillInFlight) return;
+
+    const book = this.clobWs.getBook(this.state.loserTokenId);
+    const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
+
+    if (!askCents) return;
+
+    // When urgent (late window), accept any loser price that creates a profitable pair
+    const maxLoserCents = urgent
+      ? 100 - this.state.winnerAvgPriceCents - 1 // any price that locks in ≥1¢ profit per pair
+      : this.config.opportunisticLoserMaxCents;
+
+    if (askCents > maxLoserCents) return;
+
+    const pairCost = this.state.winnerAvgPriceCents + askCents;
+    const profitCents = 100 - pairCost;
+
+    this.logger.info(urgent ? "LATE HEDGE — buying loser to lock in profit" : "OPPORTUNISTIC LOSER — ultra-cheap fill available!", {
+      loserAsk: `${askCents.toFixed(1)}¢`,
+      pairCost: `${pairCost.toFixed(1)}¢`,
+      profit: `+${profitCents.toFixed(1)}¢/pair`,
+    });
+
+    this.state.fillInFlight = true;
+    this.fillLoser(askCents).catch((err) => {
+      this.logger.error("Hedge fill failed", { error: (err as Error).message });
+      if (this.state && !this.state.filled) this.state.fillInFlight = false;
+    });
+  }
+
+  /**
+   * Fill loser side at the given price (max acceptable).
+   */
+  private async fillLoser(maxPriceCents: number): Promise<void> {
+    if (!this.state || this.state.filled) return;
+    const gen = this.generation;
 
     const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
-    const pairCost = this.state.winnerAvgPriceCents + askCents;
-    // Fees: 2% taker fee on BOTH sides (winner already paid, loser will pay)
-    const winnerFeeCents = this.state.winnerAvgPriceCents * TAKER_FEE_PCT;
-    const loserFeeCents = askCents * TAKER_FEE_PCT;
-    const profitCents = 100 - pairCost - winnerFeeCents - loserFeeCents;
-    const priceDecimal = askCents / 100;
+    const pairCost = this.state.winnerAvgPriceCents + maxPriceCents;
+    const priceDecimal = maxPriceCents / 100;
     const shares = this.state.winnerShares;
     const costUsd = shares * priceDecimal;
 
-    this.logger.info(`HEDGE FILL (${reason}) — buying 100% loser`, {
+    this.logger.info("LOSER FILL — buying hedge", {
       side: loserSide,
-      price: `${askCents.toFixed(1)}¢`,
+      maxPrice: `${maxPriceCents.toFixed(1)}¢`,
       shares: shares.toFixed(2),
       pairCost: `${pairCost.toFixed(1)}¢`,
-      profit: `${profitCents >= 0 ? "+" : ""}${profitCents.toFixed(1)}¢/pair`,
-      elapsed: `${((Date.now() - this.state.startedAt) / 1000).toFixed(1)}s`,
+      pnl: pairCost > 100 ? `-${(pairCost - 100).toFixed(1)}¢/pair` : `+${(100 - pairCost).toFixed(1)}¢/pair`,
     });
 
     if (this.config.dryRun) {
-      this.logger.info("DRY_RUN — hedge fill simulated", { side: loserSide, price: `${askCents.toFixed(1)}¢` });
       this.state.filled = true;
       this.state.totalSharesFilled = shares;
       this.state.totalCostUsd = costUsd;
@@ -336,103 +593,308 @@ export class ArbCompletionMonitor {
       return;
     }
 
-    // Cross-check with REST API to avoid stale WS data
-    const freshBook = await this.clob.getOrderbook(this.state.loserTokenId);
-    const freshAskCents = freshBook.bestAsk ? freshBook.bestAsk * 100 : null;
-
-    if (freshAskCents && Math.abs(freshAskCents - askCents) > 5) {
-      this.logger.warn("WS/REST price mismatch — using REST price", {
-        wsAsk: `${askCents.toFixed(1)}¢`,
-        restAsk: `${freshAskCents.toFixed(1)}¢`,
-        diff: `${Math.abs(freshAskCents - askCents).toFixed(1)}¢`,
-      });
-      // Re-check with fresh price
-      const freshPairCost = this.state.winnerAvgPriceCents + freshAskCents;
-      const maxPair = (Date.now() - this.state.startedAt) >= PHASE2_AFTER_MS
-        ? PHASE2_MAX_PAIR_CENTS
-        : PHASE1_MAX_PAIR_CENTS;
-      if (freshPairCost > maxPair) {
-        this.logger.info("Fresh price too expensive — aborting fill, will retry");
-        this.state.fillInFlight = false;
-        return;
-      }
-    }
-
-    const fillPrice = freshAskCents ?? askCents;
-    const fillPriceDecimal = fillPrice / 100;
-    const fillCostUsd = shares * fillPriceDecimal;
-
-    const result = await this.clob.placeBatchOrders([{
+    // Try limit order first (maker = 0% fee), fallback to FOK after 1s
+    const result = await this.clob.placeLimitThenFOK({
       tokenId: this.state.loserTokenId,
       side: Side.BUY,
-      price: fillPriceDecimal,
+      price: priceDecimal + 0.01, // 1¢ above to ensure priority
       size: shares,
-    }]);
+      timeoutMs: 1000, // shorter timeout for hedge — speed matters
+    });
 
-    if (result.placed > 0) {
+    // Guard: state may have been reset while we awaited
+    if (gen !== this.generation || !this.state) return;
+
+    if (result.filled) {
       this.state.filled = true;
       this.state.totalSharesFilled = shares;
-      this.state.totalCostUsd = fillCostUsd;
+      this.state.totalCostUsd = costUsd;
       this.state.allOrderIds = result.orderIds;
-      this.complete(loserSide, shares, fillCostUsd, result.orderIds);
+      this.complete(loserSide, shares, costUsd, result.orderIds, result.maker);
     } else {
-      this.logger.warn("Hedge order rejected — will retry on next tick");
+      this.logger.warn("Loser limit+FOK failed — will retry or fall back");
       this.state.fillInFlight = false;
     }
   }
 
   /**
-   * Hedge timeout: loser side didn't fill. Keep naked winner position
-   * (positive EV from edge) — don't sell back and eat the spread.
+   * Fill loser with retries — widens price by 2¢ each attempt up to defensive max.
+   * On final failure, falls back to sell-back with retries.
    */
-  private async doBailOut(): Promise<void> {
-    if (!this.state) return;
+  private async fillLoserWithRetry(initialAskCents: number, reason: string): Promise<void> {
+    if (!this.state || this.state.filled) return;
+    this.hedgeRetryCount = 0;
+    const maxPrice = this.getDefensiveLoserPrice();
 
-    const winnerSide = this.state.winnerSide;
-    const loserSide: TradeSide = winnerSide === "Up" ? "Down" : "Up";
+    for (let attempt = 0; attempt < ArbCompletionMonitor.MAX_HEDGE_RETRIES; attempt++) {
+      if (!this.state || this.state.filled || this.state.soldBack) return;
 
-    // Before giving up on hedge, one last check — maybe loser dropped
-    const book = this.clobWs.getBook(this.state.loserTokenId);
-    const askCents = book?.bestAsk ? book.bestAsk * 100 : null;
-    if (askCents) {
-      const pairCost = this.state.winnerAvgPriceCents + askCents;
-      if (pairCost <= PHASE2_MAX_PAIR_CENTS) {
-        this.logger.info("Last-second fill opportunity — filling instead of holding naked");
-        await this.fillLoser(askCents, "last-chance");
+      // Re-read orderbook for latest ask on retries
+      let askCents = initialAskCents;
+      if (attempt > 0) {
+        const book = this.clobWs.getBook(this.state.loserTokenId);
+        askCents = book?.bestAsk ? book.bestAsk * 100 : initialAskCents;
+      }
+
+      // Widen acceptance by HEDGE_RETRY_STEP_CENTS per retry
+      const widened = askCents + (attempt * ArbCompletionMonitor.HEDGE_RETRY_STEP_CENTS);
+      const offerPrice = Math.min(widened, maxPrice);
+
+      if (askCents > offerPrice) {
+        this.logger.warn(`Hedge retry ${attempt + 1}/${ArbCompletionMonitor.MAX_HEDGE_RETRIES} — loser too expensive`, {
+          ask: `${askCents.toFixed(1)}¢`,
+          maxOffer: `${offerPrice.toFixed(1)}¢`,
+        });
+        continue;
+      }
+
+      this.logger.info(`Hedge attempt ${attempt + 1}/${ArbCompletionMonitor.MAX_HEDGE_RETRIES}`, {
+        reason,
+        offerPrice: `${offerPrice.toFixed(1)}¢`,
+        currentAsk: `${askCents.toFixed(1)}¢`,
+      });
+
+      await this.fillLoser(offerPrice);
+
+      if (this.state?.filled) {
+        this.hedgeRetryCount = 0;
+        return; // Success!
+      }
+
+      // Wait 300ms before retry
+      if (attempt < ArbCompletionMonitor.MAX_HEDGE_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    // All hedge retries failed — fall back to sell-back with retries
+    this.logger.warn(`All ${ArbCompletionMonitor.MAX_HEDGE_RETRIES} hedge attempts failed — falling back to sell-back`, { reason });
+    this.hedgeRetryCount = 0;
+    if (this.state && !this.state.filled && !this.state.soldBack) {
+      await this.emergencySellBackWithRetry(reason);
+    }
+  }
+
+  /**
+   * Emergency sell-back with retries — widens spread by 2¢ each attempt.
+   * Last resort after hedge retries fail.
+   */
+  private async emergencySellBackWithRetry(reason: string): Promise<void> {
+    if (!this.state || this.state.soldBack || this.state.filled) return;
+
+    for (let attempt = 0; attempt < ArbCompletionMonitor.MAX_SELLBACK_RETRIES; attempt++) {
+      if (!this.state || this.state.soldBack || this.state.filled) return;
+
+      // Widen spread aggressively: 5¢, 10¢, 15¢, 20¢, then accept ANY price
+      const isLastAttempt = attempt === ArbCompletionMonitor.MAX_SELLBACK_RETRIES - 1;
+      const spreadCents = isLastAttempt
+        ? 99 // Accept any price — selling at 1¢ is better than losing everything
+        : this.config.emergencySellMaxSpreadCents + (attempt * ArbCompletionMonitor.SELLBACK_RETRY_STEP_CENTS);
+
+      this.logger.info(`Sell-back attempt ${attempt + 1}/${ArbCompletionMonitor.MAX_SELLBACK_RETRIES}`, {
+        reason,
+        spreadTolerance: isLastAttempt ? "ANY PRICE" : `${spreadCents}¢`,
+      });
+
+      await this.emergencySellBackAtSpread(reason, spreadCents);
+
+      if (this.state?.soldBack) return; // Success!
+
+      // Wait 300ms before retry
+      if (attempt < ArbCompletionMonitor.MAX_SELLBACK_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    // All sell-back retries failed — mark exhausted to prevent re-triggering
+    if (this.state && !this.state.soldBack && !this.state.filled) {
+      this.exitExhausted = true;
+      this.logger.error("ALL EXIT ATTEMPTS FAILED — forced naked hold (will not retry)", { reason });
+      this.telegram.alertError(`All exits failed (${reason}). Naked hold: ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh`);
+      this.state.fillInFlight = false;
+    }
+  }
+
+  /**
+   * Emergency sell-back at a specific spread tolerance.
+   */
+  private async emergencySellBackAtSpread(reason: string, spreadCents: number): Promise<void> {
+    if (!this.state || this.state.soldBack || this.state.filled) return;
+    const gen = this.generation;
+
+    // Cancel any outstanding loser limit order
+    if (this.state.loserLimitOrderId) {
+      await this.clob.cancelOrder(this.state.loserLimitOrderId).catch(() => {});
+      this.state.loserLimitOrderId = null;
+    }
+
+    // Get current winner bid
+    const book = this.clobWs.getBook(this.state.winnerTokenId);
+    let bestBid = book?.bestBid;
+
+    if (!bestBid) {
+      try {
+        const restBook = await this.clob.getOrderbook(this.state.winnerTokenId);
+        if (gen !== this.generation || !this.state) return;
+        bestBid = restBook.bestBid;
+      } catch {
         return;
       }
     }
 
-    const bestSeen = this.state.bestLoserAskSeen;
-    const initialAsk = this.state.initialLoserAsk;
-    const neededForBreakeven = PHASE2_MAX_PAIR_CENTS - this.state.winnerAvgPriceCents;
-    const elapsedSec = ((Date.now() - this.state.startedAt) / 1000).toFixed(1);
+    if (!bestBid) {
+      this.logger.error("NO BIDS — cannot sell back", { reason });
+      return;
+    }
 
-    this.logger.info("HEDGE TIMEOUT — holding naked winner (positive EV from edge)", {
-      side: winnerSide,
-      shares: this.state.winnerShares.toFixed(2),
-      entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
-      elapsed: `${elapsedSec}s`,
-      loserAskNow: askCents ? `${askCents.toFixed(1)}¢` : "N/A",
-      loserAskInitial: initialAsk ? `${initialAsk.toFixed(1)}¢` : "N/A",
-      bestLoserAskSeen: `${bestSeen.toFixed(1)}¢`,
-      neededForBreakeven: `≤${neededForBreakeven.toFixed(1)}¢`,
-      gap: `${(bestSeen - neededForBreakeven).toFixed(1)}¢`,
+    const worstPrice = bestBid - (spreadCents / 100);
+    const expectedLossCents = this.state.winnerAvgPriceCents - (bestBid * 100);
+
+    this.logger.info(`SELL-BACK (${reason})`, {
+      bestBid: `${(bestBid * 100).toFixed(1)}¢`,
+      worstPrice: `${(worstPrice * 100).toFixed(1)}¢`,
+      expectedLoss: `${expectedLossCents.toFixed(1)}¢/share`,
+      spread: `${spreadCents}¢`,
     });
 
-    // Don't sell winner — hold for settlement. Edge = positive EV directional bet.
-    // Settlement logic handles naked positions correctly (win: +shares-cost, lose: -cost).
-    this.telegram.alertError(
-      `Naked hold: ${winnerSide} ${this.state.winnerShares.toFixed(0)}sh @ ${this.state.winnerAvgPriceCents.toFixed(0)}¢ — hedge timeout ${elapsedSec}s, gap=${(bestSeen - neededForBreakeven).toFixed(0)}¢`,
-    );
+    if (this.config.dryRun) {
+      this.state.soldBack = true;
+      this.telegram.alertError(`SELL-BACK (${reason}): ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh, loss ~${expectedLossCents.toFixed(0)}¢/sh`);
+      this.completeSellBack();
+      return;
+    }
 
-    this.complete(loserSide, 0, 0, []);
+    const result = await this.clob.placeMarketOrderFOK({
+      tokenId: this.state.winnerTokenId,
+      side: Side.SELL,
+      amount: this.state.winnerShares,
+      worstPrice,
+    });
+
+    if (gen !== this.generation || !this.state) return;
+
+    if (result.filled) {
+      this.state.soldBack = true;
+      this.state.allOrderIds.push(...result.orderIds);
+      this.telegram.alertError(`SELL-BACK OK (${reason}): ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh @ ~${(bestBid * 100).toFixed(0)}¢`);
+      this.completeSellBack();
+    }
+    // If not filled, caller will retry with wider spread
   }
 
-  private complete(side: TradeSide, shares: number, costUsd: number, orderIds: string[]): void {
+  /**
+   * Emergency sell-back: sell the winner at market (FOK SELL).
+   * Loss: ~1-3¢ spread. Prevents catastrophic loss.
+   */
+  private async emergencySellBack(reason: string): Promise<void> {
+    if (!this.state || this.state.soldBack || this.state.filled) return;
+    const gen = this.generation;
+
+    const winnerSide = this.state.winnerSide;
+
+    // Cancel any outstanding loser limit order
+    if (this.state.loserLimitOrderId) {
+      await this.clob.cancelOrder(this.state.loserLimitOrderId).catch(() => {});
+      this.state.loserLimitOrderId = null;
+    }
+
+    // Get current winner bid
+    const book = this.clobWs.getBook(this.state.winnerTokenId);
+    const bestBid = book?.bestBid;
+
+    if (!bestBid) {
+      // No bid available — try REST as fallback
+      try {
+        const restBook = await this.clob.getOrderbook(this.state.winnerTokenId);
+        if (gen !== this.generation || !this.state) return; // stale
+        if (restBook.bestBid) {
+          await this.executeSellBack(reason, restBook.bestBid, gen);
+        } else {
+          this.logger.error("NO BIDS AVAILABLE — cannot sell back, holding naked", { reason });
+          this.telegram.alertError(`No bids for sell-back (${reason}). Naked hold: ${winnerSide} ${this.state.winnerShares.toFixed(0)}sh @ ${this.state.winnerAvgPriceCents.toFixed(0)}¢`);
+          this.state.fillInFlight = false;
+          // Don't complete — let it ride to settlement
+        }
+      } catch (err) {
+        this.logger.error("REST fallback for sell-back failed", { error: (err as Error).message });
+        this.state.fillInFlight = false;
+      }
+      return;
+    }
+
+    await this.executeSellBack(reason, bestBid, gen);
+  }
+
+  private async executeSellBack(reason: string, bestBid: number, gen?: number): Promise<void> {
+    if (!this.state) return;
+
+    const worstPrice = bestBid - (this.config.emergencySellMaxSpreadCents / 100);
+    const expectedLossCents = this.state.winnerAvgPriceCents - (bestBid * 100);
+
+    this.logger.info(`EMERGENCY SELL-BACK (${reason})`, {
+      side: this.state.winnerSide,
+      shares: this.state.winnerShares.toFixed(2),
+      entryPrice: `${this.state.winnerAvgPriceCents.toFixed(1)}¢`,
+      bestBid: `${(bestBid * 100).toFixed(1)}¢`,
+      expectedLoss: `${expectedLossCents.toFixed(1)}¢/share`,
+      worstPrice: `${(worstPrice * 100).toFixed(1)}¢`,
+    });
+
+    if (this.config.dryRun) {
+      this.state.soldBack = true;
+      const sellProceeds = this.state.winnerShares * bestBid;
+      const entryCost = this.state.winnerShares * (this.state.winnerAvgPriceCents / 100);
+      const pnl = sellProceeds - entryCost;
+      this.logger.info("DRY_RUN — sell-back simulated", { pnl: `$${pnl.toFixed(4)}` });
+      this.telegram.alertError(`SELL-BACK (${reason}): ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh, loss ~${expectedLossCents.toFixed(0)}¢/sh`);
+      // Complete with 0 loser shares (sell-back, not hedge)
+      this.completeSellBack();
+      return;
+    }
+
+    // FOK SELL the winner position
+    const result = await this.clob.placeMarketOrderFOK({
+      tokenId: this.state.winnerTokenId,
+      side: Side.SELL,
+      amount: this.state.winnerShares,
+      worstPrice,
+    });
+
+    // Guard: state may have been reset while we awaited
+    if ((gen !== undefined && gen !== this.generation) || !this.state) return;
+
+    if (result.filled) {
+      this.state.soldBack = true;
+      this.state.allOrderIds.push(...result.orderIds);
+      this.telegram.alertError(`SELL-BACK OK (${reason}): ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh @ ~${(bestBid * 100).toFixed(0)}¢`);
+      this.completeSellBack();
+    } else {
+      this.logger.error("SELL-BACK FOK FAILED — holding naked", { reason });
+      this.telegram.alertError(`Sell-back FAILED (${reason}). Naked hold: ${this.state.winnerSide} ${this.state.winnerShares.toFixed(0)}sh`);
+      this.state.fillInFlight = false;
+    }
+  }
+
+  private completeSellBack(): void {
+    if (!this.state) return;
+    const loserSide: TradeSide = this.state.winnerSide === "Up" ? "Down" : "Up";
+    // Signal sell-back: 0 loser shares, soldBack=true
+    this.completeInternal(loserSide, 0, 0, [], true);
+  }
+
+  private complete(side: TradeSide, shares: number, costUsd: number, orderIds: string[], maker?: boolean): void {
+    this.completeInternal(side, shares, costUsd, orderIds, false, maker);
+  }
+
+  private completeInternal(side: TradeSide, shares: number, costUsd: number, orderIds: string[], soldBack: boolean, maker?: boolean): void {
     if (!this.state) return;
 
     this.state.active = false;
+
+    if (this.binanceUnsubscribe) {
+      this.binanceUnsubscribe();
+      this.binanceUnsubscribe = null;
+    }
 
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
@@ -440,7 +902,7 @@ export class ArbCompletionMonitor {
     }
 
     if (this.onCompleteCallback) {
-      this.onCompleteCallback(side, shares, costUsd, orderIds);
+      this.onCompleteCallback(side, shares, costUsd, orderIds, soldBack, maker);
     }
   }
 }

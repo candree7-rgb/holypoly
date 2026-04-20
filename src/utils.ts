@@ -19,6 +19,30 @@ export const formatUsd = (amount: number) => amount.toFixed(2);
 
 export const isPositive = (n: number) => Number.isFinite(n) && n > 0;
 
+/**
+ * Polymarket crypto fee calculation.
+ * Formula: shares × price × feeRate × (price × (1 - price))^exponent
+ * Crypto markets: feeRate=0.25, exponent=2
+ * Returns fee in USD.
+ */
+export const polymarketFee = (shares: number, price: number): number => {
+  const CRYPTO_FEE_RATE = 0.25;
+  const CRYPTO_FEE_EXPONENT = 2;
+  const pq = price * (1 - price);
+  return shares * price * CRYPTO_FEE_RATE * Math.pow(pq, CRYPTO_FEE_EXPONENT);
+};
+
+/**
+ * Effective fee rate at a given price level.
+ * At 90¢: ~0.20%, at 50¢: ~1.56%, at 10¢: ~0.20%, at 5¢: ~0.06%
+ */
+export const polymarketFeeRate = (price: number): number => {
+  const CRYPTO_FEE_RATE = 0.25;
+  const CRYPTO_FEE_EXPONENT = 2;
+  const pq = price * (1 - price);
+  return CRYPTO_FEE_RATE * Math.pow(pq, CRYPTO_FEE_EXPONENT);
+};
+
 /** Standard normal CDF approximation (Abramowitz & Stegun) */
 export const normalCdf = (x: number): number => {
   const a1 = 0.254829592;
