@@ -100,6 +100,12 @@ export class TargetTracker {
   private isPolling = false;
   // per-address cursors live in lastPollTimestamps below
 
+  // Our own wallet address — used for outbound TransferSingle subscription
+  private profileAddress: string = "";
+
+  // Callback for our own outbound fills (SELLs settled on-chain)
+  private onOurFillCb: ((event: { tokenId: string; shares: number; direction: "in" | "out"; txHash: string }) => void) | null = null;
+
   // Pending on-chain events waiting for metadata from API (keyed by unique eventId)
   private pendingChainEvents: Map<string, { leaderAddress: string; tokenId: string; shares: number; timestamp: number }> = new Map();
 
@@ -126,6 +132,8 @@ export class TargetTracker {
     pollIntervalMs: number,
     logger: Logger,
     gammaHost?: string,
+    /** Our own profile wallet — used to subscribe to outbound TransferSingle for SELL ground-truth */
+    profileAddress?: string,
   ) {
     this.dataApiHost = dataApiHost.replace(/\/$/, "");
     this.gammaHost = (gammaHost ?? "https://gamma-api.polymarket.com").replace(/\/$/, "");
@@ -134,6 +142,7 @@ export class TargetTracker {
     this.targetAddresses = addrs.map((a) => a.toLowerCase());
     this.targetAddress = this.targetAddresses[0];
 
+    this.profileAddress = (profileAddress ?? "").toLowerCase();
     this.rpcWsUrl = rpcWsUrl;
     this.pollIntervalMs = pollIntervalMs;
     this.logger = logger;
@@ -144,6 +153,11 @@ export class TargetTracker {
 
   onNewTrade(cb: (trade: TargetTrade) => void): void {
     this.onTrade = cb;
+  }
+
+  /** Register callback for our own outbound TransferSingle (SELL settled on-chain) */
+  onOurFill(cb: (event: { tokenId: string; shares: number; direction: "in" | "out"; txHash: string }) => void): void {
+    this.onOurFillCb = cb;
   }
 
   /**
@@ -246,6 +260,72 @@ export class TargetTracker {
     // Layer 3: On-chain WebSocket (backup)
     if (this.rpcWsUrl) {
       this.connectChainWs();
+    }
+
+    // Pre-warm: subscribe CLOB WS to all token IDs each leader currently holds.
+    // Without this, the first trade on a new token is detected via API poll only.
+    // Pre-warming makes every leader trade trigger the instant-check path.
+    this.prewarmLeaderTokens().catch((err) =>
+      this.logger.warn("Initial pre-warm failed", { error: (err as Error).message }),
+    );
+    setInterval(() => this.prewarmLeaderTokens().catch(() => {}), 60_000);
+  }
+
+  /**
+   * Query each leader's open positions + recent activity, subscribe CLOB WS
+   * to every relevant token ID. Critical for detecting the first trade on a
+   * new market (otherwise we'd only catch it via API poll, ~50-100ms slower).
+   */
+  private async prewarmLeaderTokens(): Promise<void> {
+    const tokens = new Set<string>();
+    const cutoffSec = Math.floor(Date.now() / 1000) - 3600; // last 1h
+
+    for (const addr of this.targetAddresses) {
+      // Open positions — subscribe so we catch SELLs and add-on BUYs
+      try {
+        const url = `${this.dataApiHost}/positions?user=${addr}&sizeThreshold=0&limit=200`;
+        const resp = await fetch(url, {
+          headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          const positions = await resp.json() as Array<{ asset?: string; size?: number }>;
+          for (const p of positions) {
+            if (p.asset && (p.size ?? 0) > 0) tokens.add(p.asset);
+          }
+        }
+      } catch { /* skip */ }
+
+      // Recently traded (last 1h) — subscribe to catch quick re-entries
+      try {
+        const url = `${this.dataApiHost}/activity?user=${addr}&type=TRADE&limit=100`;
+        const resp = await fetch(url, {
+          headers: { Accept: "application/json", "User-Agent": "holypoly-copytrade" },
+          signal: AbortSignal.timeout(3000),
+        });
+        if (resp.ok) {
+          const acts = await resp.json() as Array<{ asset?: string; assetId?: string; timestamp?: number | string }>;
+          for (const a of acts) {
+            const ts = typeof a.timestamp === "number" ? a.timestamp : Number(a.timestamp);
+            if (ts >= cutoffSec) {
+              const id = a.assetId || a.asset;
+              if (id) tokens.add(id);
+            }
+          }
+        }
+      } catch { /* skip */ }
+    }
+
+    if (tokens.size > 0) {
+      const before = this.watchedTokenIds.size;
+      this.watchTokenIds(Array.from(tokens));
+      const added = this.watchedTokenIds.size - before;
+      if (added > 0) {
+        this.logger.info("Pre-warmed CLOB WS subscriptions", {
+          totalWatched: this.watchedTokenIds.size,
+          newTokens: added,
+        });
+      }
     }
   }
 
@@ -435,6 +515,8 @@ export class TargetTracker {
 
   /** Map subscription ID → leader address for multi-target chain WS */
   private chainSubIdToAddr: Map<string, string> = new Map();
+  /** Subscription ID for our own outbound transfers (SELL settlements). Empty = not subscribed. */
+  private ourOutboundSubId: string = "";
 
   private subscribeChainEvents(): void {
     if (!this.chainWs || this.chainWs.readyState !== WebSocket.OPEN) return;
@@ -442,10 +524,13 @@ export class TargetTracker {
     // One eth_subscribe per target address (Polygon WS doesn't support OR on topic filters).
     // Each subscription's response ID maps back to the originating leader.
     this.chainSubIdToAddr.clear();
+    this.ourOutboundSubId = "";
     // Clear pending req map too — prevents stale req IDs from surviving reconnects
     (this as unknown as { _pendingChainReqs?: Map<number, string> })._pendingChainReqs = new Map();
-    this.targetAddresses.forEach((addr, idx) => {
-      const reqId = idx + 1;
+
+    let nextReqId = 1;
+    this.targetAddresses.forEach((addr) => {
+      const reqId = nextReqId++;
       const subscribeMsg = {
         jsonrpc: "2.0",
         id: reqId,
@@ -458,19 +543,44 @@ export class TargetTracker {
               TRANSFER_SINGLE_TOPIC,
               null, // operator: any
               null, // from: any
-              padAddress(addr), // to: this specific target
+              padAddress(addr), // to: this specific target (BUY settlement)
             ],
           },
         ],
       };
       this.chainWs!.send(JSON.stringify(subscribeMsg));
-      // Stash the mapping; handler will populate by req ID
       (this as unknown as { _pendingChainReqs: Map<number, string> })._pendingChainReqs ??= new Map();
       (this as unknown as { _pendingChainReqs: Map<number, string> })._pendingChainReqs.set(reqId, addr);
     });
 
+    // Subscribe to OUR OUTBOUND transfers (SELL settlements for our wallet).
+    // Used as ground-truth for SellEngine fill confirmation (~2s vs /positions API lag).
+    if (this.profileAddress) {
+      const reqId = nextReqId++;
+      const ourMsg = {
+        jsonrpc: "2.0",
+        id: reqId,
+        method: "eth_subscribe",
+        params: [
+          "logs",
+          {
+            address: CTF_ADDRESS,
+            topics: [
+              TRANSFER_SINGLE_TOPIC,
+              null,
+              padAddress(this.profileAddress), // from: our wallet (SELL)
+              null,
+            ],
+          },
+        ],
+      };
+      this.chainWs.send(JSON.stringify(ourMsg));
+      (this as unknown as { _pendingChainReqs: Map<number, string> })._pendingChainReqs.set(reqId, "OUR_OUTBOUND");
+    }
+
     this.logger.info("Subscribed to CTF TransferSingle events", {
       targets: this.targetAddresses.length,
+      ourOutbound: this.profileAddress ? "enabled" : "disabled",
       addresses: this.targetAddresses.map((a) => a.slice(0, 8) + "...").join(","),
     });
   }
@@ -489,14 +599,18 @@ export class TargetTracker {
       subscription?: string;
     };
   }): void {
-    // Subscription confirmation (per-target)
+    // Subscription confirmation (per-target or our outbound)
     if (typeof msg.id === "number" && msg.result) {
       const pending = (this as unknown as { _pendingChainReqs?: Map<number, string> })._pendingChainReqs;
-      const addr = pending?.get(msg.id);
-      if (addr) {
-        this.chainSubIdToAddr.set(msg.result, addr);
+      const tag = pending?.get(msg.id);
+      if (tag === "OUR_OUTBOUND") {
+        this.ourOutboundSubId = msg.result;
         pending!.delete(msg.id);
-        this.logger.info("Chain subscription active", { subId: msg.result, leader: addr.slice(0, 8) + "..." });
+        this.logger.info("Chain subscription active (OUR OUTBOUND)", { subId: msg.result });
+      } else if (tag) {
+        this.chainSubIdToAddr.set(msg.result, tag);
+        pending!.delete(msg.id);
+        this.logger.info("Chain subscription active", { subId: msg.result, leader: tag.slice(0, 8) + "..." });
       }
       return;
     }
@@ -506,30 +620,50 @@ export class TargetTracker {
       const log = msg.params.result;
       if (!log.topics || log.topics.length < 4 || !log.data) return;
 
+      const subId = msg.params.subscription || "";
+
+      // Decode TransferSingle data first (shared by all branches)
+      const dataHex = log.data.replace("0x", "");
+      if (dataHex.length < 128) return;
+      const tokenIdBigInt = BigInt("0x" + dataHex.slice(0, 64));
+      const tokenIdDecimal = tokenIdBigInt.toString();
+      const rawValue = BigInt("0x" + dataHex.slice(64, 128));
+      const sharesValue = Number(rawValue) / 1e6;
+      const txHashValue = log.transactionHash || "";
+
+      // OUR OUTBOUND (we sold) — emit OurFill event for SellEngine ground truth
+      if (subId && subId === this.ourOutboundSubId) {
+        if (sharesValue > 0 && this.onOurFillCb) {
+          this.logger.info("ON-CHAIN: Our wallet transferred OUT (SELL settled)", {
+            tokenId: tokenIdDecimal.slice(0, 12) + "...",
+            shares: sharesValue.toFixed(1),
+            tx: txHashValue.slice(0, 12) + "...",
+          });
+          this.onOurFillCb({
+            tokenId: tokenIdDecimal,
+            shares: sharesValue,
+            direction: "out",
+            txHash: txHashValue,
+          });
+        }
+        return;
+      }
+
       // Resolve which leader this subscription belongs to.
       // If unresolved (race: event arrived before subscribe confirmation),
       // drop the event — the API poll will catch it. Falling back to
       // targets[0] would misattribute the trade and apply wrong multiplier.
-      const subId = msg.params.subscription || "";
       const leaderAddress = this.chainSubIdToAddr.get(subId);
       if (!leaderAddress) {
         this.logger.warn("Chain event with unresolved subscription — dropping (API poll will catch it)", { subId });
         return;
       }
 
-      // Decode TransferSingle data: (uint256 id, uint256 value)
-      const data = log.data.replace("0x", "");
-      if (data.length < 128) return;
-
-      // Convert token ID from hex to decimal string (CLOB/Gamma expect decimal)
-      const tokenIdBigInt = BigInt("0x" + data.slice(0, 64));
-      const tokenIdDecimal = tokenIdBigInt.toString();
-      const rawValue = BigInt("0x" + data.slice(64, 128));
-      const shares = Number(rawValue) / 1e6;
-
+      // (TransferSingle data already decoded above into tokenIdDecimal/sharesValue/txHashValue)
+      const shares = sharesValue;
+      const txHash = txHashValue;
       if (shares <= 0) return;
 
-      const txHash = log.transactionHash || "";
       const eventId = `chain-${leaderAddress}-${txHash}-${tokenIdDecimal}`;
 
       if (this.seenIds.has(eventId)) return;

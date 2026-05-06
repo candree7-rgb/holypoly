@@ -14,9 +14,13 @@
 
 import "dotenv/config";
 import { webcrypto } from "crypto";
+import { installHttpAgent } from "../data/http-agent.js";
 import { createLogger } from "../logger.js";
 import { ClobService } from "../data/clob.js";
 import { TelegramNotifier } from "../telegram.js";
+
+// Install HTTP keep-alive agent BEFORE any fetch calls
+installHttpAgent();
 import { loadCopyTradeConfig } from "./config.js";
 import { TargetTracker } from "./tracker.js";
 import { CopyExecutor, type CopyResult, type FillEvent, type UnfilledEvent } from "./executor.js";
@@ -128,7 +132,20 @@ async function main() {
     config.pollIntervalMs,
     logger,
     config.gammaHost,
+    config.profileAddress, // for OUR-OUTBOUND chain WS subscription (SELL ground truth)
   );
+
+  // Wire our outbound transfers (SELL settlements) → SellEngine ground truth
+  tracker.onOurFill((event) => {
+    if (event.direction === "out") {
+      // Apply to all active SELL intents matching this token
+      const sellEngine = executor.getSellEngine();
+      const intents = sellEngine.getActiveIntents().filter((i) => i.tokenId === event.tokenId);
+      for (const intent of intents) {
+        sellEngine.applyExternalFill(event.tokenId, intent.leaderAddress, event.shares, intent.avgFillPrice || 0);
+      }
+    }
+  });
 
   // Wire: tracker → executor → telegram → DB
   tracker.onNewTrade((trade) => {

@@ -7,6 +7,8 @@ export interface BookSnapshot {
   asks: Array<{ price: number; size: number }>;
   bestBid: number | null;
   bestAsk: number | null;
+  /** Last update time (ms) — used to gate cache freshness */
+  updatedAt: number;
 }
 
 /**
@@ -159,12 +161,13 @@ export class ClobWsClient {
               bids: [],
               asks: [],
               bestBid: null,
-              bestAsk: null,
+              bestAsk: null, updatedAt: Date.now(),
             };
             this.books.set(msg.asset_id, existing);
           }
           if (msg.best_bid) existing.bestBid = parseFloat(msg.best_bid) || existing.bestBid;
           if (msg.best_ask) existing.bestAsk = parseFloat(msg.best_ask) || existing.bestAsk;
+          existing.updatedAt = Date.now();
           this.notifyUpdate(msg.asset_id, existing);
 
         } else if (msg.event_type === "price_change" && msg.price_changes) {
@@ -177,12 +180,13 @@ export class ClobWsClient {
                 bids: [],
                 asks: [],
                 bestBid: null,
-                bestAsk: null,
+                bestAsk: null, updatedAt: Date.now(),
               };
               this.books.set(change.asset_id, existing);
             }
             existing.bestBid = parseFloat(change.best_bid) || existing.bestBid;
             existing.bestAsk = parseFloat(change.best_ask) || existing.bestAsk;
+            existing.updatedAt = Date.now();
             this.notifyUpdate(change.asset_id, existing);
           }
         }
@@ -227,6 +231,7 @@ export class ClobWsClient {
       asks,
       bestBid: bids.length > 0 ? bids[0].price : null,
       bestAsk: asks.length > 0 ? asks[0].price : null,
+      updatedAt: Date.now(),
     };
   }
 
