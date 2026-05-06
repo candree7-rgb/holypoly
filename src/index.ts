@@ -1,6 +1,6 @@
 import "dotenv/config";
 import { webcrypto } from "crypto";
-import { Side } from "@polymarket/clob-client";
+import { Side } from "@polymarket/clob-client-v2";
 import { loadConfig, ConfigError, type Config } from "./config.js";
 import { createLogger } from "./logger.js";
 import { Database } from "./db.js";

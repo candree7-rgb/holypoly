@@ -5,7 +5,7 @@ import {
   OrderType,
   Side,
   TickSize,
-} from "@polymarket/clob-client";
+} from "@polymarket/clob-client-v2";
 import { Wallet } from "ethers";
 import { Logger } from "../logger.js";
 
@@ -60,44 +60,40 @@ export class ClobService {
 
   static async init(config: ClobConfig, logger: Logger): Promise<ClobService> {
     const signer = new Wallet(config.privateKey);
-    const temp = new ClobClient(
-      config.host,
-      config.chainId,
+    // V2 SDK uses options-object constructor, `chain` instead of `chainId`
+    const temp = new ClobClient({
+      host: config.host,
+      chain: config.chainId,
       signer,
-      undefined,
-      config.signatureType,
-      config.funderAddress,
-    );
+      signatureType: config.signatureType,
+      funderAddress: config.funderAddress,
+    });
 
     let creds = config.apiCreds;
     if (!creds) {
-      logger.info("Deriving Polymarket API keys");
-      const derived = await temp.deriveApiKey();
+      logger.info("Deriving Polymarket V2 API keys");
+      // V2 has a single combined method that derives or creates as needed
+      const derived = await temp.createOrDeriveApiKey();
       if (ClobService.isValidCreds(derived)) {
         creds = derived;
-        logger.info("Derived API keys.");
+        logger.info("V2 API keys ready.");
       } else {
-        logger.warn("No existing API keys found, attempting create");
-        const created = await temp.createApiKey();
-        if (ClobService.isValidCreds(created)) {
-          creds = created;
-          logger.info("Created API keys.");
-        } else {
-          throw new Error(
-            "Unable to create or derive API keys. Check SIGNATURE_TYPE, PRIVATE_KEY, and PROFILE_ADDRESS.",
-          );
-        }
+        throw new Error(
+          "Unable to create or derive V2 API keys. Check SIGNATURE_TYPE, PRIVATE_KEY, and FUNDER_ADDRESS.",
+        );
       }
     }
 
-    const client = new ClobClient(
-      config.host,
-      config.chainId,
+    const builderCode = process.env.POLY_BUILDER_CODE;
+    const client = new ClobClient({
+      host: config.host,
+      chain: config.chainId,
       signer,
       creds,
-      config.signatureType,
-      config.funderAddress,
-    );
+      signatureType: config.signatureType,
+      funderAddress: config.funderAddress,
+      ...(builderCode ? { builderConfig: { builderCode } } : {}),
+    });
     return new ClobService(client, logger);
   }
 
@@ -439,7 +435,7 @@ export class ClobService {
     const firstMeta = await this.getMarketMeta(orders[0].tokenId);
 
     // Sign all orders
-    const signedArgs: Array<{ order: import("@polymarket/clob-client").SignedOrder; orderType: OrderType }> = [];
+    const signedArgs: Array<{ order: import("@polymarket/clob-client-v2").SignedOrder; orderType: OrderType }> = [];
     let skipped = 0;
 
     for (const order of orders) {

@@ -67,6 +67,28 @@ export interface CopyTradeConfig {
   /** Speed mode: "normal" = GTC test → FOK fallback, "fast" = direct FOK (lowest latency) */
   speedMode: "normal" | "fast";
 
+  // ============ SELL ENGINE ============
+  /** Stage 1 FAK aggressive slippage (cents below bestBid) — default 3 */
+  sellAggressiveSlippageCents: number;
+  /** Stage 2 escalating FAK loop max attempts — default 5 */
+  sellMaxAttempts: number;
+  /** Stage 4 escalation: cents below bestBid after 30s — default 3 */
+  sellEscalate30sCents: number;
+  /** Stage 4 escalation: cents below bestBid after 60s — default 5 */
+  sellEscalate60sCents: number;
+  /** Stage 4 escalation: force exit at minPriceCents after 120s — default true */
+  sellForceFloorExit: boolean;
+  /** Mark intent abandoned after this many hours — default 24 */
+  sellIntentAbandonHours: number;
+  /** Reconcile ledger every N ms against on-chain — default 60_000 */
+  ledgerReconcileMs: number;
+
+  // ============ HIGH-PRICE FAST PATH (92-99¢) ============
+  /** Min price to trigger fast path (skip GTC test, direct FAK) — default 92 */
+  highPriceFastPathMinCents: number;
+  /** Max slippage (cents) for high-price band — default 1 */
+  highPriceMaxSlippageCents: number;
+
   // Filters
   /** Only copy trades on these market types (empty = all) */
   marketFilter: string[];
@@ -240,6 +262,19 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
   const speedModeRaw = (getEnv("COPY_SPEED_MODE") ?? "normal").toLowerCase();
   const speedMode = (speedModeRaw === "fast" ? "fast" : "normal") as "normal" | "fast";
 
+  // SELL Engine
+  const sellAggressiveSlippageCents = parseNumber("COPY_SELL_AGGRESSIVE_SLIP_CENTS", 3);
+  const sellMaxAttempts = parseNumber("COPY_SELL_MAX_ATTEMPTS", 5);
+  const sellEscalate30sCents = parseNumber("COPY_SELL_ESCALATE_30S_CENTS", 3);
+  const sellEscalate60sCents = parseNumber("COPY_SELL_ESCALATE_60S_CENTS", 5);
+  const sellForceFloorExit = parseBoolean("COPY_SELL_FORCE_FLOOR", true);
+  const sellIntentAbandonHours = parseNumber("COPY_SELL_ABANDON_HOURS", 24);
+  const ledgerReconcileMs = parseNumber("COPY_LEDGER_RECONCILE_MS", 60_000);
+
+  // High-price fast path (92-99¢)
+  const highPriceFastPathMinCents = parseNumber("COPY_HIGH_PRICE_FAST_PATH_MIN_CENTS", 92);
+  const highPriceMaxSlippageCents = parseNumber("COPY_HIGH_PRICE_MAX_SLIPPAGE_CENTS", 1);
+
   // Filters
   const marketFilterRaw = getEnv("COPY_MARKET_FILTER") ?? "";
   const marketFilter = marketFilterRaw ? marketFilterRaw.split(",").map((s) => s.trim().toLowerCase()) : [];
@@ -308,6 +343,15 @@ export const loadCopyTradeConfig = (): CopyTradeConfig => {
     maxBumps,
     fokFallback,
     speedMode,
+    sellAggressiveSlippageCents,
+    sellMaxAttempts,
+    sellEscalate30sCents,
+    sellEscalate60sCents,
+    sellForceFloorExit,
+    sellIntentAbandonHours,
+    ledgerReconcileMs,
+    highPriceFastPathMinCents,
+    highPriceMaxSlippageCents,
     marketFilter,
     copyBuysOnly,
     copyRedemptions,

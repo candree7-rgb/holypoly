@@ -99,10 +99,7 @@ async function main() {
     }
   }
 
-  // Init executor (GTC limit orders)
-  const executor = new CopyExecutor(clob, config, logger);
-
-  // Init DB (optional — only if DATABASE_URL is set)
+  // Init DB FIRST (needed for resolution tracker)
   let db: CopyTradeDB | null = null;
   if (config.databaseUrl) {
     try {
@@ -113,6 +110,15 @@ async function main() {
       db = null;
     }
   }
+
+  // Resolution tracker (needs DB, but used by executor's SellEngine for short-circuit)
+  let resolution: ResolutionTracker | null = null;
+  if (db) {
+    resolution = new ResolutionTracker(db, config.gammaHost, logger);
+  }
+
+  // Init executor (uses resolution for SELL short-circuit)
+  const executor = new CopyExecutor(clob, config, logger, resolution ?? undefined);
 
   // Init tracker (WebSocket + API polling) — pass ALL target addresses
   const tracker = new TargetTracker(
@@ -229,11 +235,8 @@ async function main() {
     });
   }, 60_000);
 
-  // Resolution tracker: polls markets for resolution, updates PNL
-  let resolution: ResolutionTracker | null = null;
-  if (db) {
-    resolution = new ResolutionTracker(db, config.gammaHost, logger);
-
+  // Wire resolution tracker callbacks + start (constructed earlier)
+  if (resolution) {
     // Win/Loss Telegram notification per resolved trade
     resolution.onTradeResolved((event: ResolutionEvent) => {
       const emoji = event.won ? "✅" : "❌";

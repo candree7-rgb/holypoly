@@ -131,6 +131,12 @@ export class ResolutionTracker {
     return ourOutcome.toLowerCase() === winningOutcome.toLowerCase();
   }
 
+  /** Public API for SellEngine: is this market resolved? */
+  async isResolved(conditionId: string): Promise<boolean> {
+    const m = await this.getResolvedMarket(conditionId);
+    return m?.resolved === true;
+  }
+
   private async getResolvedMarket(conditionId: string): Promise<ResolvedMarket | null> {
     // Cache miss = query; cached nulls = market not yet resolved (retry next tick)
     const cached = this.marketCache.get(conditionId);

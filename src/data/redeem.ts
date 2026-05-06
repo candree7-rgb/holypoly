@@ -8,7 +8,8 @@ import type { Position } from "../types.js";
 import { toBaseUnits } from "../utils.js";
 
 const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
-const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/** V2 collateral token (pUSD) — replaces USDC.e for new conditions */
+const PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 
 const ctfRedeemAbi = [
@@ -114,7 +115,7 @@ export class RedeemService {
   private createCtfRedeem(conditionId: string): Transaction {
     const calldata = encodeFunctionData({
       ...ctfRedeemFn,
-      args: [USDC_ADDRESS as Hex, zeroHash, conditionId as Hex, [1n, 2n]],
+      args: [PUSD_ADDRESS as Hex, zeroHash, conditionId as Hex, [1n, 2n]],
     });
     return { to: CTF_ADDRESS, data: calldata, value: "0" };
   }

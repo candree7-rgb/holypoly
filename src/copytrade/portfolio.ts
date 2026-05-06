@@ -1,7 +1,9 @@
 import type { Logger } from "../logger.js";
 
-/** USDC.e on Polygon (Polymarket uses this for pUSD) */
-const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/** pUSD on Polygon — Polymarket V2 collateral (replaces USDC.e from V1) */
+const PUSD_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+/** USDC.e on Polygon — legacy V1 collateral, queried for transition residuals */
+const USDCE_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 export interface Position {
   asset: string; // CLOB token ID
@@ -122,24 +124,32 @@ async function fetchPositionValue(proxyWallet: string, dataApiHost: string): Pro
 
 async function fetchUsdcBalance(proxyWallet: string, rpcUrl: string): Promise<number> {
   // ERC-20 balanceOf(address) selector = 0x70a08231
-  const paddedAddr = proxyWallet.replace("0x", "").padStart(64, "0");
+  const paddedAddr = proxyWallet.replace(/^0x/i, "").padStart(64, "0");
   const callData = "0x70a08231" + paddedAddr;
 
-  const resp = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_call",
-      params: [{ to: USDC_ADDRESS, data: callData }, "latest"],
-    }),
-    signal: AbortSignal.timeout(3000),
-  });
-  if (!resp.ok) return 0;
+  // Query both pUSD (V2 active) AND USDC.e (legacy residual) and sum.
+  // Both are 6-decimal stablecoins backed 1:1 by USDC.
+  const queryToken = async (token: string): Promise<bigint> => {
+    const resp = await fetch(rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_call",
+        params: [{ to: token, data: callData }, "latest"],
+      }),
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!resp.ok) return 0n;
+    const data = await resp.json() as { result?: string };
+    if (!data.result) return 0n;
+    return BigInt(data.result);
+  };
 
-  const data = await resp.json() as { result?: string };
-  if (!data.result) return 0;
-  const raw = BigInt(data.result);
-  return Number(raw) / 1e6; // USDC has 6 decimals
+  const [pusd, usdce] = await Promise.all([
+    queryToken(PUSD_ADDRESS).catch(() => 0n),
+    queryToken(USDCE_ADDRESS).catch(() => 0n),
+  ]);
+  return Number(pusd + usdce) / 1e6;
 }

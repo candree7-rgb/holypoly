@@ -1,9 +1,9 @@
-import { Side } from "@polymarket/clob-client";
+import { Side } from "@polymarket/clob-client-v2";
 import { ClobService } from "../data/clob.js";
 import { getPortfolioValue, getPositionForToken } from "./portfolio.js";
-
-/** USDC.e on Polygon (Polymarket uses this for balances) */
-const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+import { PositionLedger } from "./ledger.js";
+import { SellEngine, type SellIntent } from "./sell-engine.js";
+import type { ResolutionTracker } from "./resolution.js";
 import type { Logger } from "../logger.js";
 import type { CopyTradeConfig } from "./config.js";
 import type { TargetTrade } from "./tracker.js";
@@ -114,27 +114,112 @@ export class CopyExecutor {
   /** Guard against overlapping checkPendingOrders runs */
   private isCheckingPending = false;
 
+  // Per-leader position ledger (source of truth for SELL sizing)
+  private ledger: PositionLedger;
+  // SELL execution engine
+  private sellEngine: SellEngine;
+
   // Callbacks
   private onFilledCb: ((event: FillEvent) => void) | null = null;
   private onUnfilledCb: ((event: UnfilledEvent) => void) | null = null;
+  private onSellIntentCompleteCb: ((intent: SellIntent) => void) | null = null;
 
-  constructor(clob: ClobService, config: CopyTradeConfig, logger: Logger) {
+  constructor(clob: ClobService, config: CopyTradeConfig, logger: Logger, resolution?: ResolutionTracker) {
     this.clob = clob;
     this.config = config;
     this.logger = logger;
+    this.ledger = new PositionLedger(logger);
+    this.sellEngine = new SellEngine(
+      clob,
+      this.ledger,
+      config,
+      logger,
+      {
+        // Use injected resolution tracker if available, else always-false
+        isResolved: async (cid: string) => resolution ? await resolution.isResolved(cid).catch(() => false) : false,
+      },
+      {
+        cancelPendingBuysFor: (leader, tokenId) => this.cancelPendingBuysFor(leader, tokenId),
+      },
+    );
+    this.sellEngine.onIntentComplete((intent) => {
+      if (this.onSellIntentCompleteCb) this.onSellIntentCompleteCb(intent);
+    });
 
     // Always run fill checker — tracks fills AND handles bumps
     setInterval(() => this.checkPendingOrders(), this.fillCheckIntervalMs);
 
     // Prime balance/equity on startup + refresh every 60s
-    // (hot path only calls refreshBalance when trades fire — without this,
-    // status log shows $0.00 until first trade detected)
     this.refreshBalance().catch(() => {});
     this.refreshLeaderBalance().catch(() => {});
     setInterval(() => {
       this.refreshBalance().catch(() => {});
       this.refreshLeaderBalance().catch(() => {});
     }, 60_000);
+
+    // Reconcile ledger every N ms against on-chain positions (only ever shrinks)
+    setInterval(() => this.reconcileLedger().catch(() => {}), this.config.ledgerReconcileMs);
+    setInterval(() => this.ledger.pruneAppliedFills(), 5 * 60_000);
+  }
+
+  /** Cancel any pending BUYs for (leader, tokenId) — called by SellEngine before SELL */
+  private async cancelPendingBuysFor(leader: string, tokenId: string): Promise<void> {
+    const toCancel: string[] = [];
+    for (const [orderId, order] of this.pendingOrders) {
+      if (order.side === Side.BUY
+        && order.tokenId === tokenId
+        && order.trade.leaderAddress.toLowerCase() === leader.toLowerCase()) {
+        toCancel.push(orderId);
+      }
+    }
+    for (const orderId of toCancel) {
+      const order = this.pendingOrders.get(orderId);
+      if (!order) continue;
+      try {
+        await this.clob.cancelOrder(orderId);
+      } catch { /* ignore */ }
+      order.onFinalize?.();
+      this.pendingOrders.delete(orderId);
+      this.logger.info("Cancelled pending BUY before SELL", { orderId: orderId.slice(0, 12) + "...", leader: leader.slice(0, 8) + "..." });
+    }
+  }
+
+  /** Reconcile ledger against on-chain `/positions` data */
+  private async reconcileLedger(): Promise<void> {
+    const tokenIds = new Set(this.ledger.allEntries().map((e) => e.tokenId));
+    for (const tokenId of tokenIds) {
+      try {
+        const onChain = await getPositionForToken(this.config.profileAddress, tokenId, this.config.dataApiHost);
+        const onChainShares = onChain?.size ?? 0;
+        this.ledger.reconcile(tokenId, onChainShares);
+      } catch { /* skip on error — try next tick */ }
+    }
+  }
+
+  /** Public hook so external code (index.ts) can listen to completed SELL intents */
+  onSellIntentComplete(cb: (intent: SellIntent) => void): void {
+    this.onSellIntentCompleteCb = cb;
+  }
+
+  /** Hook the executor's BUY fills into the ledger so SELL sizing has truth */
+  private applyLedgerBuy(trade: TargetTrade, filledShares: number, fillPrice: number, orderId: string): void {
+    if (filledShares <= 0) return;
+    this.ledger.applyBuyFill(
+      trade.leaderAddress,
+      trade.tokenId,
+      trade.conditionId,
+      filledShares,
+      fillPrice,
+      `${orderId}:${trade.id}`,
+    );
+  }
+
+  getLedger(): PositionLedger {
+    return this.ledger;
+  }
+
+  getSellEngine(): SellEngine {
+    return this.sellEngine;
   }
 
   /** Register callback for when an order is filled */
@@ -287,66 +372,37 @@ export class CopyExecutor {
     let shares: number;
 
     if (trade.side === "SELL") {
-      // PROPORTIONAL SELL: sell same % of our position as leader sold of theirs
-      //
-      // IMPORTANT: distinguish API failure from "position closed"
-      //   - HTTP error/timeout → skip the trade (safety: no 100% dumps on flaky API)
-      //   - HTTP 200 but no matching position → leader closed 100%
-      //
-      // Query both positions IN PARALLEL to minimize race window
-      // (sequential queries add ~1-2s where leader can do more trades).
-      const [leaderRes, ourRes] = await Promise.allSettled([
-        getPositionForToken(trade.leaderAddress, trade.tokenId, this.config.dataApiHost),
-        getPositionForToken(this.config.profileAddress, trade.tokenId, this.config.dataApiHost),
-      ]);
+      // SELL: hand off to SellEngine for staged execution with no-gaps guarantee.
+      // Leader pre-sell size: query leader's CURRENT position (post-sell) and add trade.shares.
+      // Use 5s cache to handle rapid back-to-back SELLs from same leader.
+      const leaderPreSellSize = await this.sellEngine.getLeaderPreSellSize(
+        trade.leaderAddress,
+        trade.tokenId,
+        trade.shares,
+        async () => {
+          const pos = await getPositionForToken(trade.leaderAddress, trade.tokenId, this.config.dataApiHost);
+          return pos?.size || 0;
+        },
+      ).catch(() => trade.shares); // fallback: assume 100% close
 
-      const leaderQueryOk = leaderRes.status === "fulfilled";
-      const ourQueryOk = ourRes.status === "fulfilled";
-      const leaderSize = leaderQueryOk ? (leaderRes.value?.size || 0) : 0;
-      const ourSize = ourQueryOk ? (ourRes.value?.size || 0) : 0;
+      const intent = await this.sellEngine.exit(trade, leaderPreSellSize);
 
-      if (!leaderQueryOk) {
-        this.logger.warn("Leader position query failed — skipping SELL for safety", {
-          error: (leaderRes.reason as Error)?.message,
-        });
-      }
-      if (!ourQueryOk) {
-        this.logger.warn("Own position query failed — skipping SELL for safety", {
-          error: (ourRes.reason as Error)?.message,
-        });
-      }
-
-      if (!leaderQueryOk || !ourQueryOk) {
-        this.totalSkipped++;
-        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "position_query_failed" };
-      }
-
-      if (ourSize <= 0) {
-        this.totalSkipped++;
-        return { success: false, trade, latencyMs: Date.now() - startMs, reason: "no_position_to_sell" };
-      }
-
-      const leaderPreSellSize = leaderSize + trade.shares;
-      const sellPct = leaderPreSellSize > 0 ? trade.shares / leaderPreSellSize : 1;
-      // Defense: never sell more than we own
-      shares = Math.min(ourSize * sellPct, ourSize);
-      copyUsd = shares * price;
-
-      this.logger.info("PROPORTIONAL SELL calculation", {
-        leaderSold: trade.shares.toFixed(1),
-        leaderRemaining: leaderSize.toFixed(1),
-        sellPct: `${(sellPct * 100).toFixed(1)}%`,
-        ourPosition: ourSize.toFixed(1),
-        ourSellShares: shares.toFixed(1),
-      });
-
-      // Don't dust-sell: respect market's min order size (fallback 1 share)
-      const meta = await this.clob.getMarketMeta(trade.tokenId).catch(() => null);
-      const minSize = meta?.minOrderSize || 1;
-      if (shares < minSize) {
-        this.totalSkipped++;
-        return { success: false, trade, latencyMs: Date.now() - startMs, reason: `sell_size_below_min_${minSize}` };
-      }
+      // Map intent result into CopyResult
+      const success = intent.filledShares > 0;
+      if (success) this.totalCopied++; else this.totalSkipped++;
+      return {
+        success,
+        trade,
+        executedPrice: intent.avgFillPrice,
+        executedShares: intent.filledShares,
+        executedUsd: intent.totalProceedsUsd,
+        leaderPriceCents: trade.priceCents,
+        leaderUsd: trade.usdValue,
+        leaderShares: trade.shares,
+        latencyMs: Date.now() - startMs,
+        reason: intent.reason || intent.status,
+        orderId: intent.childOrderIds[0],
+      };
     } else {
       // BUY: standard portfolio/percentage/fixed sizing
       copyUsd = this.calculateCopySize(trade, priceCents);
@@ -431,32 +487,48 @@ export class CopyExecutor {
     // Step 3: If still unfilled → patient GTC at leader price
     //
     const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
-    // Slippage direction: BUY accepts HIGHER price, SELL accepts LOWER price
-    const slippage = this.config.maxSlippageCents / 100;
+    // High-price fast path (92-99¢): leader has likely eaten all liquidity at their price.
+    // Skip Step 1 GTC (would never fill), use tight slippage to protect edge.
+    const isHighPriceBand = trade.side === "BUY"
+      && priceCents >= this.config.highPriceFastPathMinCents;
+    const effectiveSlipCents = isHighPriceBand
+      ? this.config.highPriceMaxSlippageCents
+      : this.config.maxSlippageCents;
+    const slippage = effectiveSlipCents / 100;
     const worstPrice = trade.side === "BUY" ? price + slippage : Math.max(0.01, price - slippage);
+
+    if (isHighPriceBand) {
+      this.logger.info("HIGH-PRICE FAST PATH (skip GTC test, direct FAK)", {
+        priceCents,
+        slipCents: effectiveSlipCents,
+      });
+    }
 
     try {
       // ─── STEP 1: GTC at leader's exact price (500ms) ───
+      // SKIPPED for high-price band (92-99¢) — leader has eaten liquidity, GTC won't fill
       let gtcFilled = 0;
       let step1OrderId: string | null = null;
 
-      try {
-        const { orderId } = await this.clob.placeLimitOrder({
-          tokenId: trade.tokenId,
-          side,
-          price,
-          size: shares,
-        });
-        step1OrderId = orderId;
+      if (!isHighPriceBand) {
+        try {
+          const { orderId } = await this.clob.placeLimitOrder({
+            tokenId: trade.tokenId,
+            side,
+            price,
+            size: shares,
+          });
+          step1OrderId = orderId;
 
-        if (orderId) {
-          await new Promise((r) => setTimeout(r, 500));
-          try {
-            gtcFilled = await this.clob.getFilledShares(orderId);
-          } catch { /* continue */ }
+          if (orderId) {
+            await new Promise((r) => setTimeout(r, 500));
+            try {
+              gtcFilled = await this.clob.getFilledShares(orderId);
+            } catch { /* continue */ }
+          }
+        } catch (err) {
+          this.logger.info("Step 1 GTC failed, trying FAK", { error: (err as Error).message });
         }
-      } catch (err) {
-        this.logger.info("Step 1 GTC failed, trying FAK", { error: (err as Error).message });
       }
 
       // Check if GTC filled instantly (best case: 0% fee)
@@ -472,6 +544,9 @@ export class CopyExecutor {
           shares: gtcFilled.toFixed(1),
           latency: `${Date.now() - startMs}ms`,
         });
+
+        // Apply BUY fill to per-leader ledger (source of truth for SELL sizing)
+        this.applyLedgerBuy(trade, gtcFilled, price, step1OrderId!);
 
         if (this.onFilledCb) {
           this.onFilledCb({
@@ -531,6 +606,9 @@ export class CopyExecutor {
               latency: `${Date.now() - startMs}ms`,
               step1Partial: gtcFilled > 0 ? `${gtcFilled.toFixed(1)} maker` : "none",
             });
+
+            // Apply BUY fill to ledger
+            this.applyLedgerBuy(trade, totalFilled, worstPrice, fakResult.orderIds[0] || step1OrderId || "fak");
 
             if (this.onFilledCb) {
               this.onFilledCb({
@@ -648,6 +726,11 @@ export class CopyExecutor {
             price: `${Math.round(order.price * 100)}¢`,
             elapsed: `${((now - order.placedAt) / 1000).toFixed(1)}s`,
           });
+
+          // Apply BUY fill to ledger (SELLs handled by SellEngine.complete())
+          if (order.side === Side.BUY) {
+            this.applyLedgerBuy(order.trade, filled, order.price, order.orderId);
+          }
 
           if (this.onFilledCb) {
             this.onFilledCb({

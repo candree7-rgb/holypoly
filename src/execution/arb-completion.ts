@@ -1,4 +1,4 @@
-import { Side } from "@polymarket/clob-client";
+import { Side } from "@polymarket/clob-client-v2";
 import type { BookSnapshot, ClobWsClient } from "../data/clob-ws.js";
 import type { ClobService } from "../data/clob.js";
 import type { Config } from "../config.js";
