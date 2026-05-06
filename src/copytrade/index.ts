@@ -95,12 +95,7 @@ async function main() {
   logger.info(`Balance: $${balance.toFixed(2)} USDC`);
 
   if (balance < config.minBalanceFloorUsd) {
-    if (config.dryRun) {
-      logger.warn(`Balance ($${balance.toFixed(2)}) below floor — continuing anyway (DRY RUN)`);
-    } else {
-      logger.error(`Balance ($${balance.toFixed(2)}) below floor ($${config.minBalanceFloorUsd}). Exiting.`);
-      process.exit(1);
-    }
+    logger.warn(`Balance ($${balance.toFixed(2)}) below floor ($${config.minBalanceFloorUsd}) — bot will wait for deposits`);
   }
 
   // Init DB FIRST (needed for resolution tracker)
