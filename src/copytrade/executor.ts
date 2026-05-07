@@ -487,21 +487,28 @@ export class CopyExecutor {
     // Step 3: If still unfilled → patient GTC at leader price
     //
     const side = trade.side === "BUY" ? Side.BUY : Side.SELL;
-    // High-price fast path (92-99¢): leader has likely eaten all liquidity at their price.
-    // Skip Step 1 GTC (would never fill), use tight slippage to protect edge.
+    // Dynamic slippage: tighter near 100¢ to protect edge, wider at low prices for fills.
+    // Formula: slippage = min(normalSlippage, max(0.5, 100 - price - 1))
+    //   99¢ → 0.5¢   (edge 1¢, keep 0.5¢ profit)
+    //   98¢ → 1¢     (edge 2¢, keep 1¢ profit)
+    //   97¢ → 2¢     (edge 3¢, keep 1¢ profit)
+    //   96¢ → 3¢     (edge 4¢, keep 1¢ profit)
+    //   ≤95¢ → 3¢    (capped at maxSlippageCents)
+    const dynamicSlipCents = trade.side === "BUY"
+      ? Math.min(this.config.maxSlippageCents, Math.max(0.5, 100 - priceCents - 1))
+      : this.config.maxSlippageCents; // SELL uses normal slippage
+    const slippage = dynamicSlipCents / 100;
+    const worstPrice = trade.side === "BUY" ? price + slippage : Math.max(0.01, price - slippage);
+
+    // High-price fast path: skip Step 1 GTC test (leader ate liquidity, GTC won't fill)
     const isHighPriceBand = trade.side === "BUY"
       && priceCents >= this.config.highPriceFastPathMinCents;
-    const effectiveSlipCents = isHighPriceBand
-      ? this.config.highPriceMaxSlippageCents
-      : this.config.maxSlippageCents;
-    const slippage = effectiveSlipCents / 100;
-    const worstPrice = trade.side === "BUY" ? price + slippage : Math.max(0.01, price - slippage);
 
     if (isHighPriceBand) {
       this.logger.info("HIGH-PRICE FAST PATH (skip GTC test, direct FAK)", {
         priceCents,
         threshold: this.config.highPriceFastPathMinCents,
-        slipCents: effectiveSlipCents,
+        dynamicSlipCents: dynamicSlipCents.toFixed(1),
       });
     }
 
