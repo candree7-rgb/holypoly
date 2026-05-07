@@ -500,6 +500,7 @@ export class CopyExecutor {
     if (isHighPriceBand) {
       this.logger.info("HIGH-PRICE FAST PATH (skip GTC test, direct FAK)", {
         priceCents,
+        threshold: this.config.highPriceFastPathMinCents,
         slipCents: effectiveSlipCents,
       });
     }
@@ -591,18 +592,28 @@ export class CopyExecutor {
             worstPrice,
           });
 
-          if (fakResult.filled) {
-            const totalFilled = gtcFilled + remaining;
+          // CRITICAL: don't trust fakResult.filled — always verify actual shares via getFilledShares.
+          // The CLOB returns an orderID even when 0 shares matched (FAK auto-cancels remainder).
+          let fakActualFilled = 0;
+          if (fakResult.orderIds[0]) {
+            try {
+              fakActualFilled = await this.clob.getFilledShares(fakResult.orderIds[0]);
+            } catch { /* assume 0 */ }
+          }
+
+          if (fakActualFilled > 0) {
+            const totalFilled = gtcFilled + fakActualFilled;
             // Reservation already made — release it (order filled, CLOB balance drops)
             releaseReservation();
             this.totalCopied++;
 
-            this.logger.info("STEP 2: FAK filled", {
+            this.logger.info("STEP 2: FAK filled (verified)", {
               side: trade.side,
               outcome: trade.outcome || "?",
               leaderPrice: `${priceCents}¢`,
               worstPrice: `${Math.round(worstPrice * 100)}¢`,
-              shares: totalFilled.toFixed(1),
+              fakVerified: fakActualFilled.toFixed(1),
+              totalShares: totalFilled.toFixed(1),
               latency: `${Date.now() - startMs}ms`,
               step1Partial: gtcFilled > 0 ? `${gtcFilled.toFixed(1)} maker` : "none",
             });
